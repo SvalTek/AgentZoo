@@ -1,0 +1,52 @@
+{
+  "name": "agent-zoo",
+  "version": "0.0.1",
+  "exports": {
+    ".": "./mod.ts"
+  },
+  "tasks": {
+    "dev": "deno run -A main.ts",
+    "check": "deno check main.ts mod.ts",
+    "lint": "deno lint",
+    "test": "deno test -A"
+  },
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
+  },
+  "lint": {
+    "exclude": ["vendor/"],
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "fmt": {
+    "exclude": ["vendor/"]
+  },
+  // Tests are found in any subpath that has a dedicated `tests` folder, and the test files must end with `_test.ts`.
+  "test": {
+    "include": ["**/tests/**/*_test.ts"]
+  },
+
+  // Workspace settings
+  "workspace": [
+    "packages/*"
+  ],
+
+  "imports": {
+    "@cliffy/command": "jsr:@cliffy/command@^1.2.1",
+    "@deno-ink/core": "jsr:@deno-ink/core@^0.2.1",
+    // Global imports for the entire workspace. These imports will be available in all packages.
+    "@std/assert": "jsr:@std/assert@1",
+    "@std/yaml": "jsr:@std/yaml@1",
+    "@std/fs": "jsr:@std/fs@1",
+    "@std/path": "jsr:@std/path@1",
+    "@vibesjs/sdk": "./vendor/vibes/agentzoo.ts",
+    "react": "npm:react@18.3.1",
+    "@types/react": "npm:@types/react@18.3.28",
+    "react/jsx-runtime": "npm:react@18.3.1/jsx-runtime",
+    "zod": "npm:zod@^4",
+    "@ai-sdk/openai-compatible": "npm:@ai-sdk/openai-compatible@2.0.30",
+    "ollama-ai-provider-v2": "npm:ollama-ai-provider-v2@3.6.0"
+  }
+}

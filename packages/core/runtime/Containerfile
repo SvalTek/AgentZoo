@@ -1,0 +1,19 @@
+# AgentZoo's runtime base is deliberately separate from user WSL distributions.
+# One privileged runtime container hosts many agent OverlayFS/chroot roots.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash bindfs ca-certificates coreutils curl findutils git grep fuse3 fuse-overlayfs proot tini util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '%s\n' 'source ~/.bashrc' > /root/.bash_profile \
+    && printf '%s\n' 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'export PS1="\\u@agent:\\w\\$ "' > /root/.bashrc \
+    && mkdir -p /opt/runtime/rootfs-template \
+    && cp -a /bin /etc /home /lib /lib64 /root /sbin /usr /var /opt/runtime/rootfs-template/ \
+    && mkdir -p /opt/runtime/rootfs-template/dev /opt/runtime/rootfs-template/proc /opt/runtime/rootfs-template/shared /opt/runtime/rootfs-template/tmp \
+    && chmod 1777 /opt/runtime/rootfs-template/tmp
+
+COPY runtime-entrypoint.sh /usr/local/bin/runtime-host
+RUN chmod 0755 /usr/local/bin/runtime-host
+
+ENTRYPOINT ["/usr/local/bin/runtime-host"]
+CMD ["sleep", "infinity"]

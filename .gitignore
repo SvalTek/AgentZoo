@@ -1,0 +1,58 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Deno / Node dependency directories
+node_modules/
+.deno/
+
+# Optional vendored dependencies
+vendor/
+!vendor/
+vendor/*
+!vendor/vibes/
+!vendor/vibes/**
+
+# Coverage / test output
+coverage/
+*.lcov
+
+# Build / generated output
+dist/
+build/
+out/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+.cache/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Local runtime/config overrides
+.agent-zoo/
+.shared/
+agent-zoo-*.jsonl
+*.local
+*.local.json
+*.local.jsonc
+*.local.yaml
+*.local.yml
