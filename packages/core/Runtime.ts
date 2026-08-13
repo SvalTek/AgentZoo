@@ -94,18 +94,7 @@ export class DockerRuntimeManager implements RuntimeManager {
   async prepare(): Promise<void> {
     if (this.#prepared) return;
 
-    await runDocker([
-      "build",
-      "--file",
-      fromFileUrl(new URL("./runtime/Containerfile", import.meta.url)),
-      "--tag",
-      this.image,
-      "--label",
-      `${DOCKER_MANAGED_LABEL}=true`,
-      "--label",
-      `${DOCKER_RESOURCE_LABEL}=image`,
-      fromFileUrl(new URL("./runtime/", import.meta.url)),
-    ]);
+    await this.#ensureRuntimeImage();
 
     await this.#ensureDataVolume();
     const desiredImageId = await dockerImageId(this.image);
@@ -143,6 +132,30 @@ export class DockerRuntimeManager implements RuntimeManager {
     }
 
     this.#prepared = true;
+  }
+
+  /** Ensure the runtime image exists locally, building from source when the
+   * Containerfile is present or pulling the published image otherwise. */
+  async #ensureRuntimeImage(): Promise<void> {
+    if (await tryDockerImageId(this.image)) return;
+    const containerfile = fromFileUrl(
+      new URL("./runtime/Containerfile", import.meta.url),
+    );
+    if (await pathExists(containerfile)) {
+      await buildRuntimeImage(this.image);
+      return;
+    }
+    try {
+      await runDocker(["pull", this.image]);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Runtime image "${this.image}" is not available locally, its ` +
+          "Containerfile is not present in this installation, and pulling " +
+          `it failed: ${detail}\n` +
+          "Build it once from a source checkout with `deno task docker:build`.",
+      );
+    }
   }
 
   async #ensureDataVolume(): Promise<void> {
@@ -394,6 +407,25 @@ const DOCKER_CREATED_LABEL = "agent-zoo.created";
 const DOCKER_PROJECT_LABEL = "agent-zoo.project";
 const DOCKER_WORKSPACE_LABEL = "agent-zoo.workspace";
 
+/** Build the managed runtime image tagged for AgentZoo, carrying the same
+ * ownership labels that the CLI uses to recognise its resources. */
+export async function buildRuntimeImage(
+  image = "agent-runtime:dev",
+): Promise<void> {
+  await runDocker([
+    "build",
+    "--file",
+    fromFileUrl(new URL("./runtime/Containerfile", import.meta.url)),
+    "--tag",
+    image,
+    "--label",
+    `${DOCKER_MANAGED_LABEL}=true`,
+    "--label",
+    `${DOCKER_RESOURCE_LABEL}=image`,
+    fromFileUrl(new URL("./runtime/", import.meta.url)),
+  ]);
+}
+
 /** Inspect only Docker resources carrying AgentZoo's explicit ownership label. */
 export async function listManagedDockerRuns(): Promise<ManagedDockerRun[]> {
   const containerIds = await dockerLines([
@@ -564,6 +596,32 @@ async function dockerImageId(image: string): Promise<string> {
     image,
   ]);
   return result.stdout.trim();
+}
+
+async function tryDockerImageId(
+  image: string,
+): Promise<string | undefined> {
+  const result = await runDockerRaw([
+    "image",
+    "inspect",
+    "--format",
+    "{{.Id}}",
+    image,
+  ]);
+  if (!result.success) {
+    if (/no such image/i.test(result.stderr)) return undefined;
+    throw new Error(`Docker command failed: ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await Deno.stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function tryInspectDockerContainer(

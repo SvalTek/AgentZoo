@@ -32,10 +32,12 @@ refresh it with:
 deno task docker:build
 ```
 
-`prepare()` also builds the image automatically (cached) when it is missing, so
-a fresh clone can run `deno task dev` directly. Run the task explicitly to
-refresh a stale image after changing `runtime-entrypoint.sh` or the
-`Containerfile`.
+`prepare()` uses the image as-is when it already exists locally. When it is
+missing, the runtime builds it from source when the `Containerfile` is present
+(a fresh clone can run `deno task dev` directly), and otherwise pulls the
+published image; if neither works it fails with a message pointing back to
+`deno task docker:build`. Run the task explicitly to refresh a stale image
+after changing `runtime-entrypoint.sh` or the `Containerfile`.
 
 ## Docker isolation integration
 

@@ -26,8 +26,10 @@ deno task docker:build
 ```
 
 The image is tagged `agent-runtime:dev` and carries AgentZoo's managed labels, so
-`docker list` and `docker purge --prune-images` recognize it. The runtime also
-auto-builds the image (using Docker's cache) when it is missing, but an explicit
+`docker list` and `docker purge --prune-images` recognize it. When the image is
+missing, the runtime builds it from source if the `Containerfile` is present in
+this installation, and otherwise pulls the published image; if neither works it
+fails with a message pointing back to `deno task docker:build`. An explicit
 build is the reliable way to refresh a stale image after updating
 `runtime-entrypoint.sh` or the `Containerfile`.
 

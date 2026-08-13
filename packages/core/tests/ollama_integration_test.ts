@@ -2,7 +2,7 @@ import { assertEquals } from "@std/assert";
 import { ZooAgent } from "../Agent.ts";
 import { ModelRegistry } from "../ModelRegistry.ts";
 import { createLanguageModel } from "../Providers.ts";
-import { DockerRuntimeManager } from "../Runtime.ts";
+import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
 import { ShellFeature } from "../ShellFeature.ts";
 
 let ollamaIntegrationEnabled = false;
@@ -11,6 +11,10 @@ try {
     Deno.env.get("AGENT_ZOO_OLLAMA_INTEGRATION") === "1";
 } catch {
   // Normal tests must not require a local model server.
+}
+
+if (ollamaIntegrationEnabled) {
+  await buildRuntimeImage("agent-zoo-runtime:ollama-test");
 }
 
 Deno.test({

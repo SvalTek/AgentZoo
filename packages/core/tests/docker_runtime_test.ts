@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { resolve } from "@std/path";
-import { DockerRuntimeManager } from "../Runtime.ts";
+import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
 import { FilesystemFeature } from "../FilesystemFeature.ts";
 import { VisionFeature } from "../VisionFeature.ts";
 import { HttpFeature } from "../HttpFeature.ts";
@@ -15,6 +15,10 @@ try {
     Deno.env.get("AGENT_ZOO_DOCKER_INTEGRATION") === "1";
 } catch {
   // Unit-test runs deliberately do not need environment permission.
+}
+
+if (dockerIntegrationEnabled) {
+  await buildRuntimeImage("agent-runtime:test");
 }
 
 Deno.test({

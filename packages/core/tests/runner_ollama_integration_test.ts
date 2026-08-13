@@ -1,11 +1,15 @@
 import { assertEquals } from "@std/assert";
-import { buildAgentZoo, DockerRuntimeManager, parseConfig } from "../mod.ts";
+import { buildAgentZoo, buildRuntimeImage, DockerRuntimeManager, parseConfig } from "../mod.ts";
 
 let enabled = false;
 try {
   enabled = Deno.env.get("AGENT_ZOO_RUNNER_INTEGRATION") === "1";
 } catch {
   // Ordinary tests do not need environment permission.
+}
+
+if (enabled) {
+  await buildRuntimeImage();
 }
 
 Deno.test({
