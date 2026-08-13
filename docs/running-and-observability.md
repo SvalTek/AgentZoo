@@ -31,6 +31,12 @@ images). `docker purge` removes the labelled Docker resources for one run
 (`--runtime <id>`) or for every run (`--all`); add `--prune-images` to also remove
 unused managed runtime images.
 
+State is durable across runs: `stop()` preserves the container and data volume so
+a later run resumes from the same state, and only `docker purge` removes them.
+If a run fails part-way through startup, the labelled data volume is kept and
+reused on the next attempt; use `docker purge` when you want to abandon it
+instead.
+
 Without `--config`, the CLI uses `agent-zoo.yaml` when present, otherwise the
 checked-in `agent-zoo.example.yaml`.
 

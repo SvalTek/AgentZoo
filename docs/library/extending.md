@@ -79,6 +79,15 @@ with the configured runtime behavior. When `exec` times out or is aborted, it
 must stop the invoked command's descendant process tree before resolving; it
 must not leave that work running after reporting interruption.
 
+A runtime manager's lifecycle methods split into stop (preserve state) and
+purge (remove state). `stop()` halts the runtime while keeping persistent
+containers and data volumes so a later run resumes from the same state;
+`purge()` removes them entirely. Implement `stop()` on your manager; the
+framework prefers it for graceful shutdown and only falls back to `destroy()`
+when `stop()` is absent. `destroy()` is deprecated — it is a backward-
+compatible alias that preserves persistent state, so it must not be used where
+full removal is intended.
+
 ## Services and mounted routers
 
 Services are configured by name and supplied by the embedding host:

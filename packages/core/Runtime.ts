@@ -254,13 +254,21 @@ export class DockerRuntimeManager implements RuntimeManager {
     await this.prepare();
     const current = this.#envs.get(agentId);
     if (current) await current.destroy();
-    await runDocker([
-      "exec",
-      this.hostName,
-      "runtime-host",
-      "purge-agent",
-      agentId,
-    ]);
+    try {
+      await runDocker([
+        "exec",
+        this.hostName,
+        "runtime-host",
+        "purge-agent",
+        agentId,
+      ]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/agent environment does not exist/.test(message)) {
+        throw new Error(`no chroot exists for "${agentId}" in this config`);
+      }
+      throw error;
+    }
     this.#envs.delete(agentId);
   }
 
@@ -277,13 +285,25 @@ export class DockerRuntimeManager implements RuntimeManager {
         "runtime",
         `container "${this.hostName}"`,
       );
-      if (container.State.Running) await runDocker(["stop", this.hostName]);
     }
+    // Release each active environment while the container is still running so
+    // that retained references fail through the controlled "not running" path
+    // instead of surfacing a raw Docker error.
+    for (const environment of this.#envs.values()) {
+      await environment.destroy();
+    }
+    if (container?.State.Running) await runDocker(["stop", this.hostName]);
     this.#envs.clear();
     this.#prepared = false;
   }
 
-  /** Backward-compatible lifecycle alias. Persistent state is not purged. */
+  /**
+   * @deprecated Lifecycle semantics changed in the persistence release: this
+   * method now only stops the runtime host and preserves the container and data
+   * volume. It is retained as a backward-compatible alias for {@link stop}.
+   * Call {@link stop} to halt while keeping persistent state, or {@link purge}
+   * to remove the container and data volume entirely.
+   */
   destroy(): Promise<void> {
     return this.stop();
   }
@@ -665,13 +685,30 @@ class DockerChrootEnvironment implements RuntimeEnv {
   /** Stop processes and mounts but keep the persistent OverlayFS upperdir. */
   async destroy(): Promise<void> {
     if (this.#prepared) {
-      await runDocker([
-        "exec",
-        this.hostName,
-        "runtime-host",
-        "stop-agent",
-        this.agentId,
-      ]);
+      try {
+        await runDocker([
+          "exec",
+          this.hostName,
+          "runtime-host",
+          "stop-agent",
+          this.agentId,
+        ]);
+      } catch (error) {
+        // The host container may already be stopped or removed (for example
+        // during an interrupted startup or after a previous stop). There is
+        // nothing to stop then, but the environment must still be released so
+        // later exec() calls fail through the controlled "not running" path
+        // instead of surfacing a raw Docker error.
+        const message = error instanceof Error
+          ? error.message
+          : String(error);
+        if (
+          !/(not running|no such container|stopped state|does not exist)/i
+            .test(message)
+        ) {
+          throw error;
+        }
+      }
     }
     this.#prepared = false;
   }
