@@ -97,6 +97,7 @@ const AgentPopulationConfigSchema = z.object({
   names: z.array(NonEmptyString).min(1).max(100).optional(),
   count: z.number().int().positive().max(100).optional(),
   model: NonEmptyString,
+  captioningModel: NonEmptyString.optional(),
   system: NonEmptyString.optional(),
   systemPrompt: NonEmptyString.optional(),
   prompt: NonEmptyString.optional(),

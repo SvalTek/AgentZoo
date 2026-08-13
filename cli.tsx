@@ -9,10 +9,6 @@ import { formatActivity } from "./packages/cli/activity_format.ts";
 import { ActivityLog } from "./packages/cli/ActivityLog.ts";
 import { createCli } from "./cli_command.ts";
 
-const encoder = new TextEncoder();
-const ENTER_FULLSCREEN = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
-const LEAVE_FULLSCREEN = "\x1b[?25h\x1b[?1049l";
-
 export async function runCli(args: string[]): Promise<void> {
   await createCli(runStandalone).parse(args);
 }
@@ -33,11 +29,11 @@ export async function runStandalone(
     signalHandled = true;
     void zoo?.stop("SIGINT");
   };
-  if (interactive) Deno.stdout.writeSync(encoder.encode(ENTER_FULLSCREEN));
   try {
     startup = interactive
       ? await render(
         <StartupScreen configPath={configPath} />,
+        { fullScreen: true },
       )
       : undefined;
     Deno.addSignalListener("SIGINT", stop);
@@ -75,9 +71,6 @@ export async function runStandalone(
         await activityLog?.close();
       } finally {
         startup?.unmount();
-        if (interactive) {
-          Deno.stdout.writeSync(encoder.encode(LEAVE_FULLSCREEN));
-        }
       }
     }
   }

@@ -256,6 +256,8 @@ Deno.test({
         const value = await tool.execute({
           deps: {
             agentId: env.agentId,
+            provider: "openai-compatible",
+            model: "test-model",
             runtime: env,
             cwd: "/root",
             control: {},
@@ -519,6 +521,8 @@ Deno.test({
         const value = await tool.execute({
           deps: {
             agentId: env.agentId,
+            provider: "openai-compatible",
+            model: "test-model",
             runtime: env,
             cwd: "/root",
             control: {},
@@ -597,6 +601,8 @@ Deno.test({
       const httpValue = await httpTool.execute({
         deps: {
           agentId: alpha.agentId,
+          provider: "openai-compatible",
+          model: "test-model",
           runtime: alpha,
           cwd: "/root",
           control: {},

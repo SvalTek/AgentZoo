@@ -2,7 +2,6 @@
 
 import { Box, Spinner, Text } from "@deno-ink/core";
 import type { ZooState } from "@agent-zoo/core";
-import { activityLogName } from "../ActivityLog.ts";
 
 export interface DashboardHeaderProps {
   state: ZooState;
@@ -15,7 +14,6 @@ export interface DashboardHeaderProps {
 export function DashboardHeader({
   state,
   configPath,
-  logPath,
   elapsedMs,
   objective,
 }: DashboardHeaderProps) {
@@ -27,21 +25,26 @@ export function DashboardHeader({
       flexDirection="column"
     >
       <Box>
-        <Box flexGrow={1} flexShrink={1}>
-          <Text color="cyan" bold>AgentZoo</Text>
-          <Text>{state.toUpperCase()}</Text>
+        <Box flexShrink={0}>
+          <Text color="cyan" bold>AgentZoo{" "}</Text>
           {state === "running" && <Spinner type="dots" color="green" />}
+        </Box>
+
+        <Box flexGrow={1} flexShrink={1} marginLeft={2}>
           <Text dimColor wrap="truncate">
-            config: {configPath} · log: {activityLogName(logPath)}
+            config: {configPath}
           </Text>
         </Box>
-        <Box flexShrink={0} marginLeft={1}>
-          <Text color="cyan">Run {formatRunElapsed(elapsedMs)}</Text>
+
+        <Box flexShrink={0} marginLeft={2}>
+          <Text color="cyan">Run: {formatRunElapsed(elapsedMs)}</Text>
         </Box>
       </Box>
+
       {objective && (
         <Text wrap="truncate">
           <Text color="cyan" bold>Objective:</Text>
+          {" "}
           {objective}
         </Text>
       )}

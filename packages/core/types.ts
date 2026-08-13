@@ -112,6 +112,13 @@ export interface AgentConfig {
   type?: string;
   /** Key into the model registry. */
   model: string;
+  /**
+   * Optional key into the model registry for image captioning.
+   * When set, view_image delegates to this model for image description.
+   * Useful for non-vision models or Ollama (which can't handle images
+   * in tool results). Falls back to the agent's own model when unset.
+   */
+  captioningModel?: string;
   /** Static system prompt, or a function producing one. */
   systemPrompt?: string | (() => string | Promise<string>);
   /**

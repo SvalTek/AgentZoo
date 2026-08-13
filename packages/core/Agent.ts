@@ -20,6 +20,9 @@ import { ToolExecutionError, unwrapObservedToolResult } from "./ToolSupport.ts";
 /** The per-run environment AgentZoo exposes to Vibes tools. */
 export interface AgentRunDeps {
   readonly agentId: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly captioningModel?: string;
   readonly runtime: RuntimeEnv;
   readonly cwd: string;
   readonly signal?: AbortSignal;
@@ -188,6 +191,9 @@ export class ZooAgent extends EventTarget {
       const result = await (await this.getVibes()).run(prompt, {
         deps: {
           agentId: this.id,
+          provider: this.#models.get(this.config.model).provider,
+          model: this.config.model,
+          captioningModel: this.config.captioningModel,
           runtime: this.runtime,
           cwd: this.config.cwd ?? "/root",
           signal,
@@ -272,6 +278,9 @@ export class ZooAgent extends EventTarget {
       const event of (await this.getVibes()).runStreamEvents(prompt, {
         deps: {
           agentId: this.id,
+          provider: this.#models.get(this.config.model).provider,
+          model: this.config.model,
+          captioningModel: this.config.captioningModel,
           runtime: this.runtime,
           cwd: this.config.cwd ?? "/root",
           signal,

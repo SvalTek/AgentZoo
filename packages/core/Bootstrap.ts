@@ -89,6 +89,11 @@ export async function buildAgentZoo(
         `Agent "${member.id}" references unknown model "${member.model}"`,
       );
     }
+    if (member.captioningModel && !models.has(member.captioningModel)) {
+      throw new Error(
+        `Agent "${member.id}" references unknown captioningModel "${member.captioningModel}"`,
+      );
+    }
     const modelConfig = models.get(member.model);
     const modelRuntime = mergeModelRuntimeConfig(modelConfig, member);
     if (
@@ -125,6 +130,31 @@ export async function buildAgentZoo(
     orderedTools.push(createYieldTool());
     if (config.completion.enabled) orderedTools.push(createCompletionTool());
     const env = await runtime.createEnv(member.id);
+
+    // Configure a default Git identity for the agent's private environment.
+    const gitName = member.name ?? member.id;
+    const gitEmail = `${member.id}@agentzoo.local`;
+
+    await Promise.all([
+      env.exec([
+        "git",
+        "config",
+        "--global",
+        "user.name",
+        gitName,
+      ]),
+      env.exec([
+        "git",
+        "config",
+        "--global",
+        "user.email",
+        gitEmail,
+      ]),
+    ]).catch(() => {
+      // Git identity is convenience provisioning, not required for the environment.
+    });
+
+    // Push the agent into the population with its resolved system prompt and runtime context.
     builtAgents.push(
       new ZooAgent(
         {
@@ -132,6 +162,7 @@ export async function buildAgentZoo(
           name: member.name,
           type: member.type,
           model: member.model,
+          captioningModel: member.captioningModel,
           systemPrompt,
           features: member.features,
           cwd: member.cwd,
@@ -236,6 +267,7 @@ interface PopulationMember {
   name?: string;
   type: string;
   model: string;
+  captioningModel?: string;
   system?: string;
   systemPrompt?: string;
   prompt?: string;
@@ -262,6 +294,7 @@ function expandPopulation(config: ZooConfig): PopulationMember[] {
         name: group.names?.[offset - 1] ?? group.name,
         type: group.type,
         model: group.model,
+        captioningModel: group.captioningModel,
         system: group.system,
         systemPrompt: group.systemPrompt,
         prompt: group.prompt,

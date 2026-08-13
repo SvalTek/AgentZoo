@@ -317,6 +317,8 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
     ({
       deps: {
         agentId: "alpha",
+        provider: "openai-compatible",
+        model: "test-model",
         cwd: "/root",
         runtime: {
           agentId: "alpha",
@@ -365,6 +367,8 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
     ({
       deps: {
         agentId: "alpha",
+        provider: "openai-compatible",
+        model: "test-model",
         cwd: "/root",
         runtime: {
           agentId: "alpha",
@@ -656,6 +660,8 @@ Deno.test("search_files accepts an empty object as bounded discovery", async () 
   const value = await tool.execute({
     deps: {
       agentId: "alpha",
+      provider: "openai-compatible",
+      model: "test-model",
       runtime,
       cwd: "/root",
       control: {},
@@ -716,6 +722,8 @@ Deno.test("HTTP convenience tool returns a bounded neutral response", async () =
   const value = await tool.execute({
     deps: {
       agentId: "alpha",
+      provider: "openai-compatible",
+      model: "test-model",
       runtime,
       cwd: "/root",
       control: {},
