@@ -59,7 +59,7 @@ Deno.test({
         throw new Error(`Agent output: ${output}\n${error}`);
       }
     } finally {
-      await runtimeManager.destroy();
+      await runtimeManager.purge();
       await Deno.remove(shared, { recursive: true });
     }
   },

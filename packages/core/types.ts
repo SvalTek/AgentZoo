@@ -185,9 +185,9 @@ export interface RuntimeEnv {
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult>;
-  /** Destroy the environment. */
+  /** Stop/release the active environment without deleting persistent agent state. */
   destroy(): Promise<void>;
-  /** Destroy and recreate the environment. */
+  /** Discard the private environment state and recreate it. */
   reset(): Promise<void>;
 }
 
@@ -201,7 +201,7 @@ export interface RuntimeManager {
   ): Promise<RuntimeEnv>;
   /** Get an already-created environment by agent id. */
   getEnv(agentId: string): RuntimeEnv | undefined;
-  /** Destroy an agent's environment. */
+  /** Stop/release an agent environment without purging its persistent state. */
   destroyEnv(agentId: string): Promise<void>;
 }
 

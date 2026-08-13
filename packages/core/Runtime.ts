@@ -56,10 +56,10 @@ export class WslRuntimeManager implements RuntimeManager {
 }
 
 /**
- * Current implementation of the single privileged AgentZoo runtime host.
- * One container owns many native OverlayFS + chroot agent roots. The public
- * RuntimeManager contract deliberately does not reveal Docker, so a future
- * WSLC backend can provide the identical semantics without changing agents.
+ * Current implementation of one privileged runtime host per AgentZoo config.
+ * One Docker container owns many native OverlayFS + chroot agent roots. The
+ * container may stop between CLI runs, while its labelled data volume keeps
+ * each agent's private upperdir persistent by stable agent id.
  */
 export class DockerRuntimeManager implements RuntimeManager {
   readonly #envs = new Map<string, RuntimeEnv>();
@@ -68,21 +68,32 @@ export class DockerRuntimeManager implements RuntimeManager {
   readonly runId: string;
   readonly createdAt: string;
   readonly project: string;
+  readonly workspace: string;
+  readonly hostName: string;
 
   constructor(
     readonly sharedWorkspace: string,
     readonly image = "agent-runtime:dev",
-    readonly hostName = `agent-runtime-${crypto.randomUUID()}`,
+    hostName?: string,
     metadata: DockerRuntimeMetadata = {},
   ) {
-    this.#dataVolumeName = `${hostName}-data`;
-    this.runId = metadata.runId ?? crypto.randomUUID();
+    this.project = metadata.project
+      ? resolve(metadata.project)
+      : resolve(sharedWorkspace);
+    this.workspace = resolve(sharedWorkspace);
+    this.runId = metadata.runId ?? dockerRuntimeIdForProject(this.project);
     this.createdAt = metadata.createdAt ?? new Date().toISOString();
-    this.project = metadata.project ?? resolve(sharedWorkspace);
+    this.hostName = hostName ?? `agent-runtime-${this.runId}`;
+    this.#dataVolumeName = `${this.hostName}-data`;
+  }
+
+  get dataVolumeName(): string {
+    return this.#dataVolumeName;
   }
 
   async prepare(): Promise<void> {
     if (this.#prepared) return;
+
     await runDocker([
       "build",
       "--file",
@@ -95,27 +106,98 @@ export class DockerRuntimeManager implements RuntimeManager {
       `${DOCKER_RESOURCE_LABEL}=image`,
       fromFileUrl(new URL("./runtime/", import.meta.url)),
     ]);
+
+    await this.#ensureDataVolume();
+    const desiredImageId = await dockerImageId(this.image);
+    let container = await tryInspectDockerContainer(this.hostName);
+
+    if (container) {
+      this.#assertOwnedResource(
+        container.Config.Labels,
+        "runtime",
+        `container "${this.hostName}"`,
+      );
+      const labels = container.Config.Labels ?? {};
+      const labelledWorkspace = labels[DOCKER_WORKSPACE_LABEL];
+      const mustRecreate = container.Image !== desiredImageId ||
+        labelledWorkspace === undefined ||
+        dockerPathIdentity(labelledWorkspace) !==
+          dockerPathIdentity(this.workspace);
+      if (mustRecreate) {
+        if (container.State.Running) {
+          throw new Error(
+            `Managed runtime "${this.hostName}" is already running with a ` +
+              "different image or workspace; stop it before restarting " +
+              "this config",
+          );
+        }
+        await runDocker(["rm", this.hostName]);
+        container = undefined;
+      }
+    }
+
+    if (!container) {
+      await this.#createHostContainer();
+    } else if (!container.State.Running) {
+      await runDocker(["start", this.hostName]);
+    }
+
+    this.#prepared = true;
+  }
+
+  async #ensureDataVolume(): Promise<void> {
+    const existing = await tryInspectDockerVolume(this.#dataVolumeName);
+    if (existing) {
+      this.#assertOwnedResource(
+        existing.Labels,
+        "data",
+        `volume "${this.#dataVolumeName}"`,
+      );
+      return;
+    }
     await runDocker([
       "volume",
       "create",
       ...this.#resourceLabelArgs("data"),
       this.#dataVolumeName,
     ]);
+  }
+
+  async #createHostContainer(): Promise<void> {
     await runDocker([
       "run",
       "--detach",
-      "--rm",
       "--privileged",
       "--name",
       this.hostName,
       ...this.#resourceLabelArgs("runtime"),
       "--volume",
-      `${resolve(this.sharedWorkspace)}:/shared`,
+      `${this.workspace}:/shared`,
       "--mount",
       `source=${this.#dataVolumeName},target=/var/lib/runtime`,
       this.image,
     ]);
-    this.#prepared = true;
+  }
+
+  #assertOwnedResource(
+    labels: Record<string, string> | undefined,
+    resource: "runtime" | "data",
+    description: string,
+  ): void {
+    const runtimeId = labels?.[DOCKER_RUNTIME_LABEL] ??
+      labels?.[DOCKER_RUN_LABEL];
+    if (
+      labels?.[DOCKER_MANAGED_LABEL] !== "true" ||
+      labels?.[DOCKER_RESOURCE_LABEL] !== resource ||
+      labels?.[DOCKER_PROJECT_LABEL] === undefined ||
+      dockerPathIdentity(labels[DOCKER_PROJECT_LABEL]) !==
+        dockerPathIdentity(this.project) ||
+      runtimeId !== this.runId
+    ) {
+      throw new Error(
+        `Refusing to reuse ${description}: it is not owned by this config`,
+      );
+    }
   }
 
   #resourceLabelArgs(resource: "runtime" | "data"): string[] {
@@ -125,11 +207,16 @@ export class DockerRuntimeManager implements RuntimeManager {
       "--label",
       `${DOCKER_RESOURCE_LABEL}=${resource}`,
       "--label",
+      `${DOCKER_RUNTIME_LABEL}=${this.runId}`,
+      // Legacy label retained so older cleanup/list tooling can still group it.
+      "--label",
       `${DOCKER_RUN_LABEL}=${this.runId}`,
       "--label",
       `${DOCKER_CREATED_LABEL}=${this.createdAt}`,
       "--label",
       `${DOCKER_PROJECT_LABEL}=${this.project}`,
+      "--label",
+      `${DOCKER_WORKSPACE_LABEL}=${this.workspace}`,
     ];
   }
 
@@ -153,23 +240,98 @@ export class DockerRuntimeManager implements RuntimeManager {
   getEnv(agentId: string): RuntimeEnv | undefined {
     return this.#envs.get(agentId);
   }
+
+  /** Stop one active chroot without deleting its persistent upperdir. */
   async destroyEnv(agentId: string): Promise<void> {
     const environment = this.#envs.get(agentId);
     if (environment) await environment.destroy();
     this.#envs.delete(agentId);
   }
-  async destroy(): Promise<void> {
-    for (const id of [...this.#envs.keys()]) await this.destroyEnv(id);
-    if (this.#prepared) {
+
+  /** Explicitly delete one agent's persisted chroot state. */
+  async purgeEnv(agentId: string): Promise<void> {
+    assertAgentId(agentId);
+    await this.prepare();
+    const current = this.#envs.get(agentId);
+    if (current) await current.destroy();
+    await runDocker([
+      "exec",
+      this.hostName,
+      "runtime-host",
+      "purge-agent",
+      agentId,
+    ]);
+    this.#envs.delete(agentId);
+  }
+
+  /** Stop the config's runtime host while preserving its container and volume. */
+  async stop(): Promise<void> {
+    if (!this.#prepared) {
+      this.#envs.clear();
+      return;
+    }
+    const container = await tryInspectDockerContainer(this.hostName);
+    if (container) {
+      this.#assertOwnedResource(
+        container.Config.Labels,
+        "runtime",
+        `container "${this.hostName}"`,
+      );
+      if (container.State.Running) await runDocker(["stop", this.hostName]);
+    }
+    this.#envs.clear();
+    this.#prepared = false;
+  }
+
+  /** Backward-compatible lifecycle alias. Persistent state is not purged. */
+  destroy(): Promise<void> {
+    return this.stop();
+  }
+
+  /** Explicitly remove this config's host container and persistent data volume. */
+  async purge(): Promise<void> {
+    const container = await tryInspectDockerContainer(this.hostName);
+    if (container) {
+      this.#assertOwnedResource(
+        container.Config.Labels,
+        "runtime",
+        `container "${this.hostName}"`,
+      );
       await runDocker(["rm", "--force", this.hostName]);
+    }
+    const volume = await tryInspectDockerVolume(this.#dataVolumeName);
+    if (volume) {
+      this.#assertOwnedResource(
+        volume.Labels,
+        "data",
+        `volume "${this.#dataVolumeName}"`,
+      );
       await runDocker(["volume", "rm", this.#dataVolumeName]);
     }
+    this.#envs.clear();
     this.#prepared = false;
   }
 }
 
+function dockerPathIdentity(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  return Deno.build.os === "windows" ? normalized.toLowerCase() : normalized;
+}
+
+/** Stable Docker-safe identifier derived from the config/project path. */
+export function dockerRuntimeIdForProject(project: string): string {
+  const canonical = dockerPathIdentity(project);
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (const byte of new TextEncoder().encode(canonical)) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * prime);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
 export interface DockerRuntimeMetadata {
-  /** Stable identifier used to group every Docker resource owned by one run. */
+  /** Stable runtime identifier. Defaults to a hash of the config/project path. */
   runId?: string;
   /** Creation time recorded in Docker resource labels. */
   createdAt?: string;
@@ -206,9 +368,11 @@ export interface DockerCleanupResult {
 
 const DOCKER_MANAGED_LABEL = "agent-zoo.managed";
 const DOCKER_RESOURCE_LABEL = "agent-zoo.resource";
+const DOCKER_RUNTIME_LABEL = "agent-zoo.runtime";
 const DOCKER_RUN_LABEL = "agent-zoo.run";
 const DOCKER_CREATED_LABEL = "agent-zoo.created";
 const DOCKER_PROJECT_LABEL = "agent-zoo.project";
+const DOCKER_WORKSPACE_LABEL = "agent-zoo.workspace";
 
 /** Inspect only Docker resources carrying AgentZoo's explicit ownership label. */
 export async function listManagedDockerRuns(): Promise<ManagedDockerRun[]> {
@@ -243,7 +407,7 @@ export async function listManagedDockerRuns(): Promise<ManagedDockerRun[]> {
     volumes: string[];
   }>();
   const getRun = (labels: Record<string, string> | undefined) => {
-    const runId = labels?.[DOCKER_RUN_LABEL];
+    const runId = labels?.[DOCKER_RUNTIME_LABEL] ?? labels?.[DOCKER_RUN_LABEL];
     if (!runId) return undefined;
     let run = runs.get(runId);
     if (!run) {
@@ -296,7 +460,7 @@ export async function listManagedDockerImages(): Promise<ManagedDockerImage[]> {
   }));
 }
 
-/** Remove one labelled run, or every labelled run when no run ID is supplied. */
+/** Remove one labelled runtime, or every labelled runtime when no id is supplied. */
 export async function cleanupManagedDockerResources(
   runId?: string,
   pruneImages = false,
@@ -306,12 +470,35 @@ export async function cleanupManagedDockerResources(
     ? runs
     : runs.filter((run) => run.runId === runId);
   if (runId !== undefined && selected.length === 0) {
-    throw new Error(`No managed Docker run found with id "${runId}"`);
+    throw new Error(`No managed Docker runtime found with id "${runId}"`);
   }
-  const containers = selected.flatMap((run) =>
-    run.containers.map((container) => container.name)
+  return await cleanupSelectedDockerRuns(selected, pruneImages);
+}
+
+/** Remove every labelled runtime resource belonging to one config path. */
+export async function cleanupManagedDockerProject(
+  project: string,
+  pruneImages = false,
+): Promise<DockerCleanupResult> {
+  const target = resolve(project);
+  const runs = (await listManagedDockerRuns()).filter((run) =>
+    run.project !== undefined &&
+    dockerPathIdentity(run.project) === dockerPathIdentity(target)
   );
-  const volumes = selected.flatMap((run) => [...run.volumes]);
+  if (!runs.length) {
+    throw new Error(`No managed Docker runtime found for config "${target}"`);
+  }
+  return await cleanupSelectedDockerRuns(runs, pruneImages);
+}
+
+async function cleanupSelectedDockerRuns(
+  selected: readonly ManagedDockerRun[],
+  pruneImages: boolean,
+): Promise<DockerCleanupResult> {
+  const containers = [...new Set(selected.flatMap((run) =>
+    run.containers.map((container) => container.name)
+  ))];
+  const volumes = [...new Set(selected.flatMap((run) => [...run.volumes]))];
   if (containers.length) await runDocker(["rm", "--force", ...containers]);
   if (volumes.length) await runDocker(["volume", "rm", ...volumes]);
   if (pruneImages) {
@@ -332,8 +519,9 @@ export async function cleanupManagedDockerResources(
 interface DockerContainerInspect {
   Id: string;
   Name: string;
+  Image: string;
   Config: { Image: string; Labels?: Record<string, string> };
-  State: { Status: string };
+  State: { Status: string; Running: boolean };
 }
 
 interface DockerVolumeInspect {
@@ -345,6 +533,39 @@ interface DockerImageInspect {
   Id: string;
   RepoTags?: string[];
   Created?: string;
+}
+
+async function dockerImageId(image: string): Promise<string> {
+  const result = await runDockerResult([
+    "image",
+    "inspect",
+    "--format",
+    "{{.Id}}",
+    image,
+  ]);
+  return result.stdout.trim();
+}
+
+async function tryInspectDockerContainer(
+  name: string,
+): Promise<DockerContainerInspect | undefined> {
+  const result = await runDockerRaw(["inspect", name]);
+  if (!result.success) {
+    if (/no such (object|container)/i.test(result.stderr)) return undefined;
+    throw new Error(`Docker command failed: ${result.stderr}`);
+  }
+  return (JSON.parse(result.stdout) as DockerContainerInspect[])[0];
+}
+
+async function tryInspectDockerVolume(
+  name: string,
+): Promise<DockerVolumeInspect | undefined> {
+  const result = await runDockerRaw(["volume", "inspect", name]);
+  if (!result.success) {
+    if (/no such volume/i.test(result.stderr)) return undefined;
+    throw new Error(`Docker command failed: ${result.stderr}`);
+  }
+  return (JSON.parse(result.stdout) as DockerVolumeInspect[])[0];
 }
 
 async function dockerLines(args: string[]): Promise<string[]> {
@@ -364,33 +585,53 @@ async function dockerInspect<T>(
   return JSON.parse((await runDockerResult(args)).stdout) as T[];
 }
 
-async function runDockerResult(
+async function runDockerRaw(
   args: string[],
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ success: boolean; stdout: string; stderr: string }> {
   const result = await new Deno.Command("docker.exe", {
     args,
     stdout: "piped",
     stderr: "piped",
   }).output();
-  const stdout = new TextDecoder().decode(result.stdout);
-  const stderr = new TextDecoder().decode(result.stderr);
-  if (!result.success) throw new Error(`Docker command failed: ${stderr}`);
-  return { stdout, stderr };
+  return {
+    success: result.success,
+    stdout: new TextDecoder().decode(result.stdout),
+    stderr: new TextDecoder().decode(result.stderr),
+  };
+}
+
+async function runDockerResult(
+  args: string[],
+): Promise<{ stdout: string; stderr: string }> {
+  const result = await runDockerRaw(args);
+  if (!result.success) {
+    throw new Error(`Docker command failed: ${result.stderr}`);
+  }
+  return { stdout: result.stdout, stderr: result.stderr };
 }
 
 class DockerChrootEnvironment implements RuntimeEnv {
   #prepared = true;
   constructor(readonly hostName: string, readonly agentId: string) {}
-  prepare(): Promise<void> {
+
+  async prepare(): Promise<void> {
+    if (this.#prepared) return;
+    await runDocker([
+      "exec",
+      this.hostName,
+      "runtime-host",
+      "create-agent",
+      this.agentId,
+    ]);
     this.#prepared = true;
-    return Promise.resolve();
   }
+
   async exec(
     command: string | string[],
     options: CommandOptions = {},
   ): Promise<CommandResult> {
     if (!this.#prepared) {
-      throw new Error(`Agent environment "${this.agentId}" has been destroyed`);
+      throw new Error(`Agent environment "${this.agentId}" is not running`);
     }
     const commandArgs = Array.isArray(command)
       ? command
@@ -420,20 +661,30 @@ class DockerChrootEnvironment implements RuntimeEnv {
       commandId,
     });
   }
+
+  /** Stop processes and mounts but keep the persistent OverlayFS upperdir. */
   async destroy(): Promise<void> {
     if (this.#prepared) {
       await runDocker([
         "exec",
         this.hostName,
         "runtime-host",
-        "destroy-agent",
+        "stop-agent",
         this.agentId,
       ]);
     }
     this.#prepared = false;
   }
+
+  /** Reset means explicitly discard the private chroot and recreate it. */
   async reset(): Promise<void> {
-    await this.destroy();
+    await runDocker([
+      "exec",
+      this.hostName,
+      "runtime-host",
+      "purge-agent",
+      this.agentId,
+    ]);
     await runDocker([
       "exec",
       this.hostName,

@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
+import { resolve } from "@std/path";
 import { DockerRuntimeManager } from "../Runtime.ts";
 import { FilesystemFeature } from "../FilesystemFeature.ts";
 import { VisionFeature } from "../VisionFeature.ts";
@@ -55,9 +56,11 @@ Deno.test({
       for (const resource of ownedResources) {
         const labels = resource.Config?.Labels ?? resource.Labels;
         assertEquals(labels?.["agent-zoo.managed"], "true");
+        assertEquals(labels?.["agent-zoo.runtime"], runtime.runId);
         assertEquals(labels?.["agent-zoo.run"], runtime.runId);
         assertEquals(labels?.["agent-zoo.created"], runtime.createdAt);
         assertEquals(labels?.["agent-zoo.project"], runtime.project);
+        assertEquals(labels?.["agent-zoo.workspace"], resolve(shared));
       }
 
       const alphaResult = await alpha.exec(
@@ -615,7 +618,92 @@ Deno.test({
       assertEquals(httpResult.status, 200);
       assert(String(httpResult.body).includes("Example Domain"));
     } finally {
-      await runtime.destroy();
+      await runtime.purge();
+      await Deno.remove(shared, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "Docker runtime reuses config state and purges only the selected agent",
+  ignore: !dockerIntegrationEnabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const shared = await Deno.makeTempDir({
+      prefix: "agent-zoo-persistence-test-",
+    });
+    const project = resolve(shared, "persistent-config.yaml");
+    const first = new DockerRuntimeManager(
+      shared,
+      "agent-runtime:test",
+      undefined,
+      { project },
+    );
+    let second: DockerRuntimeManager | undefined;
+    try {
+      const alpha = await first.createEnv("alpha");
+      const firstWrite = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf persistent > /root/persistent-marker; " +
+          "printf '\\nexport AGENT_PERSISTED=yes\\n' >> /root/.bashrc",
+      ]);
+      assertEquals(firstWrite.exitCode, 0, JSON.stringify(firstWrite));
+
+      await alpha.destroy();
+      await first.stop();
+      const stopped = await new Deno.Command("docker.exe", {
+        args: ["inspect", "--format", "{{.State.Status}}", first.hostName],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      assert(stopped.success, new TextDecoder().decode(stopped.stderr));
+      assertEquals(new TextDecoder().decode(stopped.stdout).trim(), "exited");
+
+      second = new DockerRuntimeManager(
+        shared,
+        "agent-runtime:test",
+        undefined,
+        { project },
+      );
+      assertEquals(second.hostName, first.hostName);
+      assertEquals(second.dataVolumeName, first.dataVolumeName);
+
+      const restoredAlpha = await second.createEnv("alpha");
+      const restored = await restoredAlpha.exec([
+        "/bin/bash",
+        "--login",
+        "-c",
+        "cat /root/persistent-marker; test \"$AGENT_PERSISTED\" = yes",
+      ]);
+      assertEquals(restored.exitCode, 0, JSON.stringify(restored));
+      assert(restored.stdout.includes("persistent"));
+
+      const beta = await second.createEnv("beta");
+      const betaWrite = await beta.exec([
+        "/bin/bash",
+        "-c",
+        "printf beta > /root/beta-marker; test ! -e /root/persistent-marker",
+      ]);
+      assertEquals(betaWrite.exitCode, 0, JSON.stringify(betaWrite));
+
+      await second.purgeEnv("alpha");
+      const cleanAlpha = await second.createEnv("alpha");
+      const alphaWasReset = await cleanAlpha.exec([
+        "/bin/bash",
+        "-c",
+        "test ! -e /root/persistent-marker",
+      ]);
+      assertEquals(alphaWasReset.exitCode, 0, JSON.stringify(alphaWasReset));
+      const betaSurvived = await beta.exec([
+        "/bin/bash",
+        "-c",
+        "test \"$(cat /root/beta-marker)\" = beta",
+      ]);
+      assertEquals(betaSurvived.exitCode, 0, JSON.stringify(betaSurvived));
+    } finally {
+      await (second ?? first).purge().catch(() => {});
       await Deno.remove(shared, { recursive: true });
     }
   },
@@ -663,7 +751,7 @@ Deno.test({
       ]);
       assertEquals(isolated.exitCode, 0, JSON.stringify(isolated));
     } finally {
-      await runtime.destroy();
+      await runtime.purge();
       await Deno.remove(shared, { recursive: true });
     }
   },

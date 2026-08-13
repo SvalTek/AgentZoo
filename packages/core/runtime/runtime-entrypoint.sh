@@ -41,9 +41,35 @@ mount_agent_dev() {
 
 unmount_agent_dev() {
   local dev="$1"
-  mountpoint -q "$dev/pts" && umount "$dev/pts"
-  mountpoint -q "$dev/shm" && umount "$dev/shm"
-  mountpoint -q "$dev" && umount "$dev"
+  if mountpoint -q "$dev/pts"; then umount "$dev/pts"; fi
+  if mountpoint -q "$dev/shm"; then umount "$dev/shm"; fi
+  if mountpoint -q "$dev"; then umount "$dev"; fi
+}
+
+
+stop_agent() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  if agent_init_running "$root"; then
+    local init_pid
+    init_pid="$(cat "${root}/init.pid")"
+    kill "$init_pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      kill -0 "$init_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -KILL "$init_pid" 2>/dev/null || true
+  fi
+  if [[ -s "${root}/launcher.pid" ]]; then
+    local launcher_pid
+    launcher_pid="$(cat "${root}/launcher.pid")"
+    kill "$launcher_pid" 2>/dev/null || true
+  fi
+  unmount_agent_dev "${root}/merged/dev"
+  mountpoint -q "${root}/merged/shared" && umount "${root}/merged/shared"
+  mountpoint -q "${root}/merged" && umount "${root}/merged"
+  rm -f "${root}/init.pid" "${root}/launcher.pid" "${root}/namespace.ready"
+  rm -rf "${root}/commands"
 }
 
 if [[ "${1:-}" == "create-agent" ]]; then
@@ -56,6 +82,7 @@ if [[ "${1:-}" == "create-agent" ]]; then
   fi
   if ! agent_init_running "$root"; then
     rm -f "${root}/init.pid" "${root}/launcher.pid" "${root}/namespace.ready"
+    rm -rf "${root}/commands"
     nohup unshare --mount --pid --fork /usr/local/bin/runtime-host agent-init "${2}" \
       </dev/null >"${root}/init.log" 2>&1 &
     launcher_pid="$!"
@@ -82,25 +109,17 @@ if [[ "${1:-}" == "create-agent" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "destroy-agent" ]]; then
+if [[ "${1:-}" == "stop-agent" ]]; then
   root="$(agent_root "${2:?agent id required}")"
-  if agent_init_running "$root"; then
-    init_pid="$(cat "${root}/init.pid")"
-    kill "$init_pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-      kill -0 "$init_pid" 2>/dev/null || break
-      sleep 0.05
-    done
-    kill -KILL "$init_pid" 2>/dev/null || true
-  fi
-  if [[ -s "${root}/launcher.pid" ]]; then
-    launcher_pid="$(cat "${root}/launcher.pid")"
-    kill "$launcher_pid" 2>/dev/null || true
-  fi
-  unmount_agent_dev "${root}/merged/dev"
-  mountpoint -q "${root}/merged/shared" && umount "${root}/merged/shared"
-  mountpoint -q "${root}/merged" && umount "${root}/merged"
-  rm -rf "${root}"
+  stop_agent "$root"
+  exit 0
+fi
+
+if [[ "${1:-}" == "purge-agent" || "${1:-}" == "destroy-agent" ]]; then
+  root="$(agent_root "${2:?agent id required}")"
+  [[ -d "$root" ]] || { echo "agent environment does not exist" >&2; exit 5; }
+  stop_agent "$root"
+  rm -rf "$root"
   exit 0
 fi
 

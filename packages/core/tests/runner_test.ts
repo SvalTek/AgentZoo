@@ -1,4 +1,10 @@
-import { assert, assertEquals, assertMatch, assertThrows } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertMatch,
+  assertRejects,
+  assertThrows,
+} from "@std/assert";
 import type { LanguageModel } from "npm:ai@^6";
 import {
   AgentActivationError,
@@ -256,6 +262,27 @@ Deno.test("runner retains failed transcripts and continues another agent", async
   );
   assertEquals(survivor.prompts.length, 1);
   assertEquals(zoo.state().state, "completed");
+});
+
+Deno.test("shutdown still disposes runtime when an actor stop fails", async () => {
+  let disposed = 0;
+  const actor = new class extends FakeActor {
+    override stop(): Promise<void> {
+      this.stopped++;
+      return Promise.reject(new Error("stop failed"));
+    }
+  }("alpha", { id: "alpha", model: "local" }, []);
+  const zoo = new AgentZoo({
+    dispose: () => {
+      disposed++;
+      return Promise.resolve();
+    },
+  });
+  zoo.registerAgent(actor);
+
+  await assertRejects(() => zoo.stop("test"), AggregateError, "shutdown failed");
+  assertEquals(actor.stopped, 1);
+  assertEquals(disposed, 1);
 });
 
 class FakeEnv implements RuntimeEnv {

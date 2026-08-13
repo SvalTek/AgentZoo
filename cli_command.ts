@@ -1,12 +1,16 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
 import { Command } from "@cliffy/command";
-import { resolve } from "@std/path";
+import { dirname, resolve } from "@std/path";
 import { exists } from "@std/fs";
 import {
+  cleanupManagedDockerProject,
   cleanupManagedDockerResources,
+  dockerRuntimeIdForProject,
+  DockerRuntimeManager,
   listManagedDockerImages,
   listManagedDockerRuns,
+  loadConfig,
   type ManagedDockerImage,
   type ManagedDockerRun,
 } from "@agent-zoo/core";
@@ -15,7 +19,15 @@ export interface DockerCliActions {
   listRuns(): Promise<ManagedDockerRun[]>;
   listImages(): Promise<ManagedDockerImage[]>;
   cleanup(
-    runId: string | undefined,
+    runtimeId: string | undefined,
+    pruneImages: boolean,
+  ): Promise<{
+    containers: readonly string[];
+    volumes: readonly string[];
+    imagesPruned: boolean;
+  }>;
+  cleanupProject(
+    project: string,
     pruneImages: boolean,
   ): Promise<{
     containers: readonly string[];
@@ -28,6 +40,7 @@ const defaultDockerActions: DockerCliActions = {
   listRuns: listManagedDockerRuns,
   listImages: listManagedDockerImages,
   cleanup: cleanupManagedDockerResources,
+  cleanupProject: cleanupManagedDockerProject,
 };
 
 export function createCli(
@@ -47,11 +60,11 @@ export function createCli(
     });
 
   const docker = new Command()
-    .description("Inspect or clean up labelled AgentZoo Docker resources.");
+    .description("Inspect or purge labelled AgentZoo Docker resources.");
   docker.command(
     "list",
     new Command()
-      .description("List managed Docker runs, volumes, and images.")
+      .description("List managed Docker runtimes, volumes, and images.")
       .action(async () => {
         const [runs, images] = await Promise.all([
           dockerActions.listRuns(),
@@ -61,31 +74,106 @@ export function createCli(
       }),
   );
   docker.command(
-    "cleanup",
+    "purge",
     new Command()
-      .description("Remove explicitly selected managed Docker resources.")
-      .option("--run <id:string>", "Remove one managed run")
-      .option("--all", "Remove every managed run")
+      .description("Permanently remove selected managed Docker runtime state.")
+      .option(
+        "-c, --config <path:string>",
+        "Purge every runtime owned by this config",
+      )
+      .option("--runtime <id:string>", "Purge one managed runtime id")
+      .option("--all", "Purge every managed runtime")
       .option(
         "--prune-images",
         "Also remove unused managed runtime images",
       )
       .action(async (options) => {
-        if (Boolean(options.run) === Boolean(options.all)) {
-          throw new Error("Specify exactly one of --run or --all");
+        const selectors = [
+          options.config !== undefined,
+          options.runtime !== undefined,
+          options.all === true,
+        ].filter(Boolean).length;
+        if (selectors !== 1) {
+          throw new Error("Specify exactly one of --config, --runtime, or --all");
         }
-        const result = await dockerActions.cleanup(
-          options.all ? undefined : options.run,
-          options.pruneImages ?? false,
-        );
+
+        const pruneImages = options.pruneImages ?? false;
+        const result = options.config
+          ? await dockerActions.cleanupProject(
+            resolve(options.config),
+            pruneImages,
+          )
+          : await dockerActions.cleanup(
+            options.all ? undefined : options.runtime,
+            pruneImages,
+          );
         console.log(
-          `Removed ${result.containers.length} container(s) and ${result.volumes.length} volume(s).`,
+          `Purged ${result.containers.length} container(s) and ${result.volumes.length} volume(s).`,
         );
         if (result.imagesPruned) console.log("Pruned unused managed images.");
       }),
   );
   root.command("docker", docker);
+
+  const agent = new Command()
+    .description("Manage persistent per-agent chroot state.");
+  agent.command(
+    "purge",
+    new Command()
+      .description(
+        "Permanently delete one agent chroot while keeping its config runtime.",
+      )
+      .arguments("<id:string>")
+      .option("-c, --config <path:string>", "AgentZoo YAML configuration path")
+      .action(async (options, id) => {
+        const configPath = await resolveConfigPath(options.config);
+        await purgeConfiguredAgent(configPath, id, dockerActions);
+        console.log(`Purged persistent chroot for ${id}.`);
+      }),
+  );
+  root.command("agent", agent);
+
   return root;
+}
+
+async function purgeConfiguredAgent(
+  configPath: string,
+  agentId: string,
+  dockerActions: DockerCliActions,
+): Promise<void> {
+  const runtimeId = dockerRuntimeIdForProject(configPath);
+  const runtimeState = (await dockerActions.listRuns()).find((run) =>
+    run.runId === runtimeId
+  );
+  if (!runtimeState) {
+    throw new Error(
+      `No persistent runtime with id "${runtimeId}" exists for config "${configPath}"`,
+    );
+  }
+  if (
+    runtimeState.containers.some((container) => container.state === "running")
+  ) {
+    throw new Error(
+      `Stop AgentZoo for config "${configPath}" before purging an agent chroot`,
+    );
+  }
+
+  const config = await loadConfig(configPath);
+  const workspaceRoot = resolve(
+    dirname(configPath),
+    config.runtime.sharedWorkspace,
+  );
+  const runtime = new DockerRuntimeManager(
+    workspaceRoot,
+    undefined,
+    undefined,
+    { project: configPath },
+  );
+  try {
+    await runtime.purgeEnv(agentId);
+  } finally {
+    await runtime.stop();
+  }
 }
 
 export function formatManagedDockerResources(
@@ -94,13 +182,13 @@ export function formatManagedDockerResources(
 ): string {
   const lines: string[] = [];
   if (!runs.length) {
-    lines.push("Managed runs: none");
+    lines.push("Managed runtimes: none");
   } else {
-    lines.push(`Managed runs: ${runs.length}`);
+    lines.push(`Managed runtimes: ${runs.length}`);
     for (const run of runs) {
       lines.push(`  ${run.runId}`);
       if (run.createdAt) lines.push(`    created: ${run.createdAt}`);
-      if (run.project) lines.push(`    project: ${run.project}`);
+      if (run.project) lines.push(`    config: ${run.project}`);
       for (const container of run.containers) {
         lines.push(
           `    container: ${container.name} (${container.state}, ${container.image})`,

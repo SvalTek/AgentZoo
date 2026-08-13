@@ -21,7 +21,7 @@ import { VisionFeature } from "./VisionFeature.ts";
 import { HttpFeature } from "./HttpFeature.ts";
 import { FeatureRegistry } from "./Feature.ts";
 import { createCompletionTool, createYieldTool } from "./LifecycleTools.ts";
-import type { RuntimeManager } from "./types.ts";
+import type { RuntimeEnv, RuntimeManager } from "./types.ts";
 import type { ModelRuntimeConfig } from "./types.ts";
 
 export type ServiceFactory = () =>
@@ -74,151 +74,173 @@ export async function buildAgentZoo(
       : new DockerRuntimeManager(workspace.root, undefined, undefined, {
         project: options.runtimeProject,
       }));
-
-  const population = expandPopulation(config);
-  const featureRegistry = new FeatureRegistry<AgentRunDeps>();
-  featureRegistry.register(new ShellFeature());
-  featureRegistry.register(new FilesystemFeature());
-  featureRegistry.register(new VisionFeature());
-  featureRegistry.register(new HttpFeature());
-  const initialPrompts: Record<string, string | undefined> = {};
-  const builtAgents: ZooAgent[] = [];
-  for (const member of population) {
-    if (!models.has(member.model)) {
-      throw new Error(
-        `Agent "${member.id}" references unknown model "${member.model}"`,
-      );
-    }
-    if (member.captioningModel && !models.has(member.captioningModel)) {
-      throw new Error(
-        `Agent "${member.id}" references unknown captioningModel "${member.captioningModel}"`,
-      );
-    }
-    const modelConfig = models.get(member.model);
-    const modelRuntime = mergeModelRuntimeConfig(modelConfig, member);
-    if (
-      modelRuntime.context?.window !== undefined &&
-      modelRuntime.context.maxOutputTokens !== undefined &&
-      modelRuntime.context.maxOutputTokens >= modelRuntime.context.window
-    ) {
-      throw new Error(
-        `Agent "${member.id}" has maxOutputTokens greater than or equal to its context window`,
-      );
-    }
-    const systemPrompt = member.system
-      ? await templates.get(member.system)({
-        agent: member.id,
-        name: member.name,
-        id: member.id,
-        type: member.type,
-        model: member.model,
-      })
-      : member.systemPrompt;
-    const tools: ToolDefinition<AgentRunDeps>[] = [];
-    for (const feature of member.features) {
-      let registered;
-      try {
-        registered = featureRegistry.get(feature);
-      } catch {
-        throw new Error(
-          `Agent "${member.id}" references unknown feature "${feature}"`,
-        );
-      }
-      tools.push(...await registered.createTools?.() ?? []);
-    }
-    const orderedTools = orderAgentTools(tools);
-    orderedTools.push(createYieldTool());
-    if (config.completion.enabled) orderedTools.push(createCompletionTool());
-    const env = await runtime.createEnv(member.id);
-
-    // Configure a default Git identity for the agent's private environment.
-    const gitName = member.name ?? member.id;
-    const gitEmail = `${member.id}@agentzoo.local`;
-
-    await Promise.all([
-      env.exec([
-        "git",
-        "config",
-        "--global",
-        "user.name",
-        gitName,
-      ]),
-      env.exec([
-        "git",
-        "config",
-        "--global",
-        "user.email",
-        gitEmail,
-      ]),
-    ]).catch(() => {
-      // Git identity is convenience provisioning, not required for the environment.
-    });
-
-    // Push the agent into the population with its resolved system prompt and runtime context.
-    builtAgents.push(
-      new ZooAgent(
-        {
-          id: member.id,
-          name: member.name,
-          type: member.type,
-          model: member.model,
-          captioningModel: member.captioningModel,
-          systemPrompt,
-          features: member.features,
-          cwd: member.cwd,
-          maxTurns: member.maxTurns,
-          context: modelRuntime.context,
-          sampling: modelRuntime.sampling,
-          workspace: true,
-        },
-        env,
-        models,
-        options.modelFactory ?? createLanguageModel,
-        orderedTools,
-      ),
-    );
-    initialPrompts[member.id] = composeInitialPrompt(
-      member.prompt,
-      options.taskPrompt ?? config.taskPrompt,
-    );
-  }
-
-  const disposable = runtime as RuntimeManager & {
+  const lifecycle = runtime as RuntimeManager & {
+    stop?: () => Promise<void>;
     destroy?: () => Promise<void>;
   };
-  const dispose = async () => {
-    await disposable.destroy?.();
-    if (Context.tryGet("agentZoo") === zoo) Context.delete("agentZoo");
+  let zoo: AgentZoo | undefined;
+
+  const stopRuntime = async () => {
+    if (lifecycle.stop) await lifecycle.stop();
+    else await lifecycle.destroy?.();
+  };
+
+  const clearAmbientContext = () => {
+    if (zoo && Context.tryGet("agentZoo") === zoo) Context.delete("agentZoo");
     if (Context.tryGet("models") === models) Context.delete("models");
     if (Context.tryGet("templates") === templates) Context.delete("templates");
     if (Context.tryGet("runtime") === runtime) Context.delete("runtime");
     if (Context.tryGet("workspace") === workspace) Context.delete("workspace");
   };
-  const zoo = new AgentZoo({
-    completionEnabled: config.completion.enabled,
-    initialPrompts,
-    clock: options.clock,
-    random: options.random,
-    dispose,
-  });
-  for (const [name, factory] of Object.entries(options.services ?? {})) {
-    if (config.services.includes(name)) zoo.use(name, await factory());
-  }
-  for (const name of config.services) {
-    if (!options.services?.[name]) {
-      throw new Error(`Configured service "${name}" has no registered factory`);
+
+  try {
+    const population = expandPopulation(config);
+    const featureRegistry = new FeatureRegistry<AgentRunDeps>();
+    featureRegistry.register(new ShellFeature());
+    featureRegistry.register(new FilesystemFeature());
+    featureRegistry.register(new VisionFeature());
+    featureRegistry.register(new HttpFeature());
+    const initialPrompts: Record<string, string | undefined> = {};
+    const builtAgents: ZooAgent[] = [];
+    for (const member of population) {
+      if (!models.has(member.model)) {
+        throw new Error(
+          `Agent "${member.id}" references unknown model "${member.model}"`,
+        );
+      }
+      if (member.captioningModel && !models.has(member.captioningModel)) {
+        throw new Error(
+          `Agent "${member.id}" references unknown captioningModel "${member.captioningModel}"`,
+        );
+      }
+      const modelConfig = models.get(member.model);
+      const modelRuntime = mergeModelRuntimeConfig(modelConfig, member);
+      if (
+        modelRuntime.context?.window !== undefined &&
+        modelRuntime.context.maxOutputTokens !== undefined &&
+        modelRuntime.context.maxOutputTokens >= modelRuntime.context.window
+      ) {
+        throw new Error(
+          `Agent "${member.id}" has maxOutputTokens greater than or equal to its context window`,
+        );
+      }
+      const systemPrompt = member.system
+        ? await templates.get(member.system)({
+          agent: member.id,
+          name: member.name,
+          id: member.id,
+          type: member.type,
+          model: member.model,
+        })
+        : member.systemPrompt;
+      const tools: ToolDefinition<AgentRunDeps>[] = [];
+      for (const feature of member.features) {
+        let registered;
+        try {
+          registered = featureRegistry.get(feature);
+        } catch {
+          throw new Error(
+            `Agent "${member.id}" references unknown feature "${feature}"`,
+          );
+        }
+        tools.push(...await registered.createTools?.() ?? []);
+      }
+      const orderedTools = orderAgentTools(tools);
+      orderedTools.push(createYieldTool());
+      if (config.completion.enabled) orderedTools.push(createCompletionTool());
+
+      const env = await runtime.createEnv(member.id);
+      await configureGitIdentity(env, member);
+
+      builtAgents.push(
+        new ZooAgent(
+          {
+            id: member.id,
+            name: member.name,
+            type: member.type,
+            model: member.model,
+            captioningModel: member.captioningModel,
+            systemPrompt,
+            features: member.features,
+            cwd: member.cwd,
+            maxTurns: member.maxTurns,
+            context: modelRuntime.context,
+            sampling: modelRuntime.sampling,
+            workspace: true,
+          },
+          env,
+          models,
+          options.modelFactory ?? createLanguageModel,
+          orderedTools,
+        ),
+      );
+      initialPrompts[member.id] = composeInitialPrompt(
+        member.prompt,
+        options.taskPrompt ?? config.taskPrompt,
+      );
     }
+
+    const dispose = async () => {
+      try {
+        await stopRuntime();
+      } finally {
+        clearAmbientContext();
+      }
+    };
+    zoo = new AgentZoo({
+      completionEnabled: config.completion.enabled,
+      initialPrompts,
+      clock: options.clock,
+      random: options.random,
+      dispose,
+    });
+    for (const [name, factory] of Object.entries(options.services ?? {})) {
+      if (config.services.includes(name)) zoo.use(name, await factory());
+    }
+    for (const name of config.services) {
+      if (!options.services?.[name]) {
+        throw new Error(`Configured service "${name}" has no registered factory`);
+      }
+    }
+    for (const agent of builtAgents) zoo.registerAgent(agent);
+
+    // Populate the established ambient registry for existing services/routers.
+    Context.set("agentZoo", zoo);
+    Context.set("models", models);
+    Context.set("templates", templates);
+    Context.set("runtime", runtime);
+    Context.set("workspace", workspace);
+
+    return { zoo, models, templates, runtime, workspace };
+  } catch (error) {
+    clearAmbientContext();
+    try {
+      await stopRuntime();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "AgentZoo startup failed and runtime cleanup also failed",
+      );
+    }
+    throw error;
   }
-  for (const agent of builtAgents) zoo.registerAgent(agent);
+}
 
-  // Populate the established ambient registry for existing services/routers.
-  Context.set("agentZoo", zoo);
-  Context.set("models", models);
-  Context.set("templates", templates);
-  Context.set("runtime", runtime);
-  Context.set("workspace", workspace);
+async function configureGitIdentity(
+  env: RuntimeEnv,
+  member: Pick<PopulationMember, "id" | "name">,
+): Promise<void> {
+  const identity = [
+    ["user.name", member.name ?? member.id],
+    ["user.email", `${member.id}@agentzoo.local`],
+  ] as const;
 
-  return { zoo, models, templates, runtime, workspace };
+  for (const [key, value] of identity) {
+    await env.exec(
+      ["git", "config", "--global", key, value],
+      { env: { HOME: "/root" } },
+    ).catch(() => undefined);
+  }
 }
 
 const BuiltinToolOrder = [

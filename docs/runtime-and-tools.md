@@ -77,11 +77,12 @@ are:
   supported.
 - `cwd` — optional directory path only; defaults to the agent's configured cwd.
   Commands, operators, and redirects belong in `command`, not `cwd`.
-- `timeoutMs` — optional positive timeout, capped at 300,000 ms. The default is
-  120,000 ms. On timeout, the runtime terminates the command and its descendant
-  process group before returning control. A pipeline or package installation
-  does not continue secretly after a timed-out result. Unrelated background
-  processes started by an earlier completed command are not terminated.
+- `timeoutMs` — optional positive timeout, capped at 1,800,000 ms. The default
+  is 120,000 ms. On timeout, the runtime terminates the command and its
+  descendant process group before returning control. A pipeline or package
+  installation does not continue secretly after a timed-out result. Unrelated
+  background processes started by an earlier completed command are not
+  terminated.
 
 Model-visible stdout and stderr are each bounded to 65,536 characters and report
 whether truncation occurred. Durable telemetry retains the complete available
@@ -122,10 +123,10 @@ for larger or multi-region changes, prefer `apply_patch`.
 ### `edit_file`
 
 Replaces the exact `oldText` with `newText`. Both accept normal multiline text;
-an empty `newText` deletes the match. By default there must be exactly one
-match. Zero matches and ambiguous multiple matches fail. Set `replaceAll: true`
-to replace every exact match. Files larger than 4 MiB and binary files are
-rejected.
+an empty `newText` deletes the match. `oldText` and `newText` are each limited
+to 8,192 characters. By default there must be exactly one match. Zero matches
+and ambiguous multiple matches fail. Set `replaceAll: true` to replace every
+exact match. Files larger than 4 MiB and binary files are rejected.
 
 ### `apply_patch`
 
@@ -167,6 +168,26 @@ most 65,536 bytes of body content, with truncation indicated. Durable telemetry
 retains up to 1 MiB of response body.
 
 The feature does not add search, browser automation, or research behavior.
+
+## Optional `vision` feature
+
+Add `vision` explicitly:
+
+```yaml
+features: [shell, filesystem, vision]
+```
+
+It exposes `view_image`, which lets the model view an image file from the
+computer. `path` selects the image as an absolute path or a path relative to
+the current working directory; an optional `cwd` sets the directory the path is
+resolved from and defaults to the current working directory. The complete image
+is read and returned to the model. The image type is detected from the file's
+magic bytes (PNG, JPEG, GIF, WebP, BMP, and JPEG 2000); a file that is not a
+recognized image produces an error.
+
+When the agent configures `captioningModel`, `view_image` delegates captioning
+to that model instead of the agent's own model. Otherwise it uses the agent's
+own model.
 
 ## Features are interfaces, not capability sandboxes
 

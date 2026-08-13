@@ -18,10 +18,10 @@ deno task dev
 ```
 
 Use another config with `deno task dev --config path/to/zoo.yaml`. The Cliffy
-command starts a deno-ink dashboard when attached to a terminal. Press `q` or
-Ctrl+C for a graceful stop. Use `--no-ui` for line-oriented output. Supply a
-run-wide objective without editing YAML using `--task "..."`; it overrides the
-top-level `taskPrompt` for that run.
+command starts a deno-ink dashboard when attached to an interactive terminal.
+Press `q` or Ctrl+C for a graceful stop. Use `--no-ui` for line-oriented output.
+Supply a run-wide objective without editing YAML using `--task "..."`; it
+overrides the top-level `taskPrompt` for that run.
 
 Every standalone run also writes a timestamped `agent-zoo-*.jsonl` file beside
 the selected YAML. It records the initial prompt, Vibes message deltas, provider
@@ -29,6 +29,11 @@ request deltas and responses, model output, correlated tool arguments/results,
 transitions, and errors, tagged with the agent and both the configured and
 provider model names. Failed activations retain their partial transcript and
 model exchanges, including `MaxTurnsError` runs.
+
+Each run also labels its Docker containers, volumes, and images. Inspect or
+remove them with `deno task dev docker list` and `deno task dev docker cleanup
+--run <id>` (or `--all`, plus optional `--prune-images`); see
+[getting-started](docs/getting-started.md).
 
 Each `agents` entry is a population group. `count` defaults to one and creates
 stable IDs such as `coding-1`. An optional `name` supplies a model-facing and

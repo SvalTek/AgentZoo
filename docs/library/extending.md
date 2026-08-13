@@ -28,6 +28,8 @@ const built = await buildAgentZoo(config, {
 Supported options are:
 
 - `baseDir` — base for the shared workspace path.
+- `runtimeProject` — optional host-facing identifier attached to managed
+  runtime resources; the standalone CLI supplies the config path.
 - `taskPrompt` — run-wide objective override.
 - `modelFactory` — construct a concrete AI SDK `LanguageModel` from a named
   `ModelRegistry` entry.
@@ -44,8 +46,8 @@ Supported options are:
 ```ts
 import type { LanguageModelFactory } from "agent-zoo";
 
-const modelFactory: LanguageModelFactory = (key, registry, settings) => {
-  const configured = registry.get(key);
+const modelFactory: LanguageModelFactory = (name, models, settings) => {
+  const configured = models.get(name);
   // settings contains effective context/sampling values after agent overrides.
   return createMyLanguageModel(configured, settings);
 };
@@ -62,7 +64,7 @@ A runtime manager owns multiple agent environments:
 import type { RuntimeManager } from "agent-zoo";
 
 const runtimeFactory = async (
-  runtimeConfig: { backend: "docker"; sharedWorkspace: string },
+  runtimeConfig: { backend?: "docker"; sharedWorkspace?: string },
   sharedWorkspace: string,
 ): Promise<RuntimeManager> => {
   return new MyRuntimeManager(runtimeConfig, sharedWorkspace);

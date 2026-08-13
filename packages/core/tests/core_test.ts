@@ -147,6 +147,22 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
   assert(!/agent[ -]?zoo/i.test(new DockerRuntimeManager("shared").hostName));
 });
 
+Deno.test("Docker runtime identity is stable per config path", () => {
+  const first = new DockerRuntimeManager("shared-a", undefined, undefined, {
+    project: "C:/projects/zoo-a/agent-zoo.yaml",
+  });
+  const same = new DockerRuntimeManager("shared-a", undefined, undefined, {
+    project: "C:/projects/zoo-a/agent-zoo.yaml",
+  });
+  const other = new DockerRuntimeManager("shared-b", undefined, undefined, {
+    project: "C:/projects/zoo-b/agent-zoo.yaml",
+  });
+
+  assertEquals(first.hostName, same.hostName);
+  assertEquals(first.dataVolumeName, same.dataVolumeName);
+  assert(first.hostName !== other.hostName);
+});
+
 Deno.test("Vibes preserves provider-facing tool definition order", async () => {
   const definitions = [
     ...await new ShellFeature().createTools(),

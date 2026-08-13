@@ -19,6 +19,18 @@ deno task dev [options]
 | `-h, --help`          | Show help                         |
 | `-V, --version`       | Show the CLI version              |
 
+Docker resource management subcommands:
+
+```text
+deno task dev docker list
+deno task dev docker cleanup [--run <id> | --all] [--prune-images]
+```
+
+`docker list` shows the labelled AgentZoo Docker resources (runs, volumes, and
+images). `docker cleanup` removes the labelled Docker resources for one run
+(`--run <id>`) or for every run (`--all`); add `--prune-images` to also remove
+unused managed runtime images.
+
 Without `--config`, the CLI uses `agent-zoo.yaml` when present, otherwise the
 checked-in `agent-zoo.example.yaml`.
 
@@ -27,12 +39,15 @@ checked-in `agent-zoo.example.yaml`.
 On an interactive terminal, the deno-ink dashboard enters the alternate screen
 and clears the terminal immediately. It shows:
 
-- Zoo state, selected config, log filename, and total run duration.
+- Zoo state, selected config, and total run duration.
 - The resolved objective when one exists.
 - Each agent's configured name and stable ID, type, model, state, current
   high-level activity, and active/idle duration.
 - Recent model inputs/outputs, tool arguments/results, yields, wakes, and
   errors, with bounded snippets.
+
+The dashboard header does not show the log filename; it is printed in `--no-ui`
+line-oriented mode.
 
 Configured names are displayed as `Alice (research-1)`. Stable IDs remain the
 unambiguous identity even when several agents deliberately share one name.

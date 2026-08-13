@@ -15,7 +15,9 @@ models: {}
 templates: {}
 runtime: {}
 services: []
-agents: []
+agents:
+  - type: example
+    model: local
 completion: {}
 ```
 
@@ -154,9 +156,10 @@ plus the conventional snake-case extensions for `top_k`, `min_p`, `typical_p`,
 and repetition controls. Support for those non-standard extensions ultimately
 depends on the selected compatible endpoint.
 
-`topK` remains part of the normalized configuration for providers that support
-it, but it is not supported by the current Ollama adapter. Configuring `topK`
-for an Ollama model produces an unsupported-setting warning in the activity log.
+`topK` remains part of the normalized configuration and is deliberately
+forwarded to the provider layer rather than ignored or stripped. The current
+Ollama adapter does not support it, however: `topK` is a no-op there, and the
+AI-SDK layer emits unsupported-setting noise on shutdown when it is configured.
 Leave it unset for Ollama; use `topP` and/or `minP` instead.
 
 Probability values (`topP`, `minP`, and `typicalP`) must be between 0 and 1.
@@ -266,6 +269,13 @@ The list length determines the population size. `names` cannot be combined with
 Required key from the top-level `models` mapping. An unknown key causes the
 build to fail before the zoo starts.
 
+### `captioningModel`
+
+Optional key from the top-level `models` mapping. When set, the `vision`
+feature's `view_image` tool delegates image captioning to this model instead of
+the agent's own model. An unknown key causes the build to fail before the zoo
+starts.
+
 ### `system` and `systemPrompt`
 
 Use exactly one:
@@ -289,9 +299,9 @@ List of structured convenience interfaces shown to the model. Defaults to:
 features: [shell, filesystem]
 ```
 
-Supported built-in values are `shell`, `filesystem`, and `http`. The lifecycle
-tool `yield` is always added. `complete` is added only when completion is
-enabled.
+Supported built-in values are `shell`, `filesystem`, `http`, and `vision`.
+`vision` is opt-in and is not part of the default set. The lifecycle tool
+`yield` is always added. `complete` is added only when completion is enabled.
 
 Features affect the model-visible tool list; they do not necessarily remove an
 underlying capability already available through `shell`.

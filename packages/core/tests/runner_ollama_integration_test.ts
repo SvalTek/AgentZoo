@@ -1,5 +1,5 @@
 import { assertEquals } from "@std/assert";
-import { buildAgentZoo, parseConfig } from "../mod.ts";
+import { buildAgentZoo, DockerRuntimeManager, parseConfig } from "../mod.ts";
 
 let enabled = false;
 try {
@@ -85,6 +85,9 @@ completion:
     } finally {
       clearTimeout(timeout);
       await built.zoo.stop("live test cleanup");
+      if (built.runtime instanceof DockerRuntimeManager) {
+        await built.runtime.purge();
+      }
       await Deno.remove(directory, { recursive: true });
     }
   },

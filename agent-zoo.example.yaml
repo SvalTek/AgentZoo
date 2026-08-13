@@ -1,0 +1,120 @@
+# Copyright (C) 2026 Theros <https://github.com/therosin>
+#
+# This file is part of AgentZoo and is licensed GPL-3.0-or-later.
+
+# Optional objective supplied to every configured agent.
+# taskPrompt: Inspect the available files and complete the requested work.
+
+models:
+  local-qwen:
+    provider: ollama
+    model: qwen3.5:9b
+    # apiKey: ENV[OLLAMA_API_KEY]
+    reasoning: true
+    reasoningEffort: medium
+    context:
+      # Total input plus output budget. Older history is trimmed to fit.
+      window: 32768
+      # Reserve this many tokens for each model response.
+      maxOutputTokens: 8192
+    sampling:
+      temperature: 0.9
+      topP: 0.9
+      # topK is not supported by the current Ollama adapter.
+      minP: 0.05
+
+  local-gemma:
+    provider: ollama
+    model: gemma4:12b
+    reasoning: true
+    reasoningEffort: medium
+    context:
+      window: 32768
+      maxOutputTokens: 8192
+    sampling:
+      temperature: 0.9
+      topP: 0.9
+      # topK is not supported by the current Ollama adapter.
+      minP: 0.05
+
+  local-ornith:
+    provider: ollama
+    model: satgeze/ornith-9b-1m:latest
+    reasoning: true
+    reasoningEffort: medium
+    context:
+      window: 32768
+      maxOutputTokens: 8192
+    sampling:
+      temperature: 0.9
+      topP: 0.9
+      # topK is not supported by the current Ollama adapter.
+      minP: 0.05
+
+
+templates:
+  coding-system: |
+    {#IF name}
+    You are {name}.
+    {#ELSE}
+    You are {agent}.
+    {#END}
+    This is your computer. You can use or modify it freely, including installing software and tools.
+    How you spend your time is up to you.
+  research-system: |
+    {#IF name}
+    You are {name}.
+    {#ELSE}
+    You are {agent}.
+    {#END}
+    This is your computer. You can use or modify it freely, including installing software and tools.
+    How you spend your time is up to you.
+
+runtime:
+  backend: docker
+  sharedWorkspace: .shared
+
+# Service factories are supplied by an embedding application. The standalone
+# distribution currently has no optional services enabled by default.
+services: []
+
+agents:
+  - type: coding
+    #count: 2
+    names:
+      - Alice
+      - Bob
+    model: local-ornith
+    #model: local-gemma
+    # captioningModel: local-qwen
+    # Optional: dedicated vision model for image captioning.
+    # When set, view_image delegates to this model instead of the agent's
+    # own model. Required for non-vision models. For Ollama, the agent's
+    # own model is used automatically (Ollama can't handle images in tool
+    # results), but a captioningModel overrides that behavior.
+    system: coding-system
+    # Maximum model/tool iterations within one activation.
+    maxTurns: 100
+    # Agent settings override individual fields from the named model.
+    sampling:
+      temperature: 0.6
+    # Add vision to let the agent view image files via view_image.
+    features: [shell, filesystem, vision]
+    #prompt: Inspect your environment and report what is present, then yield.
+
+  # With no prompt, this agent starts from a real listing of its private root.
+  - type: research
+    # A name applies to every member of this population entry. Use names for
+    # per-member names; names determines the population size instead of count.
+    name: Rowan
+    count: 1
+    model: local-ornith
+    #model: local-gemma
+    system: research-system
+    maxTurns: 100
+    # Add http to expose the structured http_request convenience tool.
+    features: [shell, filesystem, vision]
+
+completion:
+  # When false, agents keep cycling until AgentZoo is stopped externally.
+  enabled: true

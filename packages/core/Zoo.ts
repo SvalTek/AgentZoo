@@ -523,19 +523,33 @@ export class AgentZoo extends EventTarget {
   private async shutdown(): Promise<void> {
     if (this.#shutdown) return;
     this.#shutdown = true;
+    const errors: unknown[] = [];
     for (const service of [...this.#services.values()].reverse()) {
-      await service.stop();
+      try {
+        await service.stop();
+      } catch (error) {
+        errors.push(error);
+      }
     }
     for (const record of [...this.#agents.values()].reverse()) {
       try {
         await record.actor.stop();
+      } catch (error) {
+        errors.push(error);
       } finally {
         if (record.state !== "completed" && record.state !== "errored") {
           this.setAgentState(record, "stopped", "Stopped");
         }
       }
     }
-    await this.#dispose?.();
+    try {
+      await this.#dispose?.();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) {
+      throw new AggregateError(errors, "AgentZoo shutdown failed");
+    }
   }
 }
 
