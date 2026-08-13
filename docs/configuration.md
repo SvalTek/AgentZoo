@@ -11,13 +11,16 @@ models, environments, services, or agents.
 ```yaml
 taskPrompt: Optional objective for the whole run
 
-models: {}
+models:
+  local-qwen:
+    provider: ollama
+    model: qwen3.5:9b
 templates: {}
 runtime: {}
 services: []
 agents:
   - type: example
-    model: local
+    model: local-qwen
 completion: {}
 ```
 

@@ -86,16 +86,16 @@ deno task dev docker list
 Remove one selected run and its named data volume:
 
 ```powershell
-deno task dev docker cleanup --run <run-id>
+deno task dev docker purge --runtime <run-id>
 ```
 
 Or explicitly remove every labelled managed run:
 
 ```powershell
-deno task dev docker cleanup --all
+deno task dev docker purge --all
 ```
 
-Add `--prune-images` to either cleanup command to remove unused runtime images
+Add `--prune-images` to either purge command to remove unused runtime images
 that also carry AgentZoo's managed-image label. Cleanup never selects resources
 from an `agent-runtime-*` name prefix. Resources from older versions without
 ownership labels are reported by Docker itself but are not touched by these

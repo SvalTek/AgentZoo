@@ -22,7 +22,7 @@ Deno.test("Cliffy standalone command forwards explicit config and no-ui mode", a
   assertEquals(captured?.task, "Complete the run");
 });
 
-Deno.test("Cliffy Docker cleanup requires and forwards explicit scope", async () => {
+Deno.test("Cliffy Docker purge requires and forwards explicit scope", async () => {
   const calls: Array<{ runId?: string; pruneImages: boolean }> = [];
   const actions = {
     listRuns: () => Promise.resolve([]),
@@ -35,14 +35,20 @@ Deno.test("Cliffy Docker cleanup requires and forwards explicit scope", async ()
         imagesPruned: pruneImages,
       });
     },
+    cleanupProject: (project: string, pruneImages: boolean) =>
+      Promise.resolve({
+        containers: [],
+        volumes: [],
+        imagesPruned: pruneImages,
+      }),
   };
   const originalLog = console.log;
   console.log = () => {};
   try {
     await createCli(() => Promise.resolve(), actions).parse([
       "docker",
-      "cleanup",
-      "--run",
+      "purge",
+      "--runtime",
       "run-1",
       "--prune-images",
     ]);

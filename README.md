@@ -31,8 +31,8 @@ provider model names. Failed activations retain their partial transcript and
 model exchanges, including `MaxTurnsError` runs.
 
 Each run also labels its Docker containers, volumes, and images. Inspect or
-remove them with `deno task dev docker list` and `deno task dev docker cleanup
---run <id>` (or `--all`, plus optional `--prune-images`); see
+remove them with `deno task dev docker list` and `deno task dev docker purge
+--runtime <id>` (or `--all`, plus optional `--prune-images`); see
 [getting-started](docs/getting-started.md).
 
 Each `agents` entry is a population group. `count` defaults to one and creates

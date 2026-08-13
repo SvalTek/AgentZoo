@@ -23,12 +23,12 @@ Docker resource management subcommands:
 
 ```text
 deno task dev docker list
-deno task dev docker cleanup [--run <id> | --all] [--prune-images]
+deno task dev docker purge [-c <config> | --runtime <id> | --all] [--prune-images]
 ```
 
 `docker list` shows the labelled AgentZoo Docker resources (runs, volumes, and
-images). `docker cleanup` removes the labelled Docker resources for one run
-(`--run <id>`) or for every run (`--all`); add `--prune-images` to also remove
+images). `docker purge` removes the labelled Docker resources for one run
+(`--runtime <id>`) or for every run (`--all`); add `--prune-images` to also remove
 unused managed runtime images.
 
 Without `--config`, the CLI uses `agent-zoo.yaml` when present, otherwise the
