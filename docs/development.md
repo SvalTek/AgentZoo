@@ -22,6 +22,21 @@ network, signal, and integration behavior are part of the application.
 The normal suite leaves live Docker/Ollama tests gated so ordinary unit runs do
 not build runtime images or load large models.
 
+## Runtime image
+
+The Docker runtime image is tagged `agent-runtime:dev` and is built from
+`packages/core/runtime/Containerfile` with AgentZoo's managed labels. Build or
+refresh it with:
+
+```powershell
+deno task docker:build
+```
+
+`prepare()` also builds the image automatically (cached) when it is missing, so
+a fresh clone can run `deno task dev` directly. Run the task explicitly to
+refresh a stale image after changing `runtime-entrypoint.sh` or the
+`Containerfile`.
+
 ## Docker isolation integration
 
 ```powershell

@@ -19,6 +19,18 @@ standalone runtime is presently oriented toward a Windows host with Docker
 available. Docker is one outer runtime host; AgentZoo does not create one
 container per agent.
 
+Build the managed runtime image once before the first run:
+
+```powershell
+deno task docker:build
+```
+
+The image is tagged `agent-runtime:dev` and carries AgentZoo's managed labels, so
+`docker list` and `docker purge --prune-images` recognize it. The runtime also
+auto-builds the image (using Docker's cache) when it is missing, but an explicit
+build is the reliable way to refresh a stale image after updating
+`runtime-entrypoint.sh` or the `Containerfile`.
+
 For an Ollama model, pull it before the first run if necessary:
 
 ```powershell
