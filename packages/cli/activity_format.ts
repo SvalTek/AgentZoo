@@ -2,190 +2,420 @@
 
 import type { ZooActivityEvent } from "@agent-zoo/core";
 
-export interface ActivityDisplay {
+export interface MessageActivityDisplay {
+  readonly type: "message";
+  readonly key: string;
+  readonly at: number;
   readonly headline: string;
   readonly details: readonly string[];
 }
 
-/** Turn structured runner telemetry into short, useful terminal log entries. */
+export interface ToolActivityDisplay {
+  readonly type: "tool";
+  readonly key: string;
+  readonly at: number;
+  readonly toolCallId?: string;
+  readonly toolName: string;
+  readonly headline: string;
+  readonly status: "running" | "success" | "error";
+  readonly compact: readonly string[];
+  readonly details: readonly string[];
+}
+
+export type ActivityDisplay = MessageActivityDisplay | ToolActivityDisplay;
+
+/** Project raw runner telemetry into readable messages and correlated tools. */
+export function projectActivity(
+  events: readonly ZooActivityEvent[],
+  width = 100,
+): ActivityDisplay[] {
+  const available = Math.max(20, width - 6);
+  const displays: ActivityDisplay[] = [];
+  // A provider tool-call ID is only scoped to the agent/model turn which
+  // produced it. Multiple agents can quite legitimately emit `tool-1`; keep
+  // their lifecycle cards separate instead of allowing one to replace the
+  // other in the dashboard.
+  const tools = new Map<string, ToolActivityDisplay>();
+  const completedToolCalls = new Set(
+    events.flatMap((event) =>
+      event.kind === "agent:tool:end"
+        ? [toolCorrelationKey(event)].filter((key): key is string =>
+          key !== undefined
+        )
+        : []
+    ),
+  );
+  for (const event of events) {
+    if (event.kind === "agent:tool:start") {
+      const display = toolStartDisplay(event, available);
+      displays.push(display);
+      const correlationKey = toolCorrelationKey(event);
+      if (correlationKey) tools.set(correlationKey, display);
+      continue;
+    }
+    if (
+      event.kind === "agent:tool:error" &&
+      completedToolCalls.has(toolCorrelationKey(event) ?? "")
+    ) {
+      continue;
+    }
+    if (event.kind === "agent:tool:end" || event.kind === "agent:tool:error") {
+      const correlationKey = toolCorrelationKey(event);
+      const current = correlationKey ? tools.get(correlationKey) : undefined;
+      const display = toolEndDisplay(event, current, available);
+      if (current) {
+        const index = displays.indexOf(current);
+        if (index >= 0) displays[index] = display;
+        if (correlationKey) tools.set(correlationKey, display);
+      } else {
+        displays.push(display);
+        if (correlationKey) tools.set(correlationKey, display);
+      }
+      continue;
+    }
+    displays.push(...messageDisplays(event, available));
+  }
+  return displays;
+}
+
+/** Compatibility helper for callers that format one event at a time. */
 export function formatActivity(
   event: ZooActivityEvent,
   width = 100,
-): ActivityDisplay {
-  const available = Math.max(20, width - 4);
-  let details: string[];
-  try {
-    details = eventDetails(event)
-      .flatMap((line) => wrapLine(line, available))
-      .slice(0, 6);
-  } catch (error) {
-    details = labelledLines("activity detail", formatError(error));
-  }
-  const headline = typeof event.message === "string" && event.message
-    ? event.message
-    : typeof event.kind === "string"
-    ? event.kind
-    : "Activity";
-  return { headline, details };
+): Pick<ActivityDisplay, "headline" | "details"> {
+  return projectActivity([event], width)[0] ?? {
+    headline: event.message || event.kind,
+    details: [],
+  };
 }
 
-function eventDetails(event: ZooActivityEvent): string[] {
-  if (event.kind === "agent:wake") {
-    const prompt = objectString(event.detail, "prompt");
-    const systemContext = objectString(event.detail, "initialSystemContext");
-    const role = objectString(event.detail, "role");
-    return [
-      ...(systemContext ? compactLabelledLines("system", systemContext) : []),
-      ...(prompt
-        ? labelledLines(role === "system" ? "system" : "input", prompt)
-        : []),
-    ];
-  }
-  if (event.kind === "agent:tool:start") {
-    const args = asRecord(event.detail);
-    if (event.toolName === "apply_patch" && typeof args?.patch === "string") {
-      const cwd = typeof args.cwd === "string" ? ` (${args.cwd})` : "";
-      return labelledLines(`patch${cwd}`, args.patch);
-    }
-    const shellCommand = typeof args?.command === "string"
-      ? args.command
-      : typeof args?.script === "string"
-      ? args.script
-      : undefined;
-    if (event.toolName === "shell" && shellCommand !== undefined) {
-      const cwd = typeof args?.cwd === "string" ? ` (${args.cwd})` : "";
-      return labelledLines(`command${cwd}`, `$ ${shellCommand}`);
-    }
-    if (
-      typeof args?.path === "string" &&
-      ["read_file", "write_file", "edit_file", "list_directory", "search_files"]
-        .includes(event.toolName ?? "")
-    ) {
-      return labelledLines("path", args.path);
-    }
-    if (event.toolName === "http_request" && typeof args?.url === "string") {
-      return labelledLines(
-        "request",
-        `${String(args.method ?? "GET").toUpperCase()} ${args.url}`,
-      );
-    }
-    return labelledLines("input", serialize(event.detail));
-  }
-  if (event.kind === "agent:tool:end") {
-    const envelope = asRecord(event.detail);
-    if (envelope?.status === "error") {
-      return labelledLines("error", serialize(envelope.error));
-    }
-    const result = parseResult(envelope?.result ?? event.detail);
-    if (event.toolName === "shell" && result) {
-      const exit = result.exitCode === undefined
-        ? ""
-        : ` exit=${result.exitCode}`;
-      const flags = `${result.timedOut ? " timed-out" : ""}${
-        result.aborted ? " aborted" : ""
-      }`;
-      const stdout = typeof result.stdout === "string" ? result.stdout : "";
-      const stderr = typeof result.stderr === "string" ? result.stderr : "";
-      const output = [stdout, stderr && `[stderr]\n${stderr}`].filter(Boolean)
-        .join("\n") || "(no output)";
-      const message = typeof result.message === "string" ? result.message : "";
-      return [
-        ...labelledLines(`output${exit}${flags}`, output),
-        ...(message ? labelledLines("message", message) : []),
-      ];
-    }
-    if (result && event.toolName === "read_file") {
-      return labelledLines(
-        "result",
-        `${String(result.bytesRead ?? 0)} bytes${
-          result.truncated ? ", truncated" : ""
-        }`,
-      );
-    }
-    if (result && event.toolName === "write_file") {
-      return labelledLines(
-        "result",
-        `${String(result.bytesWritten ?? 0)} bytes written`,
-      );
-    }
-    if (result && event.toolName === "edit_file") {
-      return labelledLines(
-        "result",
-        `replaced ${String(result.replacements ?? 0)} occurrence(s)`,
-      );
-    }
-    if (result && event.toolName === "apply_patch") {
-      return labelledLines(
-        "result",
-        `${String(result.filesChanged ?? 0)} files changed`,
-      );
-    }
-    if (result && event.toolName === "list_directory") {
-      const entries = Array.isArray(result.entries) ? result.entries.length : 0;
-      return labelledLines("result", `${entries} entries`);
-    }
-    if (result && event.toolName === "search_files") {
-      const matches = Array.isArray(result.results) ? result.results.length : 0;
-      return labelledLines(
-        "result",
-        `${matches} matches${result.truncated ? ", truncated" : ""}`,
-      );
-    }
-    if (result && event.toolName === "http_request") {
-      return labelledLines(
-        "result",
-        `HTTP ${String(result.status ?? "")}, ${
-          String(result.bodyBytes ?? 0)
-        } bytes${result.truncated ? ", truncated" : ""}`,
-      );
-    }
-    return labelledLines("output", serialize(event.detail));
-  }
-  if (event.kind === "agent:tool:error") {
-    return labelledLines("error", serialize(event.detail));
-  }
+function messageDisplays(
+  event: ZooActivityEvent,
+  width: number,
+): MessageActivityDisplay[] {
   if (event.kind === "agent:model:request") {
-    const request = asRecord(asRecord(event.detail)?.request);
-    const prompt = Array.isArray(request?.prompt)
-      ? request.prompt.at(-1)
-      : request;
-    return labelledLines("model input", serialize(prompt));
+    const displays = providerMessageDisplays(
+      event,
+      requestMessages(event.detail),
+      width,
+    );
+    if (displays.length || hasProviderPrompt(event.detail)) return displays;
+    return [messageDisplay(event, "model input", ["(unavailable)"], width)];
   }
   if (event.kind === "agent:model:response") {
-    const response = asRecord(asRecord(event.detail)?.response);
-    const content = Array.isArray(response?.content) ? response.content : [];
-    const lines = content.flatMap((part) => modelContentLines(part));
-    return lines.length
-      ? lines
-      : labelledLines("model output", serialize(response));
+    return providerMessageDisplays(
+      event,
+      responseMessages(event.detail),
+      width,
+    );
   }
-  if (event.kind === "agent:model:error") {
+  if (event.kind === "agent:wake") {
     const detail = asRecord(event.detail);
-    const error = detail && ("error" in detail || detail.kind === "error")
-      ? detail.error
-      : event.detail;
-    return labelledLines("model error", formatError(error));
+    const lines = [
+      ...labelledLines("system", detail?.initialSystemContext),
+      ...labelledLines(
+        detail?.role === "system" ? "system" : "input",
+        detail?.prompt,
+      ),
+    ];
+    return lines.length
+      ? [messageDisplay(event, "environment", lines, width)]
+      : [];
   }
   if (event.kind === "agent:response") {
-    const output = objectString(event.detail, "output") ??
-      serialize(event.detail);
-    return labelledLines("output", output);
+    return [messageDisplay(
+      event,
+      "response",
+      labelledLines("output", asRecord(event.detail)?.output),
+      width,
+    )];
   }
-  if (event.kind === "agent:error") {
-    return labelledLines("error", serialize(event.detail));
+  if (event.kind === "agent:model:error" || event.kind === "agent:error") {
+    const detail = asRecord(event.detail);
+    return [messageDisplay(
+      event,
+      "error",
+      labelledLines("error", formatError(detail?.error ?? event.detail)),
+      width,
+    )];
+  }
+  if (event.kind === "agent:yield" || event.kind === "agent:complete") {
+    return [messageDisplay(event, event.kind.slice(6), [], width)];
+  }
+  if (event.kind.startsWith("zoo:")) {
+    return [messageDisplay(event, "system", [], width)];
   }
   return [];
 }
 
-function compactLabelledLines(label: string, value: unknown): string[] {
-  return labelledLines(label, value).filter((line) => line.trim().length > 0);
+function providerMessageDisplays(
+  event: ZooActivityEvent,
+  messages: readonly ProviderMessage[],
+  width: number,
+): MessageActivityDisplay[] {
+  return messages.flatMap((message, messageIndex) =>
+    message.parts.map((part, index) =>
+      messageDisplay(
+        event,
+        part.label || message.role,
+        labelledLines("", part.text),
+        width,
+        `${event.sequence}:${messageIndex}:${index}`,
+      )
+    )
+  );
 }
 
-function labelledLines(label: string, value: unknown): string[] {
-  const normalized = text(value).replace(/\r/g, "").trimEnd();
-  if (!normalized) return [`${label}: (empty)`];
-  const [first, ...rest] = normalized.split("\n");
-  return [`${label}: ${first}`, ...rest.map((line) => `  ${line}`)];
+function messageDisplay(
+  event: ZooActivityEvent,
+  role: string,
+  lines: readonly string[],
+  width: number,
+  key = String(event.sequence),
+): MessageActivityDisplay {
+  return {
+    type: "message",
+    key,
+    at: event.at,
+    headline: `${actorLabel(event)} — ${role}`,
+    details: wrapLines(lines, width),
+  };
+}
+
+function toolStartDisplay(
+  event: ZooActivityEvent,
+  width: number,
+): ToolActivityDisplay {
+  const toolName = event.toolName ?? "tool";
+  const details = wrapLines(toolInputLines(toolName, event.detail), width);
+  return {
+    type: "tool",
+    // Zoo sequences are globally monotonic. Unlike a provider call ID, this
+    // is a safe React identity even when several agents use the same ID.
+    key: String(event.sequence),
+    at: event.at,
+    toolCallId: event.toolCallId,
+    toolName,
+    headline: `${actorLabel(event)} — ${toolName}`,
+    status: "running",
+    compact: details.slice(0, 1),
+    details,
+  };
+}
+
+function toolEndDisplay(
+  event: ZooActivityEvent,
+  current: ToolActivityDisplay | undefined,
+  width: number,
+): ToolActivityDisplay {
+  const envelope = asRecord(event.detail);
+  const toolName = event.toolName ?? current?.toolName ?? "tool";
+  const result = parseResult(envelope?.result ?? event.detail);
+  const explicitFailure = event.kind === "agent:tool:error" ||
+    envelope?.status === "error";
+  const failed = explicitFailure ||
+    (toolName === "shell" && typeof result?.exitCode === "number" &&
+      result.exitCode !== 0);
+  const resultLines = explicitFailure
+    ? labelledLines("error", formatError(envelope?.error ?? event.detail))
+    : toolResultLines(toolName, result ?? envelope?.result ?? event.detail);
+  const details = wrapLines(
+    [...(current?.details ?? []), ...resultLines],
+    width,
+  );
+  return {
+    type: "tool",
+    key: current?.key ?? String(event.sequence),
+    at: current?.at ?? event.at,
+    toolCallId: event.toolCallId,
+    toolName,
+    headline: current?.headline ?? `${actorLabel(event)} — ${toolName}`,
+    status: failed ? "error" : "success",
+    compact: [
+      ...(current?.compact ?? []),
+      ...wrapLines(resultLines, width).slice(0, 6),
+    ],
+    details,
+  };
+}
+
+function toolCorrelationKey(event: ZooActivityEvent): string | undefined {
+  return event.toolCallId === undefined
+    ? undefined
+    : `${event.agentId ?? "(unidentified agent)"}\u0000${event.toolCallId}`;
+}
+
+function toolInputLines(toolName: string, value: unknown): string[] {
+  const input = asRecord(value);
+  if (!input) return labelledLines("input", value);
+  if (toolName === "shell" && typeof input.command === "string") {
+    return [
+      `$ ${input.command}`,
+      ...labelledLines("cwd", input.cwd),
+      ...labelledLines(
+        "timeout",
+        input.timeoutMs === undefined ? undefined : `${input.timeoutMs}ms`,
+      ),
+    ];
+  }
+  if (toolName === "apply_patch" && typeof input.patch === "string") {
+    return [
+      ...labelledLines("cwd", input.cwd),
+      ...labelledLines("patch", input.patch),
+    ];
+  }
+  if (toolName === "http_request" && typeof input.url === "string") {
+    return [
+      ...labelledLines(
+        "request",
+        `${String(input.method ?? "GET").toUpperCase()} ${input.url}`,
+      ),
+      ...recordLines(input, ["method", "url"]),
+    ];
+  }
+  return recordLines(input);
+}
+
+function toolResultLines(toolName: string, value: unknown): string[] {
+  const result = parseResult(value);
+  if (!result) return labelledLines("result", value);
+  if (toolName === "shell") {
+    const flags = [
+      result.exitCode === undefined
+        ? undefined
+        : `exit=${String(result.exitCode)}`,
+      result.timedOut ? "timed out" : undefined,
+      result.aborted ? "aborted" : undefined,
+    ].filter(Boolean).join(" · ");
+    const output = [result.stdout, result.stderr, result.message].some((item) =>
+      typeof item === "string" && item.length > 0
+    );
+    return [
+      ...(flags ? labelledLines("result", flags) : []),
+      ...labelledLines("stdout", result.stdout),
+      ...labelledLines("stderr", result.stderr),
+      ...labelledLines("message", result.message),
+      ...(output ? [] : ["output: (no output)"]),
+    ];
+  }
+  if (toolName === "read_file") {
+    return [
+      ...labelledLines("content", result.content),
+      ...labelledLines(
+        "size",
+        result.bytesRead === undefined
+          ? undefined
+          : `${String(result.bytesRead)} bytes`,
+      ),
+    ];
+  }
+  if (toolName === "apply_patch") {
+    const changes = Array.isArray(result.changes) ? result.changes : [];
+    return [
+      ...labelledLines(
+        "result",
+        `${String(result.filesChanged ?? changes.length)} files changed`,
+      ),
+      ...changes.flatMap((change) => {
+        const item = asRecord(change);
+        return labelledLines(
+          "file",
+          item?.path === undefined
+            ? change
+            : `${String(item.path)} +${String(item.additions ?? 0)} -${
+              String(item.deletions ?? 0)
+            }`,
+        );
+      }),
+      ...labelledLines("message", result.message),
+    ];
+  }
+  if (toolName === "list_directory") {
+    const entries = Array.isArray(result.entries) ? result.entries : [];
+    return [
+      `result: ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`,
+      ...entries.flatMap((entry) => {
+        const item = asRecord(entry);
+        if (!item) return [];
+        const name = typeof item.name === "string" ? item.name : "(unnamed)";
+        const type = typeof item.type === "string" ? item.type : "entry";
+        const size = typeof item.sizeBytes === "number"
+          ? ` (${item.sizeBytes} bytes)`
+          : "";
+        return [`${type}: ${name}${size}`];
+      }),
+    ];
+  }
+  return recordLines(result, ["path"]);
+}
+
+function recordLines(
+  record: Record<string, unknown>,
+  omit: readonly string[] = [],
+): string[] {
+  return Object.entries(record).flatMap(([key, value]) => {
+    if (omit.includes(key) || value === undefined || value === "") return [];
+    if (typeof value === "string") return labelledLines(key, value);
+    if (Array.isArray(value)) return [`${key}: ${value.length} item(s)`];
+    if (value !== null && typeof value === "object") {
+      return [`${key}: available in the activity log`];
+    }
+    return [`${key}: ${String(value)}`];
+  });
+}
+
+interface ProviderMessage {
+  readonly role: string;
+  readonly parts: readonly { label: string; text: string }[];
+}
+
+function requestMessages(value: unknown): ProviderMessage[] {
+  const request = asRecord(asRecord(value)?.request);
+  const prompt = Array.isArray(request?.prompt) ? request.prompt : [];
+  // The model receives earlier assistant messages again when it continues
+  // after a tool call. They were already displayed from their corresponding
+  // model-response event, so rendering them here makes one reasoning turn
+  // appear twice at the tool boundary.
+  return prompt.flatMap(providerMessage).filter((message) =>
+    message.role !== "assistant" && message.role !== "tool"
+  );
+}
+
+function hasProviderPrompt(value: unknown): boolean {
+  const request = asRecord(asRecord(value)?.request);
+  return Array.isArray(request?.prompt);
+}
+
+function responseMessages(value: unknown): ProviderMessage[] {
+  const response = asRecord(asRecord(value)?.response);
+  return response
+    ? providerMessage({ role: "model", content: response.content })
+    : [];
+}
+
+function providerMessage(value: unknown): ProviderMessage[] {
+  const message = asRecord(value);
+  if (!message) return [];
+  const role = typeof message.role === "string" ? message.role : "message";
+  const parts = contentParts(message.content);
+  return parts.length ? [{ role, parts }] : [];
+}
+
+function contentParts(value: unknown): Array<{ label: string; text: string }> {
+  if (typeof value === "string") return [{ label: "", text: value }];
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((value) => {
+    const part = asRecord(value);
+    if (!part) return [];
+    if (part.type === "text" && typeof part.text === "string") {
+      return [{ label: "", text: part.text }];
+    }
+    if (part.type === "reasoning" && typeof part.text === "string") {
+      return [{ label: "reasoning", text: part.text }];
+    }
+    // Tool-call and tool-result parts are rendered by correlated tool cards.
+    return [];
+  });
 }
 
 function parseResult(value: unknown): Record<string, unknown> | undefined {
@@ -199,9 +429,37 @@ function parseResult(value: unknown): Record<string, unknown> | undefined {
   return asRecord(value);
 }
 
-function objectString(value: unknown, key: string): string | undefined {
-  const property = asRecord(value)?.[key];
-  return typeof property === "string" ? property : undefined;
+function actorLabel(event: ZooActivityEvent): string {
+  return event.agentName
+    ? `${event.agentName}${event.agentId ? ` (${event.agentId})` : ""}`
+    : event.agentId ?? "System";
+}
+
+function labelledLines(label: string, value: unknown): string[] {
+  if (value === undefined || value === "") return [];
+  const normalized = String(value).replace(/\r/g, "").trimEnd();
+  if (!normalized) return [`${label || "message"}: (empty)`];
+  const [first, ...rest] = normalized.split("\n");
+  const prefix = label ? `${label}: ` : "";
+  return [
+    `${prefix}${first}`,
+    ...rest.filter((line) => line.length > 0).map((line) => `  ${line}`),
+  ];
+}
+
+function formatError(value: unknown): string {
+  if (value instanceof Error) {
+    return value.message ? `${value.name}: ${value.message}` : value.name;
+  }
+  const error = asRecord(value);
+  if (error && typeof error.message === "string") {
+    return typeof error.name === "string"
+      ? `${error.name}: ${error.message}`
+      : error.message;
+  }
+  return value === undefined || (error && !error.name && !error.message)
+    ? "Details unavailable."
+    : String(value);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -210,69 +468,8 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function modelContentLines(value: unknown): string[] {
-  const part = asRecord(value);
-  if (!part) return labelledLines("model output", serialize(value));
-  if (part.type === "text" && typeof part.text === "string") {
-    return labelledLines("model", part.text);
-  }
-  if (part.type === "reasoning" && typeof part.text === "string") {
-    return labelledLines("reasoning", part.text);
-  }
-  if (part.type === "tool-call") {
-    return labelledLines(
-      `tool request ${String(part.toolName ?? "")}`.trim(),
-      serialize(part.input),
-    );
-  }
-  return labelledLines("model output", serialize(part));
-}
-
-function serialize(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value instanceof Error) return formatError(value);
-  try {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? text(value) : serialized;
-  } catch {
-    return text(value);
-  }
-}
-
-function formatError(value: unknown): string {
-  if (value instanceof Error) {
-    return value.stack ?? `${value.name}: ${value.message}`;
-  }
-  const error = asRecord(value);
-  if (error) {
-    if (typeof error.stack === "string" && error.stack) return error.stack;
-    const name = typeof error.name === "string" ? error.name : undefined;
-    const message = typeof error.message === "string"
-      ? error.message
-      : undefined;
-    if (name && message) return `${name}: ${message}`;
-    if (message) return message;
-    if (name) return name;
-  }
-  return value === undefined ? "Details unavailable." : serialize(value);
-}
-
-function text(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "(unavailable)";
-  if (value === null) return "null";
-  try {
-    return String(value);
-  } catch {
-    return "(unprintable)";
-  }
-}
-
-function wrapLine(line: string, width: number): string[] {
-  if (line.length <= width) return [line];
-  const lines: string[] = [];
-  for (let offset = 0; offset < line.length; offset += width) {
-    lines.push(line.slice(offset, offset + width));
-  }
-  return lines;
+function wrapLines(lines: readonly string[], width: number): string[] {
+  // Terminal components own visual wrapping: preserve semantic lines here.
+  void width;
+  return [...lines];
 }

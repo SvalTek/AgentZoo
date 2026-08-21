@@ -5,8 +5,16 @@
 # Optional objective supplied to every configured agent.
 # taskPrompt: Inspect the available files and complete the requested work.
 
+runtime:
+  backend: docker
+  sharedWorkspace: .shared
+
+completion:
+  # When false, agents keep cycling until AgentZoo is stopped externally.
+  enabled: true
+
 models:
-  local-qwen:
+  local-qwen3.5:
     provider: ollama
     model: qwen3.5:9b
     # apiKey: ENV[OLLAMA_API_KEY]
@@ -23,13 +31,14 @@ models:
       # topK is not supported by the current Ollama adapter.
       minP: 0.05
 
-  local-gemma:
+  local-cogito:
     provider: ollama
-    model: gemma4:12b
+    model: cogito:14b
     reasoning: true
-    reasoningEffort: medium
+    reasoningEffort: low
     context:
-      window: 32768
+      # 24k context
+      window: 24576
       maxOutputTokens: 8192
     sampling:
       temperature: 0.9
@@ -51,6 +60,24 @@ models:
       # topK is not supported by the current Ollama adapter.
       minP: 0.05
 
+  local-gerion:
+    provider: ollama
+    model: hf.co/Tivaphraen/Geryon-9B-v1-GGUF:Q5_K_M
+    reasoning: true
+    reasoningEffort: medium
+    context:
+      window: 32768
+      maxOutputTokens: 8192
+    sampling:
+      temperature: 1.0
+      topP: 0.9
+      # topK is not supported by the current Ollama
+      minP: 0.05
+
+  local-moondream:
+    provider: ollama
+    model: moondream:latest
+
 
 templates:
   coding-system: |
@@ -70,13 +97,6 @@ templates:
     This is your computer. You can use or modify it freely, including installing software and tools.
     How you spend your time is up to you.
 
-runtime:
-  backend: docker
-  sharedWorkspace: .shared
-
-# Service factories are supplied by an embedding application. The standalone
-# distribution currently has no optional services enabled by default.
-services: []
 
 agents:
   - type: coding
@@ -85,8 +105,8 @@ agents:
       - Alice
       - Bob
     model: local-ornith
-    #model: local-gemma
-    # captioningModel: local-qwen
+    # model: local-gemma
+    # captioningModel: local-moondream
     # Optional: dedicated vision model for image captioning.
     # When set, view_image delegates to this model instead of the agent's
     # own model. Required for non-vision models. For Ollama, the agent's
@@ -109,12 +129,112 @@ agents:
     name: Rowan
     count: 1
     model: local-ornith
-    #model: local-gemma
+    # model: local-gemma
+    # captioningModel: local-moondream
     system: research-system
     maxTurns: 100
     # Add http to expose the structured http_request convenience tool.
     features: [shell, filesystem, vision]
 
-completion:
-  # When false, agents keep cycling until AgentZoo is stopped externally.
-  enabled: true
+# Service factories are supplied by an embedding application. The standalone
+# distribution currently has no optional services enabled by default.
+services: []
+
+# Configured shell-backed tools. These extend the shell feature: each entry
+# becomes a named tool whose command is rendered from its parameters with
+# TextTemplate and then executed in the agent's isolated environment. The
+# tools below wrap common applications that ship in the runtime image, so
+# agents get focused, well-described entry points instead of reaching for the
+# raw shell. Names must match ^[a-z][a-z0-9_]*$; parameters are typed and
+# shell-escaped automatically. Remove or extend to taste.
+tools:
+  git:
+    description: Run a Git command. Pass the full Git arguments, for example 'status', 'log --oneline -5', or 'clone https://example.com/repo.git'.
+    command: git {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: Git command arguments, e.g. 'status' or 'clone <url>'.
+  python:
+    description: Run a Python command or script via python3. Pass the arguments, for example '-c "print(1+1)"' or 'train.py --epochs 5'.
+    command: python3 {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: Arguments passed to python3.
+  pip:
+    description: Install or manage Python packages with pip. Pass arguments, for example 'install requests' or 'list'.
+    command: python3 -m pip {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: pip arguments, e.g. 'install <package>'.
+  curl:
+    description: Transfer data with curl. Pass arguments, for example '-L -o file.zip https://example.com/file.zip'.
+    command: curl {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: curl arguments.
+  wget:
+    description: Download files with wget. Pass arguments, for example '-O file.zip https://example.com/file.zip'.
+    command: wget {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: wget arguments.
+  deno:
+    description: Run the Deno runtime. Pass arguments, for example 'run script.ts' or 'test'.
+    command: deno {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: deno arguments.
+  uv:
+    description: Run the uv Python package and project manager. Pass arguments, for example 'pip install requests' or 'run script.py'.
+    command: uv {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: uv arguments.
+  uvx:
+    description: Run a Python tool ephemerally with uvx. Pass arguments, for example 'ruff check .'.
+    command: uvx {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: uvx arguments.
+  unzip:
+    description: Extract zip archives with unzip. Pass arguments, for example '-o archive.zip -d out'.
+    command: unzip {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: unzip arguments.
+  seven_zip:
+    description: Archive or extract with 7z. Pass arguments, for example 'x archive.7z' or 'a archive.7z folder'.
+    command: 7z {args}
+    params:
+      args:
+        type: string
+        required: true
+        array: false
+        description: 7z arguments.

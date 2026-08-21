@@ -2,24 +2,22 @@
 
 import type { ToolDefinition } from "@vibesjs/sdk";
 import { z } from "zod";
-import type { AgentRunDeps } from "./Agent.ts";
-import type { Feature } from "./Feature.ts";
+import type { AgentRunDeps } from "../Agent.ts";
+import type { Feature } from "../Feature.ts";
 import {
   actionableToolError,
   observedToolResult,
   ToolExecutionError,
-} from "./ToolSupport.ts";
+} from "../ToolSupport.ts";
 
 const HttpParameters = z.object({
-  url: z.string().url().refine((value) => /^https?:\/\//i.test(value), {
-    message: "The URL must use HTTP or HTTPS.",
-  }).optional().describe(
+  url: z.string().optional().describe(
     "The HTTP or HTTPS URL to request. Required for execution.",
   ),
-  method: z.string().regex(/^[A-Za-z]+$/).optional().describe(
+  method: z.string().optional().describe(
     "The HTTP method. Defaults to GET when body is absent and POST when body is present.",
   ),
-  headers: z.record(z.string().min(1), z.string()).optional().describe(
+  headers: z.record(z.string(), z.string()).optional().describe(
     "Request headers as name-value pairs. Defaults to no additional headers.",
   ),
   body: z.string().optional().describe(
@@ -55,11 +53,47 @@ export class HttpFeature implements Feature<AgentRunDeps> {
         "Make an HTTP request. Follows up to 5 redirects and waits up to 120 seconds. Returns status, final URL, selected response headers, a bounded body, bodyEncoding, bodyBytes, and truncation status. A base64 bodyEncoding means the returned body is base64-encoded binary data.",
       parameters: HttpParameters,
       argsValidator: (input) => {
-        if (!input.url) {
+        if (!input.url?.trim()) {
           throw actionableToolError(
-            "No URL was provided.",
-            "Provide the HTTP or HTTPS URL to request in url.",
+            [
+              "No URL was provided.",
+              "Provide the HTTP or HTTPS URL to request in url.",
+            ],
           );
+        }
+        let parsed: URL;
+        try {
+          parsed = new URL(input.url);
+        } catch {
+          throw actionableToolError([
+            "The URL is malformed.",
+            "No HTTP request was sent.",
+            "Provide a complete HTTP or HTTPS URL, for example https://example.com/path.",
+          ]);
+        }
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          throw actionableToolError([
+            "The URL must use HTTP or HTTPS.",
+            "No HTTP request was sent.",
+            "Use an http:// or https:// URL.",
+          ]);
+        }
+        if (input.method !== undefined && !/^[A-Za-z]+$/.test(input.method)) {
+          throw actionableToolError([
+            "The HTTP method is invalid.",
+            "No HTTP request was sent.",
+            "Use letters only, for example GET, POST, PATCH, or DELETE.",
+          ]);
+        }
+        if (
+          input.headers &&
+          Object.keys(input.headers).some((name) => !name.trim())
+        ) {
+          throw actionableToolError([
+            "A request header has an empty name.",
+            "No HTTP request was sent.",
+            "Provide a non-empty header name or remove that header.",
+          ]);
         }
       },
       execute: async (context, input) => {
@@ -93,8 +127,10 @@ export class HttpFeature implements Feature<AgentRunDeps> {
         }
         if (raw.exitCode !== 0) {
           throw actionableToolError(
-            "The HTTP request failed.",
-            "Check the URL, method, headers, and network availability, then retry.",
+            [
+              "No HTTP response was received.",
+              "Check the URL, method, headers, and network availability before retrying.",
+            ],
             { command: raw },
           );
         }
@@ -112,8 +148,10 @@ export class HttpFeature implements Feature<AgentRunDeps> {
           bodyBytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
         } catch {
           throw actionableToolError(
-            "The HTTP response could not be read.",
-            "Retry the request; if it persists, use shell with curl to inspect the raw response.",
+            [
+              "The HTTP response could not be read.",
+              "Retry the request; if it persists, use shell with curl to inspect the raw response.",
+            ],
             { command: raw },
           );
         }

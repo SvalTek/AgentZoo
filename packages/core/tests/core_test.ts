@@ -29,6 +29,7 @@ import type {
   RuntimeEnv,
 } from "../types.ts";
 import {
+  actionableToolError,
   AgentZoo,
   composeInitialPrompt,
   configureModelRequest,
@@ -60,6 +61,20 @@ import {
 import { Router } from "@agent-zoo/api";
 import { Service } from "@agent-zoo/service";
 import { unwrapObservedToolResult } from "../ToolSupport.ts";
+import Context from "@agent-zoo/context";
+import { FeatureRegistry } from "../Feature.ts";
+
+Deno.test("actionable tool feedback preserves ordered recovery lines", () => {
+  const error = actionableToolError([
+    "No files were changed.",
+    "The requested text was not found.",
+    "Read the current file before retrying.",
+  ]);
+  assertEquals(
+    error.message,
+    "No files were changed.\nThe requested text was not found.\nRead the current file before retrying.",
+  );
+});
 import { modelSettingsToAISDKOptions } from "../../../vendor/vibes/lib/execution/_run_utils.ts";
 
 Deno.test("completion tool uses a project-neutral public name", () => {
@@ -95,11 +110,16 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
     ...await new FilesystemFeature().createTools(),
     ...await new HttpFeature().createTools(),
   ];
-  assertEquals(genericTools[0].description, "Execute a shell command.");
+  assert(genericTools[0].description.includes("Execute a Bash command."));
+  assert(genericTools[0].description.includes("filesystem tools"));
   assertEquals(
     genericTools.map((tool) => tool.name),
     [
       "shell",
+      "start_background",
+      "stop_background",
+      "get_background",
+      "send_background",
       "apply_patch",
       "write_file",
       "edit_file",
@@ -143,7 +163,8 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
   const shellPrompt = containerfile.split("\n").find((line) =>
     line.includes("PS1=")
   );
-  assert(shellPrompt && !/agent[ -]?zoo/i.test(shellPrompt));
+  assert(shellPrompt && !/@agent(?:\W|$)/i.test(shellPrompt));
+  assert(shellPrompt.includes('PS1="\\\\u@localhost:'));
   assert(!/agent[ -]?zoo/i.test(new DockerRuntimeManager("shared").hostName));
 });
 
@@ -205,6 +226,10 @@ Deno.test("Vibes preserves provider-facing tool definition order", async () => {
   await agent.run("Inspect the available functions.");
   assertEquals(renderedTools.map((tool) => tool.name), [
     "shell",
+    "start_background",
+    "stop_background",
+    "get_background",
+    "send_background",
     "apply_patch",
     "write_file",
     "edit_file",
@@ -412,9 +437,10 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
         newText: "replacement",
       }),
     ToolExecutionError,
-    "Read the current file",
+    "No files were changed.",
   );
-  assert(missingText.message.includes("copy the exact text to oldText"));
+  assert(missingText.message.includes("The requested text was not found"));
+  assert(missingText.message.includes("copy the exact text into oldText"));
   const ambiguousText = await assertRejects(
     () =>
       edit.execute!(failingContext(45), {
@@ -423,20 +449,27 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
         newText: "replacement",
       }),
     ToolExecutionError,
-    "Provide more surrounding text",
+    "No files were changed.",
   );
   assert(ambiguousText.message.includes("replaceAll"));
 
   const http = tools.find((tool) => tool.name === "http_request")!;
+  const malformedHttp = http.parameters.safeParse({ url: "not a URL" });
+  assert(malformedHttp.success, "diagnosable URLs must reach argsValidator");
+  await assertRejects(
+    async () => await http.argsValidator!(malformedHttp.data),
+    ToolExecutionError,
+    "The URL is malformed.",
+  );
   const httpFailure = await assertRejects(
     () =>
       http.execute!(failingContext(49), {
         url: "https://example.invalid/",
       }),
     ToolExecutionError,
-    "Check the URL, method, headers, and network availability",
+    "No HTTP response was received.",
   );
-  assert(httpFailure.message.endsWith("then retry."));
+  assert(httpFailure.message.includes("network availability"));
 
   const semanticRequirements: Array<
     [string, Record<string, unknown>, string]
@@ -480,7 +513,9 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
     ToolExecutionError,
     "Replacing the complete file requires explicit confirmation.",
   );
-  assert(overwriteError.message.includes("Prefer edit_file"));
+  assert(
+    overwriteError.message.includes("For a local change, prefer edit_file"),
+  );
   assert(overwriteError.message.includes("apply_patch"));
   assert(overwriteError.message.includes("force to true"));
   const confirmedOverwrite = write.parameters.safeParse({
@@ -491,6 +526,17 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   });
   assert(confirmedOverwrite.success);
   await write.argsValidator!(confirmedOverwrite.data);
+  const meaninglessForce = write.parameters.safeParse({
+    path: "/root/new.txt",
+    content: "new",
+    force: true,
+  });
+  assert(meaninglessForce.success);
+  await assertRejects(
+    async () => await write.argsValidator!(meaninglessForce.data),
+    ToolExecutionError,
+    "force only applies with mode overwrite.",
+  );
 
   for (
     const term of [
@@ -1195,6 +1241,7 @@ Deno.test("AgentZoo: mounts a service router below its service name", async () =
 });
 
 Deno.test("runtime: rejects unsafe agent IDs", () => {
+  assertAgentId("62d2f5686392");
   assertThrows(() => assertAgentId("../other"), TypeError);
   assertThrows(() => assertAgentId("Agent"), TypeError);
 });
@@ -1204,21 +1251,34 @@ Deno.test("SharedWorkspace: cannot resolve paths outside its root", () => {
   assertThrows(() => workspace.resolve("..", "private"), TypeError);
 });
 
-Deno.test("agent system context always documents the shared workspace", async () => {
-  const prompt = await buildAgentSystemPrompt("You are a focused agent.");
-  assert(prompt.startsWith("You are a focused agent."));
-  assert(prompt.includes("`/shared`"));
+Deno.test("AgentZoo system prompt renders enabled feature guidance from Context", async () => {
+  const features = new FeatureRegistry<AgentRunDeps>();
+  features.register(new ShellFeature());
+  features.register(new FilesystemFeature());
+  Context.set("features", features);
+  try {
+    const promptWithFeatures = await buildAgentSystemPrompt(
+      ["shell", "filesystem"],
+      { shellEnvironment: "You are logged into the shell as root." },
+    );
+    assert(promptWithFeatures.includes("## Shell"));
+    assert(promptWithFeatures.includes("logged into the shell as root"));
+    assert(promptWithFeatures.includes("## Filesystem tools"));
+    assert(promptWithFeatures.includes("Use apply_patch for related changes"));
+  } finally {
+    Context.delete("features");
+  }
 
-  const promptWithoutTemplate = await buildAgentSystemPrompt(undefined);
-  assert(promptWithoutTemplate.includes("Linux filesystem"));
+  const prompt = await buildAgentSystemPrompt();
+  assert(prompt.includes("`/shared`"));
   assert(
     !/agent[ -]?zoo|other agents|scheduler|experiment|harness/i.test(
-      promptWithoutTemplate,
+      prompt,
     ),
   );
 });
 
-Deno.test("environment is leading system context and idle wake is system history", async () => {
+Deno.test("AgentZoo system stays in history for taskless startup and idle wake is system history", async () => {
   assertEquals(
     modelSettingsToAISDKOptions({ allowSystemInMessages: true })
       .allowSystemInMessages,
@@ -1263,7 +1323,7 @@ Deno.test("environment is leading system context and idle wake is system history
     }
   }();
   const agent = new ZooAgent(
-    { id: "alpha", model: "local" },
+    { id: "alpha", model: "local", systemPrompt: "Configured guidance." },
     runtime,
     new ModelRegistry({
       local: { provider: "ollama", model: "fake" },
@@ -1297,16 +1357,17 @@ Deno.test("environment is leading system context and idle wake is system history
   const secondPrompt = requests[1].prompt as Array<Record<string, unknown>>;
   assertEquals(
     firstPrompt.filter((message) => message.role === "system").length,
-    1,
-  );
-  assertEquals(firstPrompt.some((message) => message.role === "user"), false);
-  assert(JSON.stringify(firstPrompt[0]).includes("current contents"));
-  assertEquals(
-    secondPrompt.filter((message) => message.role === "system").length,
     2,
   );
+  assertEquals(firstPrompt.some((message) => message.role === "user"), false);
+  assert(JSON.stringify(firstPrompt).includes("## Environment"));
+  assert(JSON.stringify(firstPrompt).includes("Configured guidance."));
+  assertEquals(
+    secondPrompt.filter((message) => message.role === "system").length,
+    3,
+  );
   assertEquals(secondPrompt.some((message) => message.role === "user"), false);
-  assert(JSON.stringify(secondPrompt[0]).includes("current contents"));
+  assert(JSON.stringify(secondPrompt).includes("## Environment"));
   assert(
     JSON.stringify(secondPrompt.at(-1)).includes(
       "Automated activity update: You have been idle for 17 minutes.",
@@ -1324,7 +1385,7 @@ Deno.test("environment is leading system context and idle wake is system history
       "Automated activity update: You have been idle for 17 minutes.",
     ),
   );
-  assert(!JSON.stringify(secondLoggedPrompt).includes("current contents"));
+  assert(!JSON.stringify(secondLoggedPrompt).includes("## Environment"));
 
   const promptedAgent = new ZooAgent(
     { id: "beta", model: "local" },
@@ -1360,7 +1421,7 @@ Deno.test("environment is leading system context and idle wake is system history
 
   const prompted = requests[2].prompt as Array<Record<string, unknown>>;
   assertEquals(prompted.map((message) => message.role), ["system", "user"]);
-  assert(JSON.stringify(prompted[0]).includes("current contents"));
+  assert(JSON.stringify(prompted[0]).includes("## Environment"));
   const promptedUser = JSON.stringify(prompted[1]);
   assert(promptedUser.includes("INSTRUCTIONS: Inspect carefully."));
   assert(promptedUser.includes("OBJECTIVE: Finish the work."));
@@ -1483,7 +1544,7 @@ Deno.test("environment observations use readable entry types", async () => {
   );
   assertEquals(
     await agent.observeEnvironment(),
-    "User: root\n\nYou are in /root.\nIts current contents are:\n\nfile ./.profile\ndirectory ./project\nsymlink ./current",
+    "You are logged into the shell as root.\n\nYour current working directory is /root.\nIts visible contents are:\n\nfile ./.profile\ndirectory ./project\nsymlink ./current",
   );
 });
 
@@ -1598,4 +1659,907 @@ Deno.test("failed activations retain provider messages and pair every tool start
     ),
     '{"name":"ToolExecutionError"}',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Configured shell tools
+// ---------------------------------------------------------------------------
+
+Deno.test("parseConfig: tools field defaults to empty", () => {
+  const config = parseConfig(
+    [
+      "models:",
+      "  local:",
+      "    provider: ollama",
+      "    model: x",
+      "agents:",
+      "  - type: test",
+      "    model: local",
+    ].join("\n"),
+  );
+  assertEquals(config.tools, {});
+});
+
+Deno.test("parseConfig: tools field parses configured shell tools", () => {
+  const config = parseConfig(
+    [
+      "models:",
+      "  local:",
+      "    provider: ollama",
+      "    model: x",
+      "agents:",
+      "  - type: test",
+      "    model: local",
+      "tools:",
+      "  search_code:",
+      "    description: Search the codebase",
+      "    command: rg {pattern}",
+      "    params:",
+      "      pattern:",
+      "        type: string",
+      "        description: Search pattern",
+    ].join("\n"),
+  );
+  assertEquals(Object.keys(config.tools), ["search_code"]);
+  assertEquals(config.tools.search_code.description, "Search the codebase");
+  assertEquals(config.tools.search_code.command, "rg {pattern}");
+  assertEquals(config.tools.search_code.params.pattern.type, "string");
+  assertEquals(config.tools.search_code.params.pattern.required, true);
+  assertEquals(config.tools.search_code.params.pattern.array, false);
+});
+
+Deno.test("parseConfig: tools param defaults required true and array false", () => {
+  const config = parseConfig(
+    [
+      "models:",
+      "  local:",
+      "    provider: ollama",
+      "    model: x",
+      "agents:",
+      "  - type: test",
+      "    model: local",
+      "tools:",
+      "  run_thing:",
+      "    description: Do the thing",
+      "    command: some_command",
+      "    params:",
+      "      enabled:",
+      "        type: boolean",
+      "        description: Enable feature",
+      "      flags:",
+      "        type: string",
+      "        array: true",
+      "        required: false",
+      "        description: Extra args",
+    ].join("\n"),
+  );
+  const params = config.tools.run_thing.params;
+  assertEquals(params.enabled.required, true);
+  assertEquals(params.enabled.array, false);
+  assertEquals(params.flags.required, false);
+  assertEquals(params.flags.array, true);
+});
+
+Deno.test("parseConfig: rejects tool name with hyphens", () => {
+  assertThrows(
+    () =>
+      parseConfig(
+        [
+          "models:",
+          "  local:",
+          "    provider: ollama",
+          "    model: x",
+          "agents:",
+          "  - type: test",
+          "    model: local",
+          "tools:",
+          "  my-tool:",
+          "    description: Bad name",
+          "    command: echo hi",
+        ].join("\n"),
+      ),
+    ConfigValidationError,
+  );
+});
+
+Deno.test("parseConfig: rejects tool with missing description", () => {
+  assertThrows(
+    () =>
+      parseConfig(
+        [
+          "models:",
+          "  local:",
+          "    provider: ollama",
+          "    model: x",
+          "agents:",
+          "  - type: test",
+          "    model: local",
+          "tools:",
+          "  my_tool:",
+          "    command: echo hi",
+        ].join("\n"),
+      ),
+    ConfigValidationError,
+  );
+});
+
+Deno.test("parseConfig: rejects tool with missing command", () => {
+  assertThrows(
+    () =>
+      parseConfig(
+        [
+          "models:",
+          "  local:",
+          "    provider: ollama",
+          "    model: x",
+          "agents:",
+          "  - type: test",
+          "    model: local",
+          "tools:",
+          "  my_tool:",
+          "    description: A tool",
+        ].join("\n"),
+      ),
+    ConfigValidationError,
+  );
+});
+
+Deno.test("parseConfig: rejects invalid param type", () => {
+  assertThrows(
+    () =>
+      parseConfig(
+        [
+          "models:",
+          "  local:",
+          "    provider: ollama",
+          "    model: x",
+          "agents:",
+          "  - type: test",
+          "    model: local",
+          "tools:",
+          "  my_tool:",
+          "    description: A tool",
+          "    command: echo hi",
+          "    params:",
+          "      foo:",
+          "        type: object",
+          "        description: Bad type",
+        ].join("\n"),
+      ),
+    ConfigValidationError,
+  );
+});
+
+Deno.test("ShellFeature: emits only shell when no configured tools", async () => {
+  const tools = await new ShellFeature().createTools();
+  assertEquals(tools.length, 5);
+  assertEquals(tools[0].name, "shell");
+  const background = [
+    "start_background",
+    "stop_background",
+    "get_background",
+    "send_background",
+  ];
+  for (const name of background) {
+    assert(tools.some((t) => t.name === name), `missing ${name}`);
+  }
+});
+
+Deno.test("ShellFeature: emits raw shell plus configured tools", async () => {
+  const tools = await new ShellFeature({
+    search_code: {
+      command: "rg {pattern}",
+      description: "Search code",
+      params: {
+        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+      },
+    },
+    run_linter: {
+      command: "eslint {file}",
+      description: "Run linter",
+      params: {
+        file: { type: "string", required: true, array: false, description: "File" },
+      },
+    },
+  }).createTools();
+  assertEquals(tools.length, 7);
+  assertEquals(tools[0].name, "shell");
+  assertEquals(tools[1].name, "search_code");
+  assertEquals(tools[2].name, "run_linter");
+  const background = [
+    "start_background",
+    "stop_background",
+    "get_background",
+    "send_background",
+  ];
+  for (const name of background) {
+    assert(tools.some((t) => t.name === name), `missing ${name}`);
+  }
+});
+
+Deno.test("ShellFeature: configured tool Zod schema matches config", async () => {
+  const tools = await new ShellFeature({
+    search_code: {
+      command: "rg {pattern}",
+      description: "Search code",
+      params: {
+        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+        hidden: { type: "boolean", required: false, array: false, description: "Hidden" },
+        max_results: { type: "number", required: false, array: false, description: "Max" },
+      },
+    },
+  }).createTools();
+  const searchTool = tools.find((t) => t.name === "search_code")!;
+  const schema = z.toJSONSchema(searchTool.parameters) as {
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  assertEquals(schema.required, ["pattern"]);
+  assert("pattern" in (schema.properties ?? {}));
+  assert("hidden" in (schema.properties ?? {}));
+  assert("max_results" in (schema.properties ?? {}));
+  assert(searchTool.description === "Search code");
+});
+
+Deno.test("ShellFeature: configured tool with array param produces Zod array", async () => {
+  const tools = await new ShellFeature({
+    run_cmd: {
+      command: "echo {#FOR flag IN flags}{flag}{#END}",
+      description: "Run with flags",
+      params: {
+        flags: { type: "string", required: true, array: true, description: "Flags" },
+      },
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "run_cmd")!;
+  const schema = z.toJSONSchema(tool.parameters) as {
+    properties?: Record<string, { type?: string; items?: unknown }>;
+  };
+  const flagsProp = schema.properties?.flags as { type?: string; items?: unknown };
+  assertEquals(flagsProp.type, "array");
+  assert(flagsProp.items !== undefined);
+});
+
+Deno.test("ShellFeature: configured tool validate rejects missing required params", async () => {
+  const tools = await new ShellFeature({
+    run_cmd: {
+      command: "echo {pattern}",
+      description: "Run",
+      params: {
+        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+      },
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "run_cmd")!;
+  const result = tool.parameters.safeParse({});
+  assertEquals(result.success, false);
+});
+
+Deno.test("ShellFeature: configured tool validates optional params", async () => {
+  const tools = await new ShellFeature({
+    run_cmd: {
+      command: "echo {pattern}",
+      description: "Run",
+      params: {
+        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+        verbose: { type: "boolean", required: false, array: false, description: "Verbose" },
+      },
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "run_cmd")!;
+  // Without optional param should succeed
+  const result = tool.parameters.safeParse({ pattern: "test" });
+  assert(result.success);
+  // With optional param should also succeed
+  const withVerbose = tool.parameters.safeParse({ pattern: "test", verbose: true });
+  assert(withVerbose.success);
+});
+
+Deno.test("ShellFeature: configured tool renders command via TextTemplate", async () => {
+  let receivedCommand: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(
+      command: string | string[],
+    ): Promise<CommandResult> {
+      receivedCommand = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "ok",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+
+  const tools = await new ShellFeature({
+    rg_search: {
+      command: "rg {pattern}\n{#IF hidden}\n--hidden\n{#END}",
+      description: "Search",
+      params: {
+        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+        hidden: { type: "boolean", required: false, array: false, description: "Hidden" },
+      },
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "rg_search")!;
+
+  // Execute with hidden=true
+  await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { pattern: "foo", hidden: true });
+  assert(receivedCommand!.includes("'foo'"));
+  assert(receivedCommand!.includes("--hidden"));
+
+  // Execute with hidden=false
+  receivedCommand = undefined;
+  await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { pattern: "bar" });
+  assert(receivedCommand!.includes("'bar'"));
+  assert(!receivedCommand!.includes("--hidden"));
+});
+
+Deno.test("ShellFeature: configured tool shell-escapes string params", async () => {
+  let receivedCommand: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(
+      command: string | string[],
+    ): Promise<CommandResult> {
+      receivedCommand = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+
+  const tools = await new ShellFeature({
+    echo_tool: {
+      command: "echo {msg}",
+      description: "Echo",
+      params: {
+        msg: { type: "string", required: true, array: false, description: "Message" },
+      },
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "echo_tool")!;
+
+  await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { msg: "hello world" });
+  // Should be shell-quoted
+  assert(receivedCommand!.includes("'hello world'"));
+});
+
+Deno.test("ShellFeature: configured tool preserves array order for {#FOR}", async () => {
+  let receivedCommand: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(
+      command: string | string[],
+    ): Promise<CommandResult> {
+      receivedCommand = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+
+  const tools = await new ShellFeature({
+    multi_echo: {
+      command: "echo\n{#FOR item IN items}\n{item}\n{#END}",
+      description: "Multi echo",
+      params: {
+        items: { type: "string", required: true, array: true, description: "Items" },
+      },
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "multi_echo")!;
+
+  await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { items: ["foo", "hello world", "bar"] });
+  // Each item individually quoted and rendered in order
+  assert(receivedCommand!.includes("'foo'"));
+  assert(receivedCommand!.includes("'hello world'"));
+  assert(receivedCommand!.includes("'bar'"));
+});
+
+Deno.test("ShellFeature: configured tool returns model-facing result", async () => {
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(): Promise<CommandResult> {
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "result-data",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+
+  const tools = await new ShellFeature({
+    simple: {
+      command: "echo done",
+      description: "Simple tool",
+      params: {},
+    },
+  }).createTools();
+  const tool = tools.find((t) => t.name === "simple")!;
+
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, {});
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.exitCode, 0);
+  assertEquals(result.stdout, "result-data");
+  assertEquals(result.timedOut, false);
+});
+
+Deno.test("ShellFeature: emits background management tools", async () => {
+  const tools = await new ShellFeature().createTools();
+  const names = tools.map((t) => t.name);
+  assert(names.includes("shell"));
+  assert(names.includes("start_background"));
+  assert(names.includes("stop_background"));
+  assert(names.includes("get_background"));
+  assert(names.includes("send_background"));
+});
+
+Deno.test("ShellFeature: start_background builds a tmux new-session command", async () => {
+  let received: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      received = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "start_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server", command: "python3 -m http.server 8000" });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.status, "started");
+  assertEquals(result.name, "server");
+  assert(received!.startsWith("tmux new-session -d"));
+  assert(received!.includes("-s 'server'"));
+  assert(received!.includes("-c '/root'"));
+  assert(received!.includes("bash -c 'python3 -m http.server 8000'"));
+});
+
+Deno.test("ShellFeature: start_background shell-escapes the command", async () => {
+  let received: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      received = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "start_background")!;
+  await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "weird", command: "echo 'hi'" });
+  // Single quotes inside the command must be escaped for the bash -c wrapper.
+  assert(received!.includes("'\\''"), `expected escaped quote, got: ${received}`);
+});
+
+Deno.test("ShellFeature: stop_background kills the session", async () => {
+  let received: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      received = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "stop_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server" });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.status, "stopped");
+  assert(received!.includes("tmux kill-session -t 'server'"));
+});
+
+Deno.test("ShellFeature: stop_background reports not_found", async () => {
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(): Promise<CommandResult> {
+      return Promise.resolve({
+        exitCode: 1,
+        stdout: "",
+        stderr: "session not found: server",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "stop_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server" });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.status, "not_found");
+});
+
+Deno.test("ShellFeature: get_background returns output and liveness", async () => {
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      const cmd = Array.isArray(command) ? command.join(" ") : command;
+      if (cmd.includes("has-session")) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          aborted: false,
+        });
+      }
+      if (cmd.includes("capture-pane")) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "listening on 8000\n",
+          stderr: "",
+          timedOut: false,
+          aborted: false,
+        });
+      }
+      if (cmd.includes("list-panes")) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "0",
+          stderr: "",
+          timedOut: false,
+          aborted: false,
+        });
+      }
+      return Promise.resolve({
+        exitCode: 1,
+        stdout: "",
+        stderr: "unknown",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "get_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server" });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.found, true);
+  assertEquals(result.alive, true);
+  assertEquals(result.output, "listening on 8000\n");
+});
+
+Deno.test("ShellFeature: get_background reports not found", async () => {
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      const cmd = Array.isArray(command) ? command.join(" ") : command;
+      if (cmd.includes("has-session")) {
+        return Promise.resolve({
+          exitCode: 1,
+          stdout: "",
+          stderr: "session not found",
+          timedOut: false,
+          aborted: false,
+        });
+      }
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "get_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "ghost" });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.found, false);
+  assertEquals(result.alive, false);
+});
+
+Deno.test("ShellFeature: get_background honours the n line limit", async () => {
+  let received: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      const cmd = Array.isArray(command) ? command.join(" ") : command;
+      if (cmd.includes("has-session")) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          aborted: false,
+        });
+      }
+      if (cmd.includes("capture-pane")) {
+        received = cmd;
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "tail\n",
+          stderr: "",
+          timedOut: false,
+          aborted: false,
+        });
+      }
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "0",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "get_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server", last: 50 });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.found, true);
+  assertEquals(result.output, "tail\n");
+  // -S -50 captures the last 50 lines instead of all history.
+  assert(received!.includes("capture-pane -t 'server' -p -S -50"));
+});
+
+Deno.test("ShellFeature: send_background sends keys with Enter", async () => {
+  let received: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      received = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "send_background")!;
+  const value = await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server", input: "GET /" });
+  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  assertEquals(result.status, "sent");
+  assert(received!.includes("tmux send-keys -t 'server' 'GET /' Enter"));
+});
+
+Deno.test("ShellFeature: send_background omits Enter when enter is false", async () => {
+  let received: string | undefined;
+  const runtime = new class implements RuntimeEnv {
+    readonly agentId = "alpha";
+    prepare(): Promise<void> { return Promise.resolve(); }
+    exec(command: string | string[]): Promise<CommandResult> {
+      received = Array.isArray(command) ? command.join(" ") : command;
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+      });
+    }
+    destroy(): Promise<void> { return Promise.resolve(); }
+    reset(): Promise<void> { return Promise.resolve(); }
+  }();
+  const tools = await new ShellFeature().createTools();
+  const tool = tools.find((t) => t.name === "send_background")!;
+  await tool.execute({
+    deps: {
+      agentId: "alpha",
+      provider: "test",
+      model: "test",
+      runtime,
+      cwd: "/root",
+      control: {},
+    },
+  } as never, { name: "server", input: "GET /", enter: false });
+  assert(received!.includes("tmux send-keys -t 'server' 'GET /'"));
+  assert(!received!.includes("Enter"));
+});
+
+Deno.test("ShellFeature: feature gating — no shell feature means no configured tools", async () => {
+  const features = new FeatureRegistry<AgentRunDeps>();
+  features.register(new ShellFeature({
+    custom_tool: {
+      command: "echo hi",
+      description: "Custom",
+      params: {},
+    },
+  }));
+  features.register(new FilesystemFeature());
+  Context.set("features", features);
+  try {
+    // Agent with only filesystem — should not get shell or custom_tool
+    const filesystemOnly = features.get("filesystem");
+    const fsTools = await filesystemOnly.createTools?.() ?? [];
+    const fsNames = fsTools.map((t) => t.name);
+    assert(!fsNames.includes("shell"));
+    assert(!fsNames.includes("custom_tool"));
+
+    // Agent with shell — should get shell + custom_tool
+    const shellFeature = features.get("shell");
+    const shellTools = await shellFeature.createTools?.() ?? [];
+    const shellNames = shellTools.map((t) => t.name);
+    assert(shellNames.includes("shell"));
+    assert(shellNames.includes("custom_tool"));
+  } finally {
+    Context.delete("features");
+  }
 });

@@ -229,9 +229,10 @@ agents:
 Required population type/profile. It must begin with a lowercase letter and
 contain only lowercase letters, digits, and hyphens.
 
-It also forms stable IDs. A `research` population produces `research-1`,
-`research-2`, and so on. Numbering continues across repeated entries with the
-same type.
+It forms the stable semantic source identity. A `research` population produces
+`research-1`, `research-2`, and so on before AgentZoo deterministically hashes
+that value into the canonical opaque ID. Numbering continues across repeated
+entries with the same type; changing a configured name does not change the ID.
 
 ### `count`, `name`, and `names`
 
@@ -248,9 +249,9 @@ same type.
 This produces three independently identified agents:
 
 ```text
-Rowan (research-1)
-Rowan (research-2)
-Rowan (research-3)
+Rowan (62d2f5686392)
+Rowan (9ef0b7db0217)
+Rowan (c4842989967d)
 ```
 
 Identical names are intentional and valid. Stable IDs remain the correlation
@@ -284,10 +285,12 @@ starts.
 Use exactly one:
 
 - `system` names a top-level template.
-- `systemPrompt` supplies inline system text.
+- `systemPrompt` supplies inline instruction text.
 
-The stable environment contract, including the existence of `/shared`, is added
-independently. It does not depend on either field.
+Both become Vibes instructions, supplied on every model turn without being
+retained in conversation history. AgentZoo's stable environment contract,
+including the existence of `/shared`, is system content independent of either
+field.
 
 ### `prompt`
 
@@ -306,15 +309,17 @@ Supported built-in values are `shell`, `filesystem`, `http`, and `vision`.
 `vision` is opt-in and is not part of the default set. The lifecycle tool
 `yield` is always added. `complete` is added only when completion is enabled.
 
-Features affect the model-visible tool list; they do not necessarily remove an
-underlying capability already available through `shell`.
+Features affect the model-visible tool list and add their own system guidance;
+the guidance follows the same feature-group order as the tools. They do not
+necessarily remove an underlying capability already available through `shell`.
 
 ### `cwd`
 
 Starting working directory inside the private agent environment. Defaults to
-`/root`. It is used by shell/filesystem tools and the initial environment
-observation. The observation records the actual login user (normally `root`),
-working directory, and bounded directory listing in the leading system prompt.
+`/root`. It is used by shell/filesystem tools. When `shell` is enabled, its
+system guidance observes the agent's actual login user (normally `root`),
+working directory, and bounded directory listing; without `shell`, AgentZoo
+does not make that observation.
 
 ### `maxTurns`
 

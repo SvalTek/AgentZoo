@@ -30,8 +30,8 @@ Agent system templates receive:
 
 | Variable | Value                                       |
 | -------- | ------------------------------------------- |
-| `agent`  | Stable generated ID, such as `research-1`   |
-| `id`     | The same stable generated ID                |
+| `agent`  | Stable opaque ID, such as `62d2f5686392`    |
+| `id`     | The same stable opaque ID                   |
 | `name`   | Configured `name`/`names` value, or missing |
 | `type`   | Population type                             |
 | `model`  | Configured model registry key               |

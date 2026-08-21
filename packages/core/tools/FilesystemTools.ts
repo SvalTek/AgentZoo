@@ -1,15 +1,17 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
 import type { ToolDefinition } from "@vibesjs/sdk";
+import { TextTemplate } from "@agent-zoo/shared";
 import { z } from "zod";
-import type { AgentRunDeps } from "./Agent.ts";
-import type { Feature } from "./Feature.ts";
-import type { CommandResult } from "./types.ts";
+import type { AgentRunDeps } from "../Agent.ts";
+import type { Feature } from "../Feature.ts";
+import type { CommandResult } from "../types.ts";
 import {
   actionableToolError,
   observedToolResult,
   ToolExecutionError,
-} from "./ToolSupport.ts";
+  type ToolFeedback,
+} from "../ToolSupport.ts";
 
 const PathParameter = z.string().optional().describe(
   "The file path for this operation. Required for execution. Use an absolute path or a path relative to the current working directory.",
@@ -168,9 +170,99 @@ fi | head -n "$((limit + 1))"
 export class FilesystemFeature implements Feature<AgentRunDeps> {
   readonly id = "filesystem";
   readonly description = "Use files and directories.";
+  readonly systemPrompt = new TextTemplate(`## Filesystem tools
+
+Use these structured tools for ordinary file and directory work instead of shell.
+
+- Inspect with list_directory, read_file, or search_files.
+- Create a new complete file with write_file.
+- Make one exact, known text replacement with edit_file.
+- Use apply_patch for related changes across multiple regions or files. Read the current contents first and build the patch from that state.
+- Use shell for commands and operations, not to avoid structured text-file edits.`);
 
   async createTools(): Promise<readonly ToolDefinition<AgentRunDeps>[]> {
     const { tool } = await import("@vibesjs/sdk");
+    const patchFailures: Record<number, ToolFeedback> = {
+      51: [
+        "No files were changed: the patch does not match the current files.",
+        "Read the affected files and rebuild the patch from their current contents.",
+        "Do not resend the same patch unchanged.",
+      ],
+      52: [
+        "No files were changed: the checked patch could not be applied.",
+        "Read the affected files, confirm their current state, and regenerate the patch.",
+      ],
+      53: [
+        "No files were changed: the patch could not be processed.",
+        "Provide a complete unified diff with valid file headers and hunk lines.",
+      ],
+    };
+    const writeFailures: Record<number, ToolFeedback> = {
+      41: [
+        "No bytes were written: the path is not a regular file.",
+        "Choose a file path.",
+      ],
+      43: [
+        "No bytes were written: the parent directory does not exist.",
+        "Create the parent directory or choose an existing directory.",
+      ],
+      54: [
+        "No bytes were written: the file already exists.",
+        "create is only for a new file.",
+        "For a local change, read the file and use edit_file; for related changes, use apply_patch.",
+        "Use overwrite only for an intended complete replacement.",
+      ],
+    };
+    const editFailures: Record<number, ToolFeedback> = {
+      40: [
+        "No files were changed: the path does not exist.",
+        "Check the path or list its parent directory.",
+      ],
+      41: [
+        "No files were changed: the path is not a regular file.",
+        "Choose a file path.",
+      ],
+      44: [
+        "No files were changed.",
+        "The requested text was not found in the current file.",
+        "Read the current file and copy the exact text into oldText.",
+        "If several related edits are needed, rebuild one apply_patch from current content.",
+      ],
+      45: [
+        "No files were changed.",
+        "The requested text occurs more than once.",
+        "Provide more surrounding text to identify one occurrence, or set replaceAll to true to replace every exact match.",
+        "For several related edits, rebuild one apply_patch from current content.",
+      ],
+      47: [
+        "No files were changed: the file is too large for edit_file.",
+        "Use apply_patch for a precise change or shell for an appropriate large-file operation.",
+      ],
+      50: [
+        "No files were changed: the file is not suitable for text editing.",
+        "Use shell for binary data or choose a UTF-8 text file.",
+      ],
+    };
+    const readFailures: Record<number, ToolFeedback> = {
+      40: [
+        "The path does not exist.",
+        "Check the path or list its parent directory to find the correct name.",
+      ],
+      41: [
+        "The path is not a regular file.",
+        "Choose a file path; use list_directory when the path is a directory.",
+      ],
+    };
+    const directoryFailures: Record<number, ToolFeedback> = {
+      40: [
+        "The path does not exist.",
+        "Check the path or list its parent directory to find the correct name.",
+      ],
+      48: [
+        "The path is not a directory.",
+        "Choose a directory path or use read_file when the path is a file.",
+      ],
+    };
     return [
       tool<AgentRunDeps, typeof PatchParameters>({
         name: "apply_patch",
@@ -180,9 +272,21 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
         argsValidator: (input) => {
           if (!input.patch?.trim()) {
             throw actionableToolError(
-              "No patch was provided.",
-              "Provide the complete unified diff in patch.",
+              [
+                "No patch was provided.",
+                "Provide the complete unified diff in patch.",
+              ],
             );
+          }
+          if (
+            !/^---\s+\S+/m.test(input.patch!) ||
+            !/^\+\+\+\s+\S+/m.test(input.patch!)
+          ) {
+            throw actionableToolError([
+              "The patch has no complete unified-diff file header.",
+              "No files were changed.",
+              "Include matching --- and +++ file-header lines before any hunk.",
+            ]);
           }
         },
         execute: async (context, input) => {
@@ -194,6 +298,7 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
             ["/bin/bash", "-c", PATCH_SCRIPT, "apply_patch"],
             patch,
             input.cwd,
+            patchFailures,
           );
           const changes = raw.stdout.split("\n").filter(Boolean).map((line) => {
             const [additions = "0", deletions = "0", ...path] = line.split(
@@ -205,7 +310,12 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
               deletions: deletions === "-" ? undefined : Number(deletions),
             };
           });
-          const result = { filesChanged: changes.length, changes };
+          const result = {
+            filesChanged: changes.length,
+            changes,
+            message:
+              "Patch applied. Its previous file context is now stale; read or test before another related edit.",
+          };
           return observedToolResult(result, { command: raw, result });
         },
       }),
@@ -219,18 +329,27 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
           validateWriteArguments(input);
           const mode = input.mode ?? "create";
           const content = input.content!;
-          const raw = await execute(context.deps, [
-            "/bin/bash",
-            "-c",
-            WRITE_SCRIPT,
-            "write_file",
-            input.path!,
-            mode,
-          ], content);
+          const raw = await execute(
+            context.deps,
+            [
+              "/bin/bash",
+              "-c",
+              WRITE_SCRIPT,
+              "write_file",
+              input.path!,
+              mode,
+            ],
+            content,
+            undefined,
+            writeFailures,
+          );
           const result = {
             path: input.path!,
             bytesWritten: new TextEncoder().encode(content).length,
             mode,
+            message: mode === "overwrite"
+              ? "Complete file replacement finished. Read or test this file before another write."
+              : "Write finished.",
           };
           return observedToolResult(result, { command: raw, result });
         },
@@ -246,18 +365,29 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
           const newText = input.newText!;
           const encode = (value: string) =>
             btoa(String.fromCharCode(...new TextEncoder().encode(value)));
-          const raw = await execute(context.deps, [
-            "/bin/bash",
-            "-c",
-            EDIT_SCRIPT,
-            "edit_file",
-            input.path!,
-            encode(oldText),
-            encode(newText),
-            String(input.replaceAll ?? false),
-          ]);
+          const raw = await execute(
+            context.deps,
+            [
+              "/bin/bash",
+              "-c",
+              EDIT_SCRIPT,
+              "edit_file",
+              input.path!,
+              encode(oldText),
+              encode(newText),
+              String(input.replaceAll ?? false),
+            ],
+            undefined,
+            undefined,
+            editFailures,
+          );
           const replacements = Number(raw.stdout.trim());
-          const result = { path: input.path!, replacements };
+          const result = {
+            path: input.path!,
+            replacements,
+            message:
+              "Exact replacement finished. The oldText from this call is no longer current; read or test before another related edit.",
+          };
           return observedToolResult(result, { command: raw, result });
         },
       }),
@@ -279,9 +409,22 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
             String(offset),
             String(limit),
           ];
-          const raw = await execute(context.deps, command);
+          const raw = await execute(
+            context.deps,
+            command,
+            undefined,
+            undefined,
+            readFailures,
+          );
           const [sizeLine = "0", encoded = ""] = raw.stdout.split("\n", 2);
           const sizeBytes = Number(sizeLine);
+          if (offset > sizeBytes) {
+            throw actionableToolError([
+              "No bytes were read: offset is beyond the end of the file.",
+              `The file is ${sizeBytes} bytes, but offset was ${offset}.`,
+              "Read from offset 0 or use an offset no greater than the file size.",
+            ], { command: raw });
+          }
           let bytes: Uint8Array;
           try {
             bytes = Uint8Array.from(
@@ -290,15 +433,19 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
             );
           } catch {
             throw actionableToolError(
-              "The file contents could not be decoded.",
-              "Use shell for binary data or retry read_file with a valid text file.",
+              [
+                "The file contents could not be decoded.",
+                "Use shell for binary data or retry read_file with a valid text file.",
+              ],
               { command: raw },
             );
           }
           if (bytes.includes(0)) {
             throw actionableToolError(
-              "The file is not suitable for text reading.",
-              "Use shell for binary data or choose a UTF-8 text file.",
+              [
+                "The file is not suitable for text reading.",
+                "Use shell for binary data or choose a UTF-8 text file.",
+              ],
               { command: raw },
             );
           }
@@ -307,8 +454,11 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
             content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
           } catch {
             throw actionableToolError(
-              "The file is not suitable for text reading.",
-              "Use shell for binary data or choose a UTF-8 text file.",
+              [
+                "The requested byte range is not valid UTF-8.",
+                "The file may be binary, or offset and limit may split a multibyte character.",
+                "Read from offset 0 or choose a different byte range before retrying.",
+              ],
               { command: raw },
             );
           }
@@ -332,13 +482,19 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
         parameters: ListParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
-          const raw = await execute(context.deps, [
-            "/bin/bash",
-            "-c",
-            LIST_SCRIPT,
-            "list_directory",
-            path,
-          ]);
+          const raw = await execute(
+            context.deps,
+            [
+              "/bin/bash",
+              "-c",
+              LIST_SCRIPT,
+              "list_directory",
+              path,
+            ],
+            undefined,
+            undefined,
+            directoryFailures,
+          );
           const fields = raw.stdout.split("\0");
           if (fields.at(-1) === "") fields.pop();
           const entries = [];
@@ -363,25 +519,37 @@ export class FilesystemFeature implements Feature<AgentRunDeps> {
           const path = input.path ?? ".";
           const maxResults = input.maxResults ?? 50;
           const raw = input.text
-            ? await execute(context.deps, [
-              "/bin/bash",
-              "-c",
-              SEARCH_TEXT_SCRIPT,
-              "search_files",
-              path,
-              input.text,
-              String(maxResults),
-              input.name ?? "",
-            ])
-            : await execute(context.deps, [
-              "/bin/bash",
-              "-c",
-              SEARCH_NAME_SCRIPT,
-              "search_files",
-              path,
-              input.name ?? "*",
-              String(maxResults),
-            ]);
+            ? await execute(
+              context.deps,
+              [
+                "/bin/bash",
+                "-c",
+                SEARCH_TEXT_SCRIPT,
+                "search_files",
+                path,
+                input.text,
+                String(maxResults),
+                input.name ?? "",
+              ],
+              undefined,
+              undefined,
+              directoryFailures,
+            )
+            : await execute(
+              context.deps,
+              [
+                "/bin/bash",
+                "-c",
+                SEARCH_NAME_SCRIPT,
+                "search_files",
+                path,
+                input.name ?? "*",
+                String(maxResults),
+              ],
+              undefined,
+              undefined,
+              directoryFailures,
+            );
           const parsed = input.text
             ? parseTextMatches(raw.stdout)
             : parseNameMatches(raw.stdout);
@@ -401,8 +569,7 @@ function requirePath(
 ): asserts path is string {
   if (path?.trim()) return;
   throw actionableToolError(
-    "No file path was provided.",
-    `Provide the file to ${operation} in path.`,
+    ["No file path was provided.", `Provide the file to ${operation} in path.`],
   );
 }
 
@@ -410,15 +577,28 @@ function validateWriteArguments(input: z.infer<typeof WriteParameters>): void {
   requirePath(input.path, "write");
   if (input.content === undefined) {
     throw actionableToolError(
-      "No file content was provided.",
-      "Provide the complete text to write in content. Use an empty string to write an empty file.",
+      [
+        "No file content was provided.",
+        "Provide the complete text to write in content. Use an empty string to write an empty file.",
+      ],
     );
   }
   if (input.mode === "overwrite" && input.force !== true) {
     throw actionableToolError(
-      "Replacing the complete file requires explicit confirmation.",
-      "Prefer edit_file for one small exact replacement or apply_patch for larger or multiple changes. To intentionally replace the complete file, set mode to overwrite and force to true.",
+      [
+        "Replacing the complete file requires explicit confirmation.",
+        "No bytes were written.",
+        "For a local change, prefer edit_file; for related changes, prefer apply_patch.",
+        "Only for an intended complete replacement, set mode to overwrite and force to true.",
+      ],
     );
+  }
+  if (input.force === true && input.mode !== "overwrite") {
+    throw actionableToolError([
+      "force only applies with mode overwrite.",
+      "No bytes were written.",
+      "Omit force for create or append, or set mode to overwrite only for an intended complete replacement.",
+    ]);
   }
 }
 
@@ -426,14 +606,18 @@ function validateEditArguments(input: z.infer<typeof EditParameters>): void {
   requirePath(input.path, "edit");
   if (!input.oldText) {
     throw actionableToolError(
-      "No exact text to replace was provided.",
-      "Provide the existing text in oldText. oldText cannot be empty.",
+      [
+        "No exact text to replace was provided.",
+        "Provide the existing text in oldText. oldText cannot be empty.",
+      ],
     );
   }
   if (input.newText === undefined) {
     throw actionableToolError(
-      "No replacement text was provided.",
-      "Provide the replacement in newText. Use an empty string to delete the matched text.",
+      [
+        "No replacement text was provided.",
+        "Provide the replacement in newText. Use an empty string to delete the matched text.",
+      ],
     );
   }
 }
@@ -443,6 +627,7 @@ async function execute(
   command: string[],
   stdin?: string,
   cwd = deps.cwd,
+  failures: Readonly<Record<number, ToolFeedback>> = {},
 ): Promise<CommandResult> {
   let raw: CommandResult;
   try {
@@ -456,68 +641,11 @@ async function execute(
     throw new ToolExecutionError("The operation failed.", { error });
   }
   if (raw.exitCode === 0) return raw;
-  const failures: Record<number, readonly [string, string]> = {
-    40: [
-      "The path does not exist.",
-      "Check the path or list its parent directory to find the correct name.",
-    ],
-    41: [
-      "The path is not a regular file.",
-      "Choose a file path; use list_directory when the path is a directory.",
-    ],
-    43: [
-      "The parent directory does not exist.",
-      "Create the parent directory with shell or choose an existing directory, then retry.",
-    ],
-    44: [
-      "The requested text was not found.",
-      "Read the current file, copy the exact text to oldText, and retry.\nIf the intended change is still local but exact replacement is awkward, use apply_patch with surrounding context rather than rewriting the file.",
-    ],
-    45: [
-      "The requested text occurs more than once.",
-      "Provide more surrounding text to identify one occurrence, or set replaceAll to true to replace every exact match.\nIf the intended change is still local but exact replacement is awkward, use apply_patch with surrounding context rather than rewriting the file.",
-    ],
-    47: [
-      "The file is too large for edit_file.",
-      "Use apply_patch for a precise change or shell for an appropriate large-file operation.",
-    ],
-    48: [
-      "The path is not a directory.",
-      "Choose a directory path or use read_file when the path is a file.",
-    ],
-    50: [
-      "The file is not suitable for text editing.",
-      "Use shell for binary data or choose a UTF-8 text file.",
-    ],
-    51: [
-      "The patch does not match the current files.",
-      "Read the current files, correct the paths and exact hunk context, then retry.",
-    ],
-    52: [
-      "The checked patch could not be applied.",
-      "Read the affected files to confirm their current state, regenerate the patch, and retry.",
-    ],
-    53: [
-      "The patch could not be processed.",
-      "Provide a complete unified diff with valid file headers and hunk lines, then retry.",
-    ],
-    54: [
-      "The file already exists.",
-      "Use edit_file for one exact replacement, apply_patch for larger or multiple changes, append to add content, or mode overwrite with force true to intentionally replace the complete file. Overwrite should be avoided for general-purpose text editing.",
-    ],
-  };
   const failure = failures[raw.exitCode ?? -1];
   if (failure) {
-    throw actionableToolError(failure[0], failure[1], { command: raw });
+    throw actionableToolError(failure, { command: raw });
   }
-  throw neutralError("The operation failed.", raw);
-}
-
-function neutralError(
-  message: string,
-  command: CommandResult,
-): ToolExecutionError {
-  return new ToolExecutionError(message, { command });
+  throw new ToolExecutionError("The operation failed.", { command: raw });
 }
 
 function fileType(code: string): "file" | "directory" | "symlink" | "other" {

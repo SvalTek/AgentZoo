@@ -26,7 +26,7 @@ export function DashboardHeader({
     >
       <Box>
         <Box flexShrink={0}>
-          <Text color="cyan" bold>AgentZoo{" "}</Text>
+          <Text color="cyan" bold>AgentZoo </Text>
           {state === "running" && <Spinner type="dots" color="green" />}
         </Box>
 

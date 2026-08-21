@@ -119,7 +119,7 @@ export interface AgentConfig {
    * in tool results). Falls back to the agent's own model when unset.
    */
   captioningModel?: string;
-  /** Static system prompt, or a function producing one. */
+  /** Configured instructions, resolved by Vibes for each model turn. */
   systemPrompt?: string | (() => string | Promise<string>);
   /**
    * IDs of Features this agent may use. Concrete Services grant the

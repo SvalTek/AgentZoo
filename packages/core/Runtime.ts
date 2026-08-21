@@ -9,7 +9,7 @@ import type {
 } from "./types.ts";
 
 export function assertAgentId(agentId: string): void {
-  if (!/^[a-z][a-z0-9-]{0,62}$/.test(agentId)) {
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(agentId)) {
     throw new TypeError(
       "Agent id must use lowercase letters, digits, and hyphens",
     );
@@ -137,25 +137,15 @@ export class DockerRuntimeManager implements RuntimeManager {
   /** Ensure the runtime image exists locally, building from source when the
    * Containerfile is present or pulling the published image otherwise. */
   async #ensureRuntimeImage(): Promise<void> {
-    if (await tryDockerImageId(this.image)) return;
     const containerfile = fromFileUrl(
       new URL("./runtime/Containerfile", import.meta.url),
     );
-    if (await pathExists(containerfile)) {
-      await buildRuntimeImage(this.image);
-      return;
-    }
-    try {
-      await runDocker(["pull", this.image]);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Runtime image "${this.image}" is not available locally, its ` +
-          "Containerfile is not present in this installation, and pulling " +
-          `it failed: ${detail}\n` +
-          "Build it once from a source checkout with `deno task docker:build`.",
-      );
-    }
+    await ensureRuntimeImage(this.image, containerfile, {
+      tryDockerImageId,
+      pathExists,
+      buildRuntimeImage,
+      runDocker,
+    });
   }
 
   async #ensureDataVolume(): Promise<void> {
@@ -424,6 +414,42 @@ export async function buildRuntimeImage(
     `${DOCKER_RESOURCE_LABEL}=image`,
     fromFileUrl(new URL("./runtime/", import.meta.url)),
   ]);
+}
+
+export interface RuntimeImageDeps {
+  tryDockerImageId(image: string): Promise<string | undefined>;
+  pathExists(path: string): Promise<boolean>;
+  buildRuntimeImage(image: string): Promise<void>;
+  runDocker(args: string[]): Promise<void>;
+}
+
+/**
+ * Ensure the runtime image exists locally, building from source when the
+ * Containerfile is present or pulling the published image otherwise.
+ * Extracted for unit testing; {@link DockerRuntimeManager.#ensureRuntimeImage}
+ * delegates here with the real module-level functions.
+ */
+export async function ensureRuntimeImage(
+  image: string,
+  containerfilePath: string,
+  deps: RuntimeImageDeps,
+): Promise<void> {
+  if (await deps.tryDockerImageId(image)) return;
+  if (await deps.pathExists(containerfilePath)) {
+    await deps.buildRuntimeImage(image);
+    return;
+  }
+  try {
+    await deps.runDocker(["pull", image]);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Runtime image "${image}" is not available locally, its ` +
+        "Containerfile is not present in this installation, and pulling " +
+        `it failed: ${detail}\n` +
+        "Build it once from a source checkout with `deno task docker:build`.",
+    );
+  }
 }
 
 /** Inspect only Docker resources carrying AgentZoo's explicit ownership label. */

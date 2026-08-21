@@ -72,11 +72,16 @@ class FakeActor extends EventTarget implements ZooActor {
   }
 }
 
+async function resolveConfiguredSystemPrompt(agent: ZooActor | undefined) {
+  const prompt = agent?.config.systemPrompt;
+  return (typeof prompt === "function" ? await prompt() : prompt)?.trim();
+}
+
 Deno.test("runner preserves actors, tracks idle time, wakes with time, and completes by agreement", async () => {
   let now = 10_000;
   const alpha = new FakeActor(
     "alpha",
-    { id: "alpha", name: "Alpha", type: "coding", model: "local" },
+    { id: "alpha", name: "Alpha", type: "coding", model: "local", features: ["shell"] },
     [{ outcome: "yield" }, { outcome: "complete" }],
     () => now += 1_000,
   );
@@ -102,12 +107,9 @@ Deno.test("runner preserves actors, tracks idle time, wakes with time, and compl
     /real-file/,
   );
   assertEquals(alpha.activationOptions[0].appendPrompt, true);
-  assertEquals(beta.observations, 1);
+  assertEquals(beta.observations, 0);
   assertEquals(beta.prompts[0], "");
-  assertMatch(
-    beta.activationOptions[0].initialSystemContext ?? "",
-    /real-file/,
-  );
+  assertEquals(beta.activationOptions[0].initialSystemContext, undefined);
   assertEquals(beta.activationOptions[0].appendPrompt, false);
   assertMatch(
     alpha.prompts[1],
@@ -288,15 +290,20 @@ Deno.test("shutdown still disposes runtime when an actor stop fails", async () =
 class FakeEnv implements RuntimeEnv {
   prepared = 0;
   destroyed = 0;
+  readonly commands: Array<{
+    command: string | string[];
+    options?: CommandOptions;
+  }> = [];
   constructor(readonly agentId: string) {}
   prepare(): Promise<void> {
     this.prepared++;
     return Promise.resolve();
   }
   exec(
-    _command: string | string[],
-    _options?: CommandOptions,
+    command: string | string[],
+    options?: CommandOptions,
   ): Promise<CommandResult> {
+    this.commands.push({ command, options });
     return Promise.resolve({
       exitCode: 0,
       stdout: "/root\nf ./observed\n",
@@ -389,41 +396,61 @@ completion:
     runtimeFactory: () => runtime,
     modelFactory: () => ({} as LanguageModel),
   });
-  assertEquals(built.zoo.agents(), ["coding-1", "coding-2", "research-1"]);
+  assertEquals(built.zoo.agents(), [
+    "446eb29a731d",
+    "8e71e6d8a598",
+    "62d2f5686392",
+  ]);
   assertEquals(runtime.envs.size, 3);
-  assertEquals(built.zoo.getAgent("coding-1")?.config.type, "coding");
-  assertEquals(built.zoo.getAgent("coding-1")?.config.name, "Rowan");
+  assertEquals(runtime.envs.get("446eb29a731d")?.commands.slice(0, 2), [
+    {
+      command: ["git", "config", "--global", "user.name", "Rowan"],
+      options: { env: { HOME: "/root" } },
+    },
+    {
+      command: [
+        "git",
+        "config",
+        "--global",
+        "user.email",
+        "rowan@446eb29a731d.local",
+      ],
+      options: { env: { HOME: "/root" } },
+    },
+  ]);
+  assertEquals(built.zoo.getAgent("446eb29a731d")?.config.type, "coding");
+  assertEquals(built.zoo.getAgent("446eb29a731d")?.config.name, "Rowan");
   assertEquals(
-    String(built.zoo.getAgent("coding-1")?.config.systemPrompt).trim(),
+    await resolveConfiguredSystemPrompt(built.zoo.getAgent("446eb29a731d")),
     "You are Rowan of type coding.",
   );
-  assertEquals(built.zoo.getAgent("coding-1")?.config.maxTurns, 77);
-  assertEquals(built.zoo.getAgent("coding-1")?.config.context, {
+  assertEquals(built.zoo.getAgent("446eb29a731d")?.config.maxTurns, 77);
+  assertEquals(built.zoo.getAgent("446eb29a731d")?.config.context, {
     window: 32_768,
     maxOutputTokens: 2_048,
   });
-  assertEquals(built.zoo.getAgent("coding-1")?.config.sampling, {
+  assertEquals(built.zoo.getAgent("446eb29a731d")?.config.sampling, {
     temperature: 0.2,
     topP: 0.9,
     minP: 0.05,
     topK: 30,
   });
-  assertEquals(built.zoo.getAgent("research-1")?.config.maxTurns, 100);
-  assertEquals(built.zoo.getAgent("research-1")?.config.context, {
+  assertEquals(built.zoo.getAgent("62d2f5686392")?.config.maxTurns, 100);
+  assertEquals(built.zoo.getAgent("62d2f5686392")?.config.context, {
     window: 32_768,
     maxOutputTokens: 4_096,
   });
-  assertEquals(built.zoo.getAgent("research-1")?.config.sampling, {
+  assertEquals(built.zoo.getAgent("62d2f5686392")?.config.sampling, {
     temperature: 0.7,
     topP: 0.9,
     minP: 0.05,
   });
-  assertEquals(built.zoo.getAgent("research-1")?.config.name, undefined);
+  assertEquals(built.zoo.getAgent("62d2f5686392")?.config.name, undefined);
   assertEquals(
-    String(built.zoo.getAgent("research-1")?.config.systemPrompt).trim(),
-    "You are research-1 of type research.",
+    await resolveConfiguredSystemPrompt(built.zoo.getAgent("62d2f5686392")),
+    "You are 62d2f5686392 of type research.",
   );
-  assertEquals(built.zoo.getAgent("research-1")?.config.features, []);
+  assertEquals(built.zoo.getAgent("62d2f5686392")?.config.features, []);
   assertEquals(built.templates.list(), ["coding"]);
   assertEquals(built.models.list(), ["local"]);
   assertEquals(
@@ -475,26 +502,26 @@ completion:
   });
   try {
     assertEquals(built.zoo.agents(), [
-      "research-1",
-      "research-2",
-      "research-3",
-      "research-4",
+      "62d2f5686392",
+      "9ef0b7db0217",
+      "c4842989967d",
+      "1792e8014809",
     ]);
     assertEquals(
       built.zoo.state().agents.map(({ id, name }) => ({ id, name })),
       [
-        { id: "research-1", name: "Rowan" },
-        { id: "research-2", name: "Rowan" },
-        { id: "research-3", name: "Alice" },
-        { id: "research-4", name: "Alice" },
+        { id: "62d2f5686392", name: "Rowan" },
+        { id: "9ef0b7db0217", name: "Rowan" },
+        { id: "c4842989967d", name: "Alice" },
+        { id: "1792e8014809", name: "Alice" },
       ],
     );
     assertEquals(
-      String(built.zoo.getAgent("research-2")?.config.systemPrompt).trim(),
+      await resolveConfiguredSystemPrompt(built.zoo.getAgent("9ef0b7db0217")),
       "You are Rowan.",
     );
     assertEquals(
-      String(built.zoo.getAgent("research-4")?.config.systemPrompt).trim(),
+      await resolveConfiguredSystemPrompt(built.zoo.getAgent("1792e8014809")),
       "You are Alice.",
     );
   } finally {
@@ -548,7 +575,7 @@ completion:
     modelFactory: () => ({} as LanguageModel),
   });
   try {
-    assertEquals((built.zoo.getAgent("default-1") as ZooAgent).toolNames, [
+    assertEquals((built.zoo.getAgent("654ddb14e1dc") as ZooAgent).toolNames, [
       "shell",
       "apply_patch",
       "write_file",
@@ -558,7 +585,7 @@ completion:
       "search_files",
       "yield",
     ]);
-    assertEquals((built.zoo.getAgent("networked-1") as ZooAgent).toolNames, [
+    assertEquals((built.zoo.getAgent("6d58953e1a16") as ZooAgent).toolNames, [
       "shell",
       "apply_patch",
       "write_file",
@@ -568,6 +595,11 @@ completion:
       "search_files",
       "http_request",
       "yield",
+    ]);
+    assertEquals(built.zoo.getAgent("6d58953e1a16")?.config.features, [
+      "shell",
+      "filesystem",
+      "http",
     ]);
   } finally {
     await built.zoo.stop("test cleanup");

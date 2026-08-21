@@ -1,9 +1,95 @@
-import { assertEquals, assertMatch, assertStringIncludes } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertMatch,
+  assertStringIncludes,
+} from "@std/assert";
 import { createCli } from "../cli_command.ts";
-import { formatActivity } from "../packages/cli/activity_format.ts";
+import {
+  formatActivity,
+  projectActivity,
+} from "../packages/cli/activity_format.ts";
 import { ActivityLog } from "../packages/cli/ActivityLog.ts";
 import { formatRunElapsed } from "../packages/cli/components/DashboardHeader.tsx";
+import {
+  buildActivityFragments,
+  selectViewportWindow,
+  tailViewportStart,
+} from "../packages/cli/activity_viewport.ts";
 import type { AgentZoo, ModelRegistry } from "@agent-zoo/core";
+
+Deno.test("activity ScrollView fragments long messages before mounting them", () => {
+  const displays = [{
+    type: "message" as const,
+    key: "long-message",
+    at: Date.parse("2026-08-14T18:00:00Z"),
+    headline: "Alice (abc123) — reasoning",
+    details: [
+      "A deliberately long reasoning line that needs normal word wrapping before it can be placed in a small terminal viewport.",
+      "This remains accessible as a continuation instead of escaping below the activity frame.",
+    ],
+  }];
+  const fragments = buildActivityFragments(displays, 30, 6, new Set());
+  assert(fragments.length > 1);
+  assert(fragments.every((fragment) => fragment.rows <= 6));
+  assertEquals(
+    fragments.flatMap((fragment) => fragment.body).join(" ").includes(
+      "accessible",
+    ),
+    true,
+  );
+});
+
+Deno.test("activity ScrollView mounts bounded windows at either end of history", () => {
+  const displays = Array.from({ length: 5 }, (_, index) => ({
+    type: "message" as const,
+    key: String(index),
+    at: Date.parse("2026-08-14T18:00:00Z") + index,
+    headline: `Alice — message ${index}`,
+    details: [`Message ${index}`],
+  }));
+  const fragments = buildActivityFragments(displays, 50, 5, new Set());
+  const oldest = selectViewportWindow(fragments, 5, 0);
+  const latest = selectViewportWindow(
+    fragments,
+    5,
+    tailViewportStart(fragments, 5),
+  );
+  assertEquals(oldest[0].display.key, "0");
+  assertEquals(latest.at(-1)?.display.key, "4");
+  assert(latest.reduce((rows, fragment) => rows + fragment.rows, 0) <= 5);
+});
+
+Deno.test("activity ScrollView fragments an expanded tool card without losing output", () => {
+  const displays = [{
+    type: "tool" as const,
+    key: "shell-1",
+    at: Date.parse("2026-08-14T18:00:00Z"),
+    toolName: "shell",
+    headline: "Alice (abc123) — shell",
+    status: "success" as const,
+    compact: ["$ long-running-command"],
+    details: [
+      "$ long-running-command",
+      "result: exit=0",
+      "stdout: one deliberately long line of shell output that needs to remain readable in a small activity viewport.",
+      "  second deliberately long line of shell output that should appear in a later fragment rather than overflow the card.",
+    ],
+  }];
+  const fragments = buildActivityFragments(
+    displays,
+    32,
+    7,
+    new Set(["shell-1"]),
+  );
+  assert(fragments.length > 1);
+  assert(fragments.every((fragment) => fragment.rows <= 7));
+  const visibleOutput = fragments.flatMap((fragment) => fragment.body).join(
+    " ",
+  );
+  assert(visibleOutput.includes("later"));
+  assert(visibleOutput.includes("fragment"));
+});
 
 Deno.test("Cliffy standalone command forwards explicit config and no-ui mode", async () => {
   let captured: { path: string; useUi: boolean; task?: string } | undefined;
@@ -35,7 +121,7 @@ Deno.test("Cliffy Docker purge requires and forwards explicit scope", async () =
         imagesPruned: pruneImages,
       });
     },
-    cleanupProject: (project: string, pruneImages: boolean) =>
+    cleanupProject: (_project: string, pruneImages: boolean) =>
       Promise.resolve({
         containers: [],
         volumes: [],
@@ -63,6 +149,215 @@ Deno.test("dashboard run timer formats the complete elapsed duration", () => {
   assertEquals(formatRunElapsed(3_723_999), "01:02:03");
 });
 
+Deno.test("activity projection groups tool lifecycle and omits provider tool transport", () => {
+  const activity = projectActivity([
+    {
+      sequence: 1,
+      at: 0,
+      kind: "agent:model:response",
+      agentId: "alpha",
+      agentName: "Alice",
+      message: "model response",
+      detail: {
+        response: {
+          content: [
+            { type: "reasoning", text: "I will inspect the file." },
+            {
+              type: "tool-call",
+              toolName: "read_file",
+              input: { path: "/root/a.txt" },
+            },
+          ],
+        },
+      },
+    },
+    {
+      sequence: 2,
+      at: 1,
+      kind: "agent:tool:start",
+      agentId: "alpha",
+      agentName: "Alice",
+      toolName: "read_file",
+      toolCallId: "tool-1",
+      message: "called read_file",
+      detail: { path: "/root/a.txt" },
+    },
+    {
+      sequence: 3,
+      at: 2,
+      kind: "agent:tool:end",
+      agentId: "alpha",
+      agentName: "Alice",
+      toolName: "read_file",
+      toolCallId: "tool-1",
+      message: "finished read_file",
+      detail: {
+        status: "success",
+        result: { path: "/root/a.txt", content: "hello", bytesRead: 5 },
+      },
+    },
+    {
+      sequence: 4,
+      at: 3,
+      kind: "agent:model:request",
+      agentId: "alpha",
+      agentName: "Alice",
+      message: "requested model turn",
+      detail: {
+        request: {
+          prompt: [{
+            role: "tool",
+            content: [{ type: "tool-result", output: { value: "hello" } }],
+          }],
+        },
+      },
+    },
+  ]);
+  assertEquals(activity.length, 2);
+  assertEquals(activity[0].type, "message");
+  assertEquals(activity[0].details, ["I will inspect the file."]);
+  assertEquals(activity[1].type, "tool");
+  const tool = activity[1];
+  if (tool.type !== "tool") throw new Error("Expected a tool display");
+  assertEquals(tool.toolName, "read_file");
+  assertEquals(tool.status, "success");
+  assertEquals(tool.details, [
+    "path: /root/a.txt",
+    "content: hello",
+    "size: 5 bytes",
+  ]);
+});
+
+Deno.test("activity projection keeps same provider tool-call IDs distinct between agents", () => {
+  const activity = projectActivity([
+    {
+      sequence: 10,
+      at: 0,
+      kind: "agent:tool:start",
+      agentId: "alice",
+      agentName: "Alice",
+      toolName: "read_file",
+      toolCallId: "tool-1",
+      message: "Alice called read_file",
+      detail: { path: "/shared/alice.txt" },
+    },
+    {
+      sequence: 11,
+      at: 1,
+      kind: "agent:tool:start",
+      agentId: "bob",
+      agentName: "Bob",
+      toolName: "read_file",
+      toolCallId: "tool-1",
+      message: "Bob called read_file",
+      detail: { path: "/shared/bob.txt" },
+    },
+    {
+      sequence: 12,
+      at: 2,
+      kind: "agent:tool:end",
+      agentId: "alice",
+      agentName: "Alice",
+      toolName: "read_file",
+      toolCallId: "tool-1",
+      message: "Alice finished read_file",
+      detail: { status: "success", result: { content: "alice" } },
+    },
+    {
+      sequence: 13,
+      at: 3,
+      kind: "agent:tool:end",
+      agentId: "bob",
+      agentName: "Bob",
+      toolName: "read_file",
+      toolCallId: "tool-1",
+      message: "Bob finished read_file",
+      detail: { status: "success", result: { content: "bob" } },
+    },
+  ]);
+  assertEquals(activity.map((display) => display.key), ["10", "11"]);
+  assert(activity.every((display) => display.type === "tool"));
+  assertEquals(activity.map((display) => display.details.at(-1)), [
+    "content: alice",
+    "content: bob",
+  ]);
+  const fragments = buildActivityFragments(activity, 50, 6, new Set());
+  assertEquals(
+    new Set(fragments.map((fragment) => fragment.key)).size,
+    fragments.length,
+  );
+});
+
+Deno.test("activity projection gives each part of a multi-message prompt a unique key", () => {
+  const activity = projectActivity([
+    {
+      sequence: 20,
+      at: 0,
+      kind: "agent:model:request",
+      agentId: "alice",
+      agentName: "Alice",
+      message: "Alice requested a model turn",
+      detail: {
+        request: {
+          prompt: [
+            { role: "system", content: "You are concise." },
+            { role: "user", content: "Inspect the activity panel." },
+          ],
+        },
+      },
+    },
+  ]);
+  assertEquals(activity.map((display) => display.key), ["20:0:0", "20:1:0"]);
+  const fragments = buildActivityFragments(activity, 50, 6, new Set());
+  assertEquals(
+    new Set(fragments.map((fragment) => fragment.key)).size,
+    fragments.length,
+  );
+});
+
+Deno.test("activity projection does not repeat assistant context after a tool call", () => {
+  const reasoning = "I will create the requested file.";
+  const activity = projectActivity([
+    {
+      sequence: 30,
+      at: 0,
+      kind: "agent:model:response",
+      agentId: "alice",
+      agentName: "Alice",
+      message: "Alice received a model response",
+      detail: {
+        response: {
+          content: [{ type: "reasoning", text: reasoning }],
+        },
+      },
+    },
+    {
+      sequence: 31,
+      at: 1,
+      kind: "agent:model:request",
+      agentId: "alice",
+      agentName: "Alice",
+      message: "Alice requested a model turn",
+      detail: {
+        request: {
+          prompt: [
+            {
+              role: "assistant",
+              content: [{ type: "reasoning", text: reasoning }],
+            },
+            {
+              role: "tool",
+              content: [{ type: "tool-result", output: "created" }],
+            },
+          ],
+        },
+      },
+    },
+  ]);
+  assertEquals(activity.length, 1);
+  assertEquals(activity[0].details, [reasoning]);
+});
+
 Deno.test("activity display includes shell command and real output snippets", () => {
   const command = formatActivity({
     sequence: 1,
@@ -73,7 +368,7 @@ Deno.test("activity display includes shell command and real output snippets", ()
     message: "alpha called shell",
     detail: { command: "printf hello", cwd: "/shared" },
   });
-  assertEquals(command.details, ["command (/shared): $ printf hello"]);
+  assertEquals(command.details, ["$ printf hello", "cwd: /shared"]);
 
   const output = formatActivity({
     sequence: 2,
@@ -93,7 +388,11 @@ Deno.test("activity display includes shell command and real output snippets", ()
       },
     },
   });
-  assertEquals(output.details, ["output exit=0: hello", "  second line"]);
+  assertEquals(output.details, [
+    "result: exit=0",
+    "stdout: hello",
+    "  second line",
+  ]);
 });
 
 Deno.test("activity display includes shell timeout recovery guidance", () => {
@@ -118,9 +417,8 @@ Deno.test("activity display includes shell timeout recovery guidance", () => {
     },
   });
   assertEquals(output.details, [
-    "output exit=143 timed-out: (no output)",
-    "message: The command exceeded its 3-minute timeout and was stopped. A terminated package-manager",
-    " operation may have left an interrupted transaction.",
+    "result: exit=143 · timed out",
+    "message: The command exceeded its 3-minute timeout and was stopped. A terminated package-manager operation may have left an interrupted transaction.",
   ]);
 });
 
@@ -158,7 +456,11 @@ Deno.test("activity display summarizes structured filesystem work", () => {
     message: "alpha called edit_file",
     detail: { path: "/root/main.ts", oldText: "a", newText: "b" },
   });
-  assertEquals(start.details, ["path: /root/main.ts"]);
+  assertEquals(start.details, [
+    "path: /root/main.ts",
+    "oldText: a",
+    "newText: b",
+  ]);
   const end = formatActivity({
     sequence: 2,
     at: 1,
@@ -171,7 +473,46 @@ Deno.test("activity display summarizes structured filesystem work", () => {
       result: { path: "/root/main.ts", replacements: 1 },
     },
   });
-  assertEquals(end.details, ["result: replaced 1 occurrence(s)"]);
+  assertEquals(end.details, ["replacements: 1"]);
+});
+
+Deno.test("directory activity retains the requested path once and summarizes entries", () => {
+  const activity = projectActivity([
+    {
+      sequence: 1,
+      at: 0,
+      kind: "agent:tool:start",
+      agentId: "alpha",
+      toolName: "list_directory",
+      toolCallId: "tool-1",
+      message: "alpha called list_directory",
+      detail: { path: "/shared" },
+    },
+    {
+      sequence: 2,
+      at: 1,
+      kind: "agent:tool:end",
+      agentId: "alpha",
+      toolName: "list_directory",
+      toolCallId: "tool-1",
+      message: "alpha finished list_directory",
+      detail: {
+        status: "success",
+        result: {
+          path: "/shared",
+          entries: [{ name: "notes", type: "directory", sizeBytes: 4096 }],
+        },
+      },
+    },
+  ]);
+  assertEquals(activity[0].type, "tool");
+  const tool = activity[0];
+  if (tool.type !== "tool") throw new Error("Expected a tool display");
+  assertEquals(tool.details, [
+    "path: /shared",
+    "result: 1 entry",
+    "directory: notes (4096 bytes)",
+  ]);
 });
 
 Deno.test("activity display shows patch snippets and changed-file results", () => {
@@ -188,7 +529,8 @@ Deno.test("activity display shows patch snippets and changed-file results", () =
     },
   });
   assertEquals(start.details, [
-    "patch (/root/project): --- a/main.ts",
+    "cwd: /root/project",
+    "patch: --- a/main.ts",
     "  +++ b/main.ts",
     "  @@ -1 +1 @@",
   ]);
@@ -223,7 +565,7 @@ Deno.test("activity display survives malformed provider errors and missing field
       error: providerError,
     },
   });
-  assertEquals(displayed.headline, "Bob (coding-2) model request failed");
+  assertEquals(displayed.headline, "Bob (coding-2) — error");
   assertStringIncludes(displayed.details.join("\n"), "AI_APICallError");
   assertStringIncludes(displayed.details.join("\n"), "XML syntax error");
 
@@ -240,7 +582,7 @@ Deno.test("activity display survives malformed provider errors and missing field
     },
   });
   assertEquals(serialized.details, [
-    "model error: AI_APICallError: malformed tool-call response",
+    "error: AI_APICallError: malformed tool-call response",
   ]);
 
   const missingError = formatActivity({
@@ -250,7 +592,7 @@ Deno.test("activity display survives malformed provider errors and missing field
     message: "model request failed",
     detail: { kind: "error", callId: "model:18" },
   });
-  assertEquals(missingError.details, ["model error: Details unavailable."]);
+  assertEquals(missingError.details, ["error: Details unavailable."]);
 
   const missingPrompt = formatActivity({
     sequence: 6,
@@ -259,7 +601,7 @@ Deno.test("activity display survives malformed provider errors and missing field
     message: "requested a model turn",
     detail: {},
   });
-  assertEquals(missingPrompt.details, ["model input: (unavailable)"]);
+  assertEquals(missingPrompt.details, ["(unavailable)"]);
 });
 
 Deno.test(

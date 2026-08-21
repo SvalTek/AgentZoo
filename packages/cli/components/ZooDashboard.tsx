@@ -23,7 +23,7 @@ export function ZooDashboard({
   const { snapshot, runStartedAt } = useZooSnapshot(zoo);
   const terminal = useTerminalSize();
   useInput((input) => {
-    if (input === "q") void zoo.stop("dashboard quit");
+    if (input.toLowerCase() === "q") void zoo.stop("dashboard quit");
   });
 
   const activityHeight = Math.max(
@@ -48,9 +48,11 @@ export function ZooDashboard({
       <ActivityPanel
         events={snapshot.recentActivity}
         height={activityHeight}
-        detailWidth={Math.max(40, terminal.columns - 8)}
+        // Root padding (2), activity-panel border/padding (4), and the timeline rail (5)
+        // leave this exact width for normal text and tool cards.
+        detailWidth={Math.max(30, terminal.columns - 11)}
       />
-      <Text dimColor>q / Ctrl+C stop gracefully</Text>
+      <Text dimColor>↑↓ select and scroll · Home/End oldest/latest · Enter expand/collapse a tool · q / Ctrl+C stop gracefully</Text>
     </Box>
   );
 }

@@ -93,9 +93,9 @@ exchanges so the interrupted work can be diagnosed.
 
 ## An unnamed agent sees a type-shaped identity
 
-When no `name` is configured, `{agent}` resolves to the stable generated ID,
-such as `coding-1`. If that identity would steer the model, configure a neutral
-`name` or `names` value and use the documented conditional template.
+When no `name` is configured, `{agent}` resolves to the stable opaque ID, such
+as `446eb29a731d`. Configure `name` or `names` when the model needs a readable
+identity, and use the documented conditional template.
 
 ## Template directives appear literally
 

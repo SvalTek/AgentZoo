@@ -3,7 +3,7 @@ set -euo pipefail
 
 agent_root() {
   local id="$1"
-  [[ "$id" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "invalid agent id" >&2; exit 2; }
+  [[ "$id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "invalid agent id" >&2; exit 2; }
   printf '/var/lib/runtime/agents/%s' "$id"
 }
 

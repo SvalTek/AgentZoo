@@ -5,8 +5,7 @@
     "jsr:@cliffy/flags@1.2.1": "1.2.1",
     "jsr:@cliffy/internal@1.2.1": "1.2.1",
     "jsr:@cliffy/table@1.2.1": "1.2.1",
-    "jsr:@deno-ink/core@*": "0.2.1",
-    "jsr:@deno-ink/core@~0.2.1": "0.2.1",
+    "jsr:@deno-ink/core@0.2.1": "0.2.1",
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/fmt@^1.0.10": "1.0.10",
     "jsr:@std/fs@1": "1.0.24",
@@ -273,8 +272,8 @@
         "environment"
       ]
     },
-    "ansi-regex@6.2.2": {
-      "integrity": "sha512-Bq3SmSpyFHaWjPk8If9yc6svM8c56dB5BAtW4Qbw5jHTwwXXcTLoRMkpDJp6VL0XzlWaCHTXrkFURMYmD0sLqg=="
+    "ansi-regex@6.3.0": {
+      "integrity": "sha512-WpDfL7NO6j7tH88IDBNVdUJxDh9nmCteAVW9dsep846XdwF4naCBK+/tGLX3KJgcpgMRXCFlTM2hKGoK9FsdrQ=="
     },
     "ansi-styles@6.2.3": {
       "integrity": "sha512-4Dj6M28JB+oAH8kFkTLUo+a2jwOFkuqb3yucU0CANcRRUbxS0cP0nZYCGjcc3BNXwRIsUVmDGgzawme7zvJHvg=="
@@ -887,7 +886,6 @@
   "workspace": {
     "dependencies": [
       "jsr:@cliffy/command@^1.2.1",
-      "jsr:@deno-ink/core@~0.2.1",
       "jsr:@std/assert@1",
       "jsr:@std/fs@1",
       "jsr:@std/path@1",

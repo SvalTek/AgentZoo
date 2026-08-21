@@ -1,9 +1,9 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { resolve } from "@std/path";
 import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
-import { FilesystemFeature } from "../FilesystemFeature.ts";
-import { VisionFeature } from "../VisionFeature.ts";
-import { HttpFeature } from "../HttpFeature.ts";
+import { FilesystemFeature } from "../tools/FilesystemTools.ts";
+import { VisionFeature } from "../tools/ViewImageTool.ts";
+import { HttpFeature } from "../tools/HttpRequestTool.ts";
 import { unwrapObservedToolResult } from "../ToolSupport.ts";
 import type { AgentRunDeps } from "../Agent.ts";
 import type { RuntimeEnv } from "../types.ts";
@@ -543,38 +543,41 @@ Deno.test({
         "-c",
         "printf '\\211PNG\\r\\n\\032\\n' > /root/photo.png",
       ]);
-       const viewed = (await invokeVision(alpha, {
-         path: "/root/photo.png",
-       })).result as {
-         type: string;
-         mimeType: string;
-         data: Uint8Array;
-       };
-       assertEquals(viewed.type, "binary");
-       assertEquals(viewed.mimeType, "image/png");
-       assertEquals(viewed.data, new Uint8Array([
-         0x89,
-         0x50,
-         0x4e,
-         0x47,
-         0x0d,
-         0x0a,
-         0x1a,
-         0x0a,
-       ]));
+      const viewed = (await invokeVision(alpha, {
+        path: "/root/photo.png",
+      })).result as {
+        type: string;
+        mimeType: string;
+        data: Uint8Array;
+      };
+      assertEquals(viewed.type, "binary");
+      assertEquals(viewed.mimeType, "image/png");
+      assertEquals(
+        viewed.data,
+        new Uint8Array([
+          0x89,
+          0x50,
+          0x4e,
+          0x47,
+          0x0d,
+          0x0a,
+          0x1a,
+          0x0a,
+        ]),
+      );
 
-       await alpha.exec([
-         "/bin/bash",
-         "-c",
-         "printf 'not an image' > /root/not-image.bin",
-       ]);
-       await assertRejects(
-         () => invokeVision(alpha, { path: "/root/not-image.bin" }),
-         Error,
-         "The file is not a supported image.",
-       );
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'not an image' > /root/not-image.bin",
+      ]);
+      await assertRejects(
+        () => invokeVision(alpha, { path: "/root/not-image.bin" }),
+        Error,
+        "The file is not a supported image.",
+      );
 
-       await assertRejects(
+      await assertRejects(
         () => invokeVision(alpha, { path: "/root/missing.png" }),
         Error,
         "The image path does not exist.",
@@ -651,7 +654,7 @@ Deno.test({
         "/bin/bash",
         "-c",
         "printf persistent > /root/persistent-marker; " +
-          "printf '\\nexport AGENT_PERSISTED=yes\\n' >> /root/.bashrc",
+        "printf '\\nexport AGENT_PERSISTED=yes\\n' >> /root/.bashrc",
       ]);
       assertEquals(firstWrite.exitCode, 0, JSON.stringify(firstWrite));
 
@@ -679,7 +682,7 @@ Deno.test({
         "/bin/bash",
         "--login",
         "-c",
-        "cat /root/persistent-marker; test \"$AGENT_PERSISTED\" = yes",
+        'cat /root/persistent-marker; test "$AGENT_PERSISTED" = yes',
       ]);
       assertEquals(restored.exitCode, 0, JSON.stringify(restored));
       assert(restored.stdout.includes("persistent"));
@@ -703,7 +706,7 @@ Deno.test({
       const betaSurvived = await beta.exec([
         "/bin/bash",
         "-c",
-        "test \"$(cat /root/beta-marker)\" = beta",
+        'test "$(cat /root/beta-marker)" = beta',
       ]);
       assertEquals(betaSurvived.exitCode, 0, JSON.stringify(betaSurvived));
     } finally {

@@ -7,6 +7,7 @@ import type {
 } from "@vibesjs/sdk";
 import { tokenTrimHistoryProcessor } from "@vibesjs/sdk";
 import type { LanguageModel, ModelMessage } from "npm:ai@^6";
+import { TextTemplate } from "@agent-zoo/shared";
 import type {
   AgentActivationOptions,
   AgentActivationResult,
@@ -15,6 +16,7 @@ import type {
   RuntimeEnv,
 } from "./types.ts";
 import type { ModelRegistry } from "./ModelRegistry.ts";
+import { buildFeaturePrompt } from "./Feature.ts";
 import { ToolExecutionError, unwrapObservedToolResult } from "./ToolSupport.ts";
 
 /** The per-run environment AgentZoo exposes to Vibes tools. */
@@ -94,15 +96,23 @@ export const RuntimeEnvironmentContract = `## Environment
 You are operating in a Linux filesystem. The directory \`/shared\` is persistent
 shared storage. Other filesystem locations are private to this environment.`;
 
+const AgentZooSystemTemplate = new TextTemplate(`${RuntimeEnvironmentContract}
+
+{#IF hasFeatures}
+{featurePrompt}
+{#END}`);
+
 export async function buildAgentSystemPrompt(
-  systemPrompt: AgentConfig["systemPrompt"],
+  features: readonly string[] = [],
+  featureArgs: Record<string, unknown> = {},
 ): Promise<string> {
-  const configured = typeof systemPrompt === "function"
-    ? await systemPrompt()
-    : systemPrompt;
-  return configured
-    ? `${configured}\n\n${RuntimeEnvironmentContract}`
-    : RuntimeEnvironmentContract;
+  const args: Record<string, unknown> = {
+    hasFeatures: features.length > 0,
+  };
+  if (features.length) {
+    args.featurePrompt = () => buildFeaturePrompt(features, featureArgs);
+  }
+  return await AgentZooSystemTemplate.render(args);
 }
 
 /**
@@ -133,7 +143,7 @@ export class ZooAgent extends EventTarget {
     tools: readonly ToolDefinition<AgentRunDeps>[] = [],
   ) {
     super();
-    if (!/^[a-z][a-z0-9-]{0,62}$/.test(config.id)) {
+    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(config.id)) {
       throw new TypeError("Invalid agent id");
     }
     this.id = config.id;
@@ -180,7 +190,7 @@ export class ZooAgent extends EventTarget {
       }
       this.#initialSystemContext = options.initialSystemContext;
     }
-    if (!appendPrompt && options.initialSystemContext) {
+    if (!appendPrompt && !this.#history.length) {
       this.#systemPromptInHistory = true;
     }
     this.#resolvedSystemPrompt = this.currentSystemPrompt();
@@ -261,7 +271,7 @@ export class ZooAgent extends EventTarget {
         : "symlink";
       return `${type} ${match[2]}`;
     });
-    return `User: ${user}\n\nYou are in ${actualCwd}.\nIts current contents are:\n\n${
+    return `You are logged into the shell as ${user}.\n\nYour current working directory is ${actualCwd}.\nIts visible contents are:\n\n${
       visibleEntries.length ? visibleEntries.join("\n") : "(empty)"
     }`;
   }
@@ -298,7 +308,15 @@ export class ZooAgent extends EventTarget {
     if (!this.#vibes) {
       const { Agent } = await import("@vibesjs/sdk");
       this.#baseSystemPrompt = await buildAgentSystemPrompt(
-        this.config.systemPrompt,
+        this.config.features,
+        {
+          agent: this.id,
+          name: this.config.name,
+          id: this.id,
+          type: this.config.type,
+          model: this.config.model,
+          shellEnvironment: this.#initialSystemContext ?? "",
+        },
       );
       this.#resolvedSystemPrompt = this.currentSystemPrompt();
       const inputBudget = modelInputTokenBudget(this.config.context);
@@ -319,6 +337,7 @@ export class ZooAgent extends EventTarget {
           (event) => this.observeModelBoundary(event),
         ),
         systemPrompt: () => this.currentSystemPrompt(),
+        instructions: this.config.systemPrompt,
         tools: this.#tools.map((definition) => this.observeTool(definition)),
         maxConcurrency: 1,
         maxTurns: this.config.maxTurns ?? 100,
@@ -342,10 +361,7 @@ export class ZooAgent extends EventTarget {
   }
 
   private currentSystemPrompt(): string {
-    return [
-      this.#baseSystemPrompt,
-      this.#initialSystemContext,
-    ].filter((part): part is string => Boolean(part)).join("\n\n");
+    return this.#baseSystemPrompt ?? RuntimeEnvironmentContract;
   }
 
   private observeTool(

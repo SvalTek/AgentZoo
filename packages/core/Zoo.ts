@@ -362,9 +362,11 @@ export class AgentZoo extends EventTarget {
     const label = actorLabel(record.actor);
     try {
       if (record.initialPending) {
-        initialSystemContext = await record.actor.observeEnvironment(
-          record.actor.config.cwd,
-        );
+        if (record.actor.config.features?.includes("shell")) {
+          initialSystemContext = await record.actor.observeEnvironment(
+            record.actor.config.cwd,
+          );
+        }
         prompt = record.initialPrompt ?? "";
         role = "user";
         appendPrompt = record.initialPrompt !== undefined;

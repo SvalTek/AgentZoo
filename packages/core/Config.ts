@@ -24,6 +24,8 @@ import { TextTemplate } from "@agent-zoo/shared";
 
 const NonEmptyString = z.string().min(1);
 const Identifier = z.string().regex(/^[a-z][a-z0-9-]*$/);
+/** Provider-facing tool names allow underscores (e.g. apply_patch, some_tool). */
+const ToolName = z.string().regex(/^[a-z][a-z0-9_]*$/);
 const ReasoningEffort = z.enum(["auto", "low", "medium", "high", "max"]);
 const ReasoningConfigShape = {
   reasoning: z.boolean().optional(),
@@ -134,12 +136,40 @@ const CompletionConfigSchema = z.object({
   enabled: z.boolean().default(true),
 });
 
+/**
+ * A single parameter definition for a user-configured shell-backed tool.
+ *
+ * `type` is required because it determines the generated Zod schema.
+ * `required` defaults to true; `array` defaults to false.
+ */
+const ShellToolParamConfigSchema = z.object({
+  type: z.enum(["string", "number", "boolean"]),
+  required: z.boolean().default(true),
+  array: z.boolean().default(false),
+  description: NonEmptyString,
+});
+
+export type ShellToolParamConfig = z.infer<typeof ShellToolParamConfigSchema>;
+
+/**
+ * A user-configured shell-backed tool. The `command` is rendered through
+ * TextTemplate with the validated model parameters before execution.
+ */
+const ShellToolConfigSchema = z.object({
+  command: NonEmptyString,
+  description: NonEmptyString,
+  params: z.record(ToolName, ShellToolParamConfigSchema).default({}),
+});
+
+export type ShellToolConfig = z.infer<typeof ShellToolConfigSchema>;
+
 /** Runtime Zod schema for the user-facing AgentZoo YAML configuration. */
 export const ZooConfigSchema = z.object({
   taskPrompt: NonEmptyString.optional(),
   models: z.record(NonEmptyString, ModelConfigSchema).default({}),
   services: z.array(Identifier).default([]),
   templates: z.record(NonEmptyString, z.string()).default({}),
+  tools: z.record(ToolName, ShellToolConfigSchema).default({}),
   runtime: RuntimeConfigSchema.default({
     backend: "docker",
     sharedWorkspace: ".shared",

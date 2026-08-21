@@ -32,8 +32,8 @@ function AgentRow({ agent }: { agent: ZooAgentSnapshot }) {
       <Box width={13}>
         <Text>{agent.state}</Text>
       </Box>
-      <Box width={18}>
-        <Text dimColor>{agent.type ?? "agent"} · {agent.model}</Text>
+      <Box width={28} flexShrink={1}>
+        <Text dimColor wrap="truncate">{agent.type ?? "agent"} · {agent.model}</Text>
       </Box>
       <Box flexGrow={1}>
         <Text wrap="truncate">{agent.currentActivity}</Text>

@@ -2,7 +2,7 @@
 
 import type { ToolDefinition } from "@vibesjs/sdk";
 import { z } from "zod";
-import type { AgentRunDeps } from "./Agent.ts";
+import type { AgentRunDeps } from "../Agent.ts";
 
 const NoParameters = z.object({});
 const CompletionParameters = z.object({

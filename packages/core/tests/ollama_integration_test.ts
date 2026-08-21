@@ -3,7 +3,7 @@ import { ZooAgent } from "../Agent.ts";
 import { ModelRegistry } from "../ModelRegistry.ts";
 import { createLanguageModel } from "../Providers.ts";
 import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
-import { ShellFeature } from "../ShellFeature.ts";
+import { ShellFeature } from "../tools/ShellTool.ts";
 
 let ollamaIntegrationEnabled = false;
 try {

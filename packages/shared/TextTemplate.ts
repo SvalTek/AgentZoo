@@ -1,6 +1,7 @@
+// deno-lint-ignore-file no-explicit-any no-this-alias
+
 // This callable Function/Proxy compatibility surface necessarily crosses
 // dynamic boundaries; its public API remains typed below.
-// deno-lint-ignore-file no-explicit-any no-this-alias
 
 /**
  * Copyright (C) 2026 Theros <https://github.com/therosin>
@@ -19,8 +20,7 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with AgentZoo.  If not, see <https://www.gnu.org/licenses/>.
- */
-
+*/
 interface TemplateArgs {
   [key: string]: any;
 }
@@ -274,12 +274,28 @@ function visibleValues(scope: Scope): Map<string, unknown> {
 }
 
 function replaceValues(text: string, scope: Scope): string {
-  let out = text;
-  for (const [key, value] of visibleValues(scope)) {
-    const pattern = new RegExp(`\\{${escapeRegExp(key)}\\}`, "g");
-    out = out.replace(pattern, () => String(value));
-  }
-  return out;
+  const values = visibleValues(scope);
+  if (values.size === 0) return text;
+
+  // Match every currently visible placeholder in one pass. Replacement values
+  // are then expanded recursively, making nested placeholder resolution
+  // independent of context insertion order while keeping inserted directives
+  // inert: only placeholders are processed here, never template syntax.
+  const pattern = new RegExp(
+    `\\{(${[...values.keys()].map(escapeRegExp).join("|")})\\}`,
+    "g",
+  );
+
+  const expand = (value: string, resolving: Set<string>): string =>
+    value.replace(pattern, (match, key: string) => {
+      if (resolving.has(key)) return match;
+
+      const next = new Set(resolving);
+      next.add(key);
+      return expand(String(values.get(key)), next);
+    });
+
+  return expand(text, new Set());
 }
 
 async function renderNodes(
@@ -366,7 +382,7 @@ async function renderNodes(
 }
 
 export interface TextTemplate {
-  (args?: TemplateArgs, ...positional: any[]): string;
+  (args?: TemplateArgs, ...positional: any[]): Promise<string>;
 
   template: string;
   render(args?: TemplateArgs, positional?: any[]): Promise<string>;
@@ -383,10 +399,8 @@ export class TextTemplate extends Function {
 
   constructor(template: string) {
     super();
-    const normalized = template.startsWith("\n") ? template.slice(1) : template;
-    this.template = normalized.endsWith("\n")
-      ? normalized.slice(0, -1)
-      : normalized;
+    const normalized = template.replace(/^\r?\n/, "");
+    this.template = normalized.replace(/\r?\n$/, "");
 
     const self = this;
 
@@ -401,6 +415,9 @@ export class TextTemplate extends Function {
       get(_t, prop) {
         const member = (self as any)[prop];
         return typeof member === "function" ? member.bind(self) : member;
+      },
+      set(_t, prop, value) {
+        return Reflect.set(self as any, prop, value);
       },
       apply(target, _thisArg, argArray) {
         return target(...argArray);
@@ -604,8 +621,11 @@ export class TextTemplate extends Function {
 // Temporary bindings take precedence while their block is active. Context
 // values take precedence over template locals.
 //
-// Blocks may be nested. Inserted values are not reparsed as template source:
-// a value containing "{#IF ...}" is emitted as text.
+// Blocks may be nested. Replacement values may themselves contain placeholders;
+// those placeholders are resolved recursively against the visible scope,
+// independent of caller property order. Cyclic placeholder references remain
+// literal. Inserted values are not reparsed as template source: a value
+// containing "{#IF ...}" is emitted as text.
 //
 // Deliberate language limits:
 //

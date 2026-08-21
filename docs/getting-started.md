@@ -144,9 +144,11 @@ when it exists, otherwise `agent-zoo.example.yaml`. Relative
 
 ## What a first activation contains
 
-AgentZoo always observes the agent's real starting directory and appends that
-observation to the single leading system message. Entries are labelled with
-readable types such as `file`, `directory`, and `symlink`.
+AgentZoo's leading system content contains its environment contract and guidance
+from enabled features. When `shell` is enabled, Shell guidance also identifies
+the agent's own login user, starting directory, and bounded listing with
+readable entry types such as `file`, `directory`, and `symlink`. With `shell`
+disabled, AgentZoo does not make that observation.
 
 If configured, the first user message contains:
 

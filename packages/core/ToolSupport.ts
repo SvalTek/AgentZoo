@@ -46,11 +46,14 @@ export class ToolExecutionError extends Error {
   }
 }
 
+/** Ordered model-facing feedback. The first line is the outcome; later lines
+ * explain the state and give recovery steps. */
+export type ToolFeedback = readonly [summary: string, ...hints: string[]];
+
 /** Create a model-facing failure that states both the problem and a safe repair. */
 export function actionableToolError(
-  problem: string,
-  repair: string,
+  feedback: ToolFeedback,
   telemetry?: unknown,
 ): ToolExecutionError {
-  return new ToolExecutionError(`${problem} ${repair}`, telemetry);
+  return new ToolExecutionError(feedback.filter(Boolean).join("\n"), telemetry);
 }

@@ -15,12 +15,15 @@ import { ModelRegistry } from "./ModelRegistry.ts";
 import { createLanguageModel } from "./Providers.ts";
 import { DockerRuntimeManager } from "./Runtime.ts";
 import { SharedWorkspace } from "./Workspace.ts";
-import { ShellFeature } from "./ShellFeature.ts";
-import { FilesystemFeature } from "./FilesystemFeature.ts";
-import { VisionFeature } from "./VisionFeature.ts";
-import { HttpFeature } from "./HttpFeature.ts";
+import { ShellFeature } from "./tools/ShellTool.ts";
+import { FilesystemFeature } from "./tools/FilesystemTools.ts";
+import { VisionFeature } from "./tools/ViewImageTool.ts";
+import { HttpFeature } from "./tools/HttpRequestTool.ts";
 import { FeatureRegistry } from "./Feature.ts";
-import { createCompletionTool, createYieldTool } from "./LifecycleTools.ts";
+import {
+  createCompletionTool,
+  createYieldTool,
+} from "./tools/LifecycleTools.ts";
 import type { RuntimeEnv, RuntimeManager } from "./types.ts";
 import type { ModelRuntimeConfig } from "./types.ts";
 
@@ -79,6 +82,7 @@ export async function buildAgentZoo(
     destroy?: () => Promise<void>;
   };
   let zoo: AgentZoo | undefined;
+  let featureRegistry: FeatureRegistry<AgentRunDeps> | undefined;
 
   const stopRuntime = async () => {
     if (lifecycle.stop) await lifecycle.stop();
@@ -91,15 +95,19 @@ export async function buildAgentZoo(
     if (Context.tryGet("templates") === templates) Context.delete("templates");
     if (Context.tryGet("runtime") === runtime) Context.delete("runtime");
     if (Context.tryGet("workspace") === workspace) Context.delete("workspace");
+    if (featureRegistry && Context.tryGet("features") === featureRegistry) {
+      Context.delete("features");
+    }
   };
 
   try {
-    const population = expandPopulation(config);
-    const featureRegistry = new FeatureRegistry<AgentRunDeps>();
-    featureRegistry.register(new ShellFeature());
+    const population = await expandPopulation(config);
+    featureRegistry = new FeatureRegistry<AgentRunDeps>();
+    featureRegistry.register(new ShellFeature(config.tools));
     featureRegistry.register(new FilesystemFeature());
     featureRegistry.register(new VisionFeature());
     featureRegistry.register(new HttpFeature());
+    Context.set("features", featureRegistry);
     const initialPrompts: Record<string, string | undefined> = {};
     const builtAgents: ZooAgent[] = [];
     for (const member of population) {
@@ -125,16 +133,21 @@ export async function buildAgentZoo(
         );
       }
       const systemPrompt = member.system
-        ? await templates.get(member.system)({
-          agent: member.id,
-          name: member.name,
-          id: member.id,
-          type: member.type,
-          model: member.model,
-        })
+        ? () =>
+          templates.get(member.system!)({
+            agent: member.id,
+            name: member.name,
+            id: member.id,
+            type: member.type,
+            model: member.model,
+          })
         : member.systemPrompt;
-      const tools: ToolDefinition<AgentRunDeps>[] = [];
-      for (const feature of member.features) {
+      const featureTools: Array<{
+        id: string;
+        index: number;
+        tools: readonly ToolDefinition<AgentRunDeps>[];
+      }> = [];
+      for (const [index, feature] of member.features.entries()) {
         let registered;
         try {
           registered = featureRegistry.get(feature);
@@ -143,9 +156,16 @@ export async function buildAgentZoo(
             `Agent "${member.id}" references unknown feature "${feature}"`,
           );
         }
-        tools.push(...await registered.createTools?.() ?? []);
+        featureTools.push({
+          id: feature,
+          index,
+          tools: await registered.createTools?.() ?? [],
+        });
       }
+      const tools = featureTools.flatMap((group) => group.tools);
+      assertUniqueToolNames(member.id, tools);
       const orderedTools = orderAgentTools(tools);
+      const orderedFeatures = orderFeatureGroups(featureTools, orderedTools);
       orderedTools.push(createYieldTool());
       if (config.completion.enabled) orderedTools.push(createCompletionTool());
 
@@ -161,7 +181,7 @@ export async function buildAgentZoo(
             model: member.model,
             captioningModel: member.captioningModel,
             systemPrompt,
-            features: member.features,
+            features: orderedFeatures,
             cwd: member.cwd,
             maxTurns: member.maxTurns,
             context: modelRuntime.context,
@@ -199,7 +219,9 @@ export async function buildAgentZoo(
     }
     for (const name of config.services) {
       if (!options.services?.[name]) {
-        throw new Error(`Configured service "${name}" has no registered factory`);
+        throw new Error(
+          `Configured service "${name}" has no registered factory`,
+        );
       }
     }
     for (const agent of builtAgents) zoo.registerAgent(agent);
@@ -226,13 +248,30 @@ export async function buildAgentZoo(
   }
 }
 
+function assertUniqueToolNames(
+  agentId: string,
+  tools: readonly ToolDefinition<AgentRunDeps>[],
+): void {
+  const seen = new Map<string, string>();
+  for (const tool of tools) {
+    const existing = seen.get(tool.name);
+    if (existing) {
+      throw new Error(
+        `Agent "${agentId}" has duplicate tool name "${tool.name}"`,
+      );
+    }
+    seen.set(tool.name, tool.name);
+  }
+}
+
 async function configureGitIdentity(
   env: RuntimeEnv,
   member: Pick<PopulationMember, "id" | "name">,
 ): Promise<void> {
+  const name = member.name ?? member.id;
   const identity = [
-    ["user.name", member.name ?? member.id],
-    ["user.email", `${member.id}@agentzoo.local`],
+    ["user.name", name],
+    ["user.email", `${gitEmailLocalPart(name)}@${member.id}.local`],
   ] as const;
 
   for (const [key, value] of identity) {
@@ -272,6 +311,29 @@ function orderAgentTools<TDeps>(
   }).map(({ tool }) => tool);
 }
 
+function orderFeatureGroups<TDeps>(
+  groups: readonly {
+    id: string;
+    index: number;
+    tools: readonly ToolDefinition<TDeps>[];
+  }[],
+  orderedTools: readonly ToolDefinition<TDeps>[],
+): string[] {
+  const toolPositions = new Map<ToolDefinition<TDeps>, number>();
+  orderedTools.forEach((tool, index) => toolPositions.set(tool, index));
+  return [...groups].sort((left, right) => {
+    const leftPosition = Math.min(
+      ...left.tools.map((tool) => toolPositions.get(tool) ?? Infinity),
+      Infinity,
+    );
+    const rightPosition = Math.min(
+      ...right.tools.map((tool) => toolPositions.get(tool) ?? Infinity),
+      Infinity,
+    );
+    return leftPosition - rightPosition || left.index - right.index;
+  }).map((group) => group.id);
+}
+
 /** Compose agent-specific guidance and the run-wide objective as one user message. */
 export function composeInitialPrompt(
   instructions?: string,
@@ -300,7 +362,9 @@ interface PopulationMember {
   sampling?: ModelRuntimeConfig["sampling"];
 }
 
-function expandPopulation(config: ZooConfig): PopulationMember[] {
+async function expandPopulation(
+  config: ZooConfig,
+): Promise<PopulationMember[]> {
   const members: PopulationMember[] = [];
   const ids = new Set<string>();
   const typeCounts = new Map<string, number>();
@@ -308,7 +372,8 @@ function expandPopulation(config: ZooConfig): PopulationMember[] {
     const previousCount = typeCounts.get(group.type) ?? 0;
     for (let offset = 1; offset <= group.count; offset++) {
       const index = previousCount + offset;
-      const id = `${group.type}-${index}`;
+      const semanticId = `${group.type}-${index}`;
+      const id = await opaqueAgentId(semanticId);
       if (ids.has(id)) throw new Error(`Duplicate configured agent id "${id}"`);
       ids.add(id);
       members.push({
@@ -330,6 +395,23 @@ function expandPopulation(config: ZooConfig): PopulationMember[] {
     typeCounts.set(group.type, previousCount + group.count);
   }
   return members;
+}
+
+/** Derive the stable, opaque identity used outside population expansion. */
+async function opaqueAgentId(semanticId: string): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(semanticId)),
+  );
+  return Array.from(
+    digest.slice(0, 6),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function gitEmailLocalPart(name: string): string {
+  const localPart = name.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return localPart || "user";
 }
 
 /** Merge named-model defaults with field-level overrides from an agent entry. */

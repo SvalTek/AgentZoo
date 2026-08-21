@@ -20,21 +20,21 @@
 import type { BinaryContent, ToolDefinition } from "@vibesjs/sdk";
 import { z } from "zod";
 import Context from "@agent-zoo/context";
-import type { AgentRunDeps } from "./Agent.ts";
-import type { Feature } from "./Feature.ts";
-import type { CommandResult } from "./types.ts";
-import type { ModelRegistry } from "./ModelRegistry.ts";
+import type { AgentRunDeps } from "../Agent.ts";
+import type { Feature } from "../Feature.ts";
+import type { CommandResult } from "../types.ts";
+import type { ModelRegistry } from "../ModelRegistry.ts";
 import {
   actionableToolError,
   observedToolResult,
   ToolExecutionError,
-} from "./ToolSupport.ts";
+} from "../ToolSupport.ts";
 
 const ReadImageParameters = z.object({
-  path: z.string().min(1).optional().describe(
+  path: z.string().optional().describe(
     "The image file to view, as an absolute path or a path relative to the current working directory. Required for execution. Reads the complete image and returns it to you so you can see its contents.",
   ),
-  cwd: z.string().min(1).optional().describe(
+  cwd: z.string().optional().describe(
     "The directory from which the image path is resolved, as an absolute path or a path relative to the current working directory. Defaults to the current working directory.",
   ),
 });
@@ -92,7 +92,8 @@ function detectImageMime(bytes: Uint8Array): string | undefined {
     return "image/bmp";
   }
   if (
-    len >= 4 && u32(0) === 0x0000000c && bytes[4] === 0x6a && bytes[5] === 0x50 &&
+    len >= 4 && u32(0) === 0x0000000c && bytes[4] === 0x6a &&
+    bytes[5] === 0x50 &&
     bytes[6] === 0x20 && bytes[7] === 0x20
   ) {
     return "image/jp2";
@@ -132,14 +133,25 @@ export class VisionFeature implements Feature<AgentRunDeps> {
         ], cwd);
 
         const encoded = raw.stdout.trim();
-        const binary = encoded.length > 0
-          ? Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))
-          : new Uint8Array(0);
+        let binary: Uint8Array;
+        try {
+          binary = encoded.length > 0
+            ? Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))
+            : new Uint8Array(0);
+        } catch {
+          throw actionableToolError([
+            "The image data could not be decoded.",
+            "No image was shown.",
+            "Retry once; if it persists, choose another image or inspect the file with shell.",
+          ], { command: raw, path });
+        }
         const mimeType = detectImageMime(binary);
         if (!mimeType) {
           throw actionableToolError(
-            "The file is not a supported image.",
-            "Choose a PNG, JPEG, GIF, or WebP image.",
+            [
+              "The file is not a supported image.",
+              "Choose a PNG, JPEG, GIF, WebP, BMP, or JPEG 2000 image.",
+            ],
             { command: raw, path },
           );
         }
@@ -187,9 +199,18 @@ function validateViewImageArguments(
 ): void {
   if (!input.path?.trim()) {
     throw actionableToolError(
-      "No image path was provided.",
-      "Provide the image file to view in path.",
+      [
+        "No image path was provided.",
+        "Provide the image file to view in path.",
+      ],
     );
+  }
+  if (input.cwd !== undefined && !input.cwd.trim()) {
+    throw actionableToolError([
+      "cwd is empty.",
+      "No image was read.",
+      "Provide a directory path in cwd, or omit cwd to use the current working directory.",
+    ]);
   }
 }
 
@@ -213,32 +234,42 @@ async function execute(
       return raw;
     case 40:
       throw actionableToolError(
-        "The image path does not exist.",
-        "Check the path or list its parent directory to find the correct name.",
+        [
+          "The image path does not exist.",
+          "Check the path or list its parent directory to find the correct name.",
+        ],
         { command: raw },
       );
     case 41:
       throw actionableToolError(
-        "The image path is not a regular file.",
-        "Choose a file path; use list_directory when the path is a directory.",
+        [
+          "The image path is not a regular file.",
+          "Choose a file path; use list_directory when the path is a directory.",
+        ],
         { command: raw },
       );
     case 49:
       throw actionableToolError(
-        "The image file could not be read.",
-        "Check the file permissions and retry.",
+        [
+          "The image file could not be read.",
+          "Check the file permissions and retry.",
+        ],
         { command: raw },
       );
     case 50:
       throw actionableToolError(
-        "The image file size could not be determined.",
-        "Check the file and retry.",
+        [
+          "The image file size could not be determined.",
+          "Check the file and retry.",
+        ],
         { command: raw },
       );
     case 52:
       throw actionableToolError(
-        `The image exceeds the ${MAX_IMAGE_BYTES} byte limit.`,
-        "Choose a smaller image, or downscale or crop it before viewing.",
+        [
+          `The image exceeds the ${MAX_IMAGE_BYTES} byte limit.`,
+          "Choose a smaller image, or downscale or crop it before viewing.",
+        ],
         { command: raw },
       );
     default:
@@ -266,7 +297,7 @@ async function describeImageViaModel(
   }
 
   try {
-    const { createLanguageModel } = await import("./Providers.ts");
+    const { createLanguageModel } = await import("../Providers.ts");
     const { generateText } = await import("npm:ai@^6");
 
     const model = await createLanguageModel(modelName, models);

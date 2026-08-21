@@ -55,7 +55,7 @@ and clears the terminal immediately. It shows:
 The dashboard header does not show the log filename; it is printed in `--no-ui`
 line-oriented mode.
 
-Configured names are displayed as `Alice (research-1)`. Stable IDs remain the
+Configured names are displayed as `Alice (c4842989967d)`. Stable IDs remain the
 unambiguous identity even when several agents deliberately share one name.
 
 Press `q` or Ctrl+C to request a graceful shutdown. The alternate terminal
@@ -104,7 +104,7 @@ Agent identity stays structured:
 
 ```json
 {
-  "agentId": "research-1",
+  "agentId": "c4842989967d",
   "agentName": "Alice",
   "modelKey": "local-qwen",
   "modelName": "qwen3.5:9b",
@@ -112,7 +112,7 @@ Agent identity stays structured:
 }
 ```
 
-Human-readable headlines may use `Alice (research-1)`, but the JSON identity
+Human-readable headlines may use `Alice (c4842989967d)`, but the JSON identity
 fields are never collapsed into that display string.
 
 Every entered tool execution emits a correlated `agent:tool:start` and

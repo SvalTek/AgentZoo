@@ -36,13 +36,14 @@ remove them with `deno task dev docker list` and `deno task dev docker purge
 [getting-started](docs/getting-started.md).
 
 Each `agents` entry is a population group. `count` defaults to one and creates
-stable IDs such as `coding-1`. An optional `name` supplies a model-facing and
+stable opaque IDs such as `446eb29a731d`. An optional `name` supplies a model-facing and
 display name for every member expanded from that population entry without
 changing their stable IDs. Alternatively, `names` supplies one name per member
 and determines the population size; it cannot be combined with `name` or
 `count`, and duplicate names are valid. Numbering continues across repeated
-entries of the same `type`. System templates receive the configured name as
-`{name}` when present and the stable ID as `{agent}`, so a neutral fallback can
+entries of the same `type`; the semantic type/index is hashed before becoming
+the canonical ID. System templates receive the configured name as `{name}`
+when present and the stable ID as `{agent}`, so a neutral fallback can
 be written as:
 
 ```text
@@ -54,9 +55,12 @@ be written as:
 ```
 
 `system` names a configured `TextTemplate`; `systemPrompt` supplies inline text
-instead. `prompt` is optional. Without it, AgentZoo starts that agent with a
-real listing of its private working directory. The listing is always appended to
-the single leading system message. Agent `prompt` text is labelled
+instead. Both are Vibes instructions: they are supplied on every model turn but
+are not retained in conversation history. AgentZoo's own environment contract
+and enabled feature guidance form the system prompt. When `shell` is enabled,
+AgentZoo also adds that agent's login user, working directory, and bounded
+listing to the Shell guidance; without `shell`, it does not observe or disclose
+that shell context. Agent `prompt` text is labelled
 `INSTRUCTIONS:` and the run-wide `taskPrompt` is labelled `OBJECTIVE:`; when
 present, they form one user message in that order. With neither, startup is
 system-only. Later wake stimuli use
@@ -66,7 +70,8 @@ how many model/tool iterations one activation may perform before Vibes raises
 `MaxTurnsError`; it defaults to 100 and may be set separately for each
 configured population group.
 
-`features` controls which structured convenience tools appear to the model. It
+`features` controls which structured convenience tools and their system guidance
+appear to the model. It
 does not remove capabilities already available through `shell`. The default
 features are `shell` and `filesystem`; `filesystem` provides bounded file
 reading, writing, exact text edits, directory listing, and bounded search. Add
