@@ -422,6 +422,83 @@ Deno.test("activity display includes shell timeout recovery guidance", () => {
   ]);
 });
 
+Deno.test("terminal activity cards retain typed input and render the screen without duplicate metadata", () => {
+  const activity = projectActivity([
+    {
+      sequence: 1,
+      at: 0,
+      kind: "agent:tool:start",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-1",
+      toolName: "terminal_send",
+      message: "Alice called terminal_send",
+      detail: { name: "universe", text: "garden", enter: true },
+    },
+    {
+      sequence: 2,
+      at: 1,
+      kind: "agent:tool:end",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-1",
+      toolName: "terminal_send",
+      message: "Alice finished terminal_send",
+      detail: {
+        status: "success",
+        result: { name: "universe", status: "sent" },
+      },
+    },
+    {
+      sequence: 3,
+      at: 2,
+      kind: "agent:tool:start",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-2",
+      toolName: "terminal_read",
+      message: "Alice called terminal_read",
+      detail: { name: "universe" },
+    },
+    {
+      sequence: 4,
+      at: 3,
+      kind: "agent:tool:end",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-2",
+      toolName: "terminal_read",
+      message: "Alice finished terminal_read",
+      detail: {
+        status: "success",
+        result: {
+          name: "universe",
+          found: true,
+          output: "Welcome to the garden\n> ",
+        },
+      },
+    },
+  ]);
+  assertEquals(activity.length, 2);
+  assertEquals(activity[0].type, "tool");
+  assertEquals(activity[1].type, "tool");
+  if (activity[0].type !== "tool" || activity[1].type !== "tool") {
+    throw new Error("Expected terminal tool cards");
+  }
+  assertEquals(activity[0].details, [
+    "terminal: universe",
+    "sent: garden",
+    "enter: true",
+    "result: sent",
+  ]);
+  assertEquals(activity[1].details, [
+    "terminal: universe",
+    "range: all retained scrollback",
+    "screen: Welcome to the garden",
+    "  >",
+  ]);
+});
+
 Deno.test("activity display makes optional MCP loss conspicuous", () => {
   const display = formatActivity({
     sequence: 1,

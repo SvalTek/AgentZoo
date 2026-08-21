@@ -228,7 +228,8 @@ function toolEndDisplay(
     envelope?.status === "error";
   const failed = explicitFailure ||
     (toolName === "shell" && typeof result?.exitCode === "number" &&
-      result.exitCode !== 0);
+      result.exitCode !== 0) ||
+    result?.status === "error";
   const resultLines = explicitFailure
     ? labelledLines("error", formatError(envelope?.error ?? event.detail))
     : toolResultLines(toolName, result ?? envelope?.result ?? event.detail);
@@ -285,6 +286,40 @@ function toolInputLines(toolName: string, value: unknown): string[] {
       ),
       ...recordLines(input, ["method", "url"]),
     ];
+  }
+  if (toolName === "terminal_create") {
+    const command = typeof input.command === "string"
+      ? [input.command, ...(Array.isArray(input.args) ? input.args : [])]
+        .join(" ")
+      : "interactive Bash shell";
+    return [
+      ...labelledLines("terminal", input.name),
+      ...labelledLines("start", command),
+      ...labelledLines("cwd", input.cwd),
+      ...labelledLines("history", input.historyLimit),
+    ];
+  }
+  if (toolName === "terminal_read") {
+    const range = input.start === undefined && input.end === undefined
+      ? "all retained scrollback"
+      : `${String(input.start ?? "-")}…${String(input.end ?? "screen")}`;
+    return [...labelledLines("terminal", input.name), `range: ${range}`];
+  }
+  if (toolName === "terminal_send") {
+    return [
+      ...labelledLines("terminal", input.name),
+      ...labelledLines("sent", input.text),
+      `enter: ${input.enter === false ? "false" : "true"}`,
+    ];
+  }
+  if (toolName === "terminal_keys") {
+    return [
+      ...labelledLines("terminal", input.name),
+      `keys: ${Array.isArray(input.keys) ? input.keys.join(", ") : "(none)"}`,
+    ];
+  }
+  if (toolName === "terminal_clear" || toolName === "terminal_kill") {
+    return [...labelledLines("terminal", input.name)];
   }
   return recordLines(input);
 }
@@ -357,6 +392,41 @@ function toolResultLines(toolName: string, value: unknown): string[] {
           : "";
         return [`${type}: ${name}${size}`];
       }),
+    ];
+  }
+  if (toolName === "terminal_create") {
+    return [
+      `result: ${String(result.status ?? "created")}`,
+      ...labelledLines("cwd", result.cwd),
+      ...labelledLines(
+        "program",
+        Array.isArray(result.command) ? result.command.join(" ") : undefined,
+      ),
+      ...labelledLines("history", result.historyLimit),
+      ...labelledLines("error", result.error),
+    ];
+  }
+  if (toolName === "terminal_list") {
+    const terminals = Array.isArray(result.terminals) ? result.terminals : [];
+    return terminals.length
+      ? terminals.map((name) => `terminal: ${String(name)}`)
+      : ["terminals: (none)"];
+  }
+  if (toolName === "terminal_read") {
+    return [
+      ...labelledLines("screen", result.output),
+      ...(result.truncated ? ["screen: truncated"] : []),
+      ...labelledLines("result", result.status),
+      ...labelledLines("error", result.error),
+    ];
+  }
+  if (
+    toolName === "terminal_send" || toolName === "terminal_keys" ||
+    toolName === "terminal_clear" || toolName === "terminal_kill"
+  ) {
+    return [
+      ...labelledLines("result", result.status),
+      ...labelledLines("error", result.error),
     ];
   }
   return recordLines(result, ["path"]);
