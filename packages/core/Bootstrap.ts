@@ -19,6 +19,7 @@ import { ShellFeature } from "./tools/ShellTool.ts";
 import { FilesystemFeature } from "./tools/FilesystemTools.ts";
 import { VisionFeature } from "./tools/ViewImageTool.ts";
 import { HttpFeature } from "./tools/HttpRequestTool.ts";
+import { TerminalFeature } from "./tools/TerminalTool.ts";
 import { FeatureRegistry } from "./Feature.ts";
 import {
   createCompletionTool,
@@ -110,6 +111,7 @@ export async function buildAgentZoo(
     featureRegistry.register(new FilesystemFeature());
     featureRegistry.register(new VisionFeature());
     featureRegistry.register(new HttpFeature());
+    featureRegistry.register(new TerminalFeature());
     Context.set("features", featureRegistry);
     const initialPrompts: Record<string, string | undefined> = {};
     const builtAgents: ZooAgent[] = [];
@@ -289,6 +291,13 @@ async function configureGitIdentity(
 
 const BuiltinToolOrder = [
   "shell",
+  "terminal_create",
+  "terminal_list",
+  "terminal_read",
+  "terminal_send",
+  "terminal_keys",
+  "terminal_clear",
+  "terminal_kill",
   "apply_patch",
   "write_file",
   "edit_file",

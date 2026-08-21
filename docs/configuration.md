@@ -333,13 +333,18 @@ List of structured convenience interfaces shown to the model. Defaults to:
 features: [shell, filesystem]
 ```
 
-Supported built-in values are `shell`, `filesystem`, `http`, and `vision`.
-`vision` is opt-in and is not part of the default set. The lifecycle tool
-`yield` is always added. `complete` is added only when completion is enabled.
+Supported built-in values are `shell`, `filesystem`, `http`, `vision`, and
+`terminal`. `vision` is opt-in and is not part of the default set. The lifecycle
+tool `yield` is always added. `complete` is added only when completion is
+enabled.
 
 Features affect the model-visible tool list and add their own system guidance;
 the guidance follows the same feature-group order as the tools. They do not
 necessarily remove an underlying capability already available through `shell`.
+
+`terminal` is opt-in and provides persistent interactive terminals in the
+agent's own runtime. It is distinct from `shell`, which executes bounded
+one-shot commands.
 
 ### `mcp`
 

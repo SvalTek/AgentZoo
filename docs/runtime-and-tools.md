@@ -67,6 +67,23 @@ The current Vibes MCP adapter returns textual MCP content to the model. Do not
 use MCP in this version when a workflow requires preservation of structured or
 image-only MCP tool results.
 
+## Interactive terminals
+
+The opt-in `terminal` feature gives an agent persistent interactive terminals
+inside its own isolated runtime. It is for REPLs, TUIs, debuggers, interactive
+programs, SSH, and development servers that require later keyboard input. Use
+`shell` for ordinary one-shot commands instead.
+
+The feature exposes `terminal_create`, `terminal_list`, `terminal_read`,
+`terminal_send`, `terminal_keys`, `terminal_clear`, and `terminal_kill`.
+Sessions persist across model turns, activations, yields, and idle periods; an
+agent may stop them explicitly, and runtime teardown stops all of them.
+
+`terminal_read` returns a bounded plain-text tmux capture. Interactive programs
+therefore receive a real terminal while AgentZoo renders only inert text in its
+own TUI. Use `terminal_send` for literal text (optionally followed by Enter) and
+`terminal_keys` for symbolic keys such as `Up`, `Escape`, or `C-c`.
+
 ## Lifecycle tools
 
 ### `yield`

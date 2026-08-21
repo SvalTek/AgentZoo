@@ -28,6 +28,7 @@ export * from "./tools/ShellTool.ts";
 export * from "./tools/FilesystemTools.ts";
 export * from "./tools/ViewImageTool.ts";
 export * from "./tools/HttpRequestTool.ts";
+export * from "./tools/TerminalTool.ts";
 export * from "./ToolSupport.ts";
 export * from "./Providers.ts";
 export * from "./tools/LifecycleTools.ts";
