@@ -139,6 +139,19 @@ function messageDisplays(
       width,
     )];
   }
+  if (event.kind === "agent:mcp:unavailable") {
+    const detail = asRecord(event.detail);
+    return [messageDisplay(
+      event,
+      "MCP unavailable",
+      [
+        `Server: ${String(detail?.serverName ?? "unknown")}`,
+        String(detail?.message ?? event.message),
+        "Continuing with the remaining capabilities.",
+      ],
+      width,
+    )];
+  }
   if (event.kind === "agent:yield" || event.kind === "agent:complete") {
     return [messageDisplay(event, event.kind.slice(6), [], width)];
   }

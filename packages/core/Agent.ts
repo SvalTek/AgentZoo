@@ -6,6 +6,7 @@ import type {
   ToolDefinition,
 } from "@vibesjs/sdk";
 import { tokenTrimHistoryProcessor } from "@vibesjs/sdk";
+import { PrefixedToolset, type Toolset } from "@vibesjs/sdk";
 import type { LanguageModel, ModelMessage } from "npm:ai@^6";
 import { TextTemplate } from "@agent-zoo/shared";
 import type {
@@ -18,6 +19,12 @@ import type {
 import type { ModelRegistry } from "./ModelRegistry.ts";
 import { buildFeaturePrompt } from "./Feature.ts";
 import { ToolExecutionError, unwrapObservedToolResult } from "./ToolSupport.ts";
+import {
+  ObservedToolset,
+  type ObserveToolCall,
+  OptionalMCPToolset,
+} from "./mcp/ObservedToolset.ts";
+import { type MCPServerEntry, mcpToolPrefix } from "./mcp/MCPPool.ts";
 
 /** The per-run environment AgentZoo exposes to Vibes tools. */
 export interface AgentRunDeps {
@@ -86,8 +93,16 @@ export function modelInputTokenBudget(
   return context.window - (context.maxOutputTokens ?? 0);
 }
 
-function estimatedTextTokens(value: string): number {
-  return Math.ceil(JSON.stringify(value).length / 4);
+/** Keep a positive history budget after reserving measured prompt-envelope cost. */
+export function adjustedHistoryTokenBudget(
+  baseBudget: number,
+  promptEnvelopeReserve: number,
+): number {
+  return Math.max(1, baseBudget - promptEnvelopeReserve);
+}
+
+function estimatedEnvelopeTokens(characters: number): number {
+  return Math.ceil(characters / 3);
 }
 
 /** Stable facts about every Docker-backed agent environment. */
@@ -126,6 +141,7 @@ export class ZooAgent extends EventTarget {
   readonly #createModel: LanguageModelFactory;
   readonly #models: ModelRegistry;
   readonly #tools: readonly ToolDefinition<AgentRunDeps>[];
+  readonly #mcpServers: readonly MCPServerEntry[];
   #vibes?: VibesAgent<AgentRunDeps>;
   #baseSystemPrompt?: string;
   #initialSystemContext?: string;
@@ -134,6 +150,7 @@ export class ZooAgent extends EventTarget {
   #history: ModelMessage[] = [];
   #activeModelExchanges?: ModelExchange[];
   #toolSequence = 0;
+  #promptEnvelopeReserve = 0;
 
   constructor(
     config: AgentConfig,
@@ -141,6 +158,7 @@ export class ZooAgent extends EventTarget {
     models: ModelRegistry,
     createModel: LanguageModelFactory,
     tools: readonly ToolDefinition<AgentRunDeps>[] = [],
+    mcpServers: readonly MCPServerEntry[] = [],
   ) {
     super();
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(config.id)) {
@@ -164,6 +182,7 @@ export class ZooAgent extends EventTarget {
     this.#createModel = createModel;
     this.#models = models;
     this.#tools = [...tools];
+    this.#mcpServers = [...mcpServers];
   }
 
   async prepare(): Promise<void> {
@@ -320,13 +339,7 @@ export class ZooAgent extends EventTarget {
       );
       this.#resolvedSystemPrompt = this.currentSystemPrompt();
       const inputBudget = modelInputTokenBudget(this.config.context);
-      const historyBudget = inputBudget === undefined ? undefined : Math.max(
-        1,
-        inputBudget -
-          (this.#systemPromptInHistory
-            ? 0
-            : estimatedTextTokens(this.#resolvedSystemPrompt)),
-      );
+      const historyBudget = inputBudget;
       this.#vibes = new Agent<AgentRunDeps>({
         name: this.config.name ?? this.id,
         model: observeLanguageModel(
@@ -339,10 +352,27 @@ export class ZooAgent extends EventTarget {
         systemPrompt: () => this.currentSystemPrompt(),
         instructions: this.config.systemPrompt,
         tools: this.#tools.map((definition) => this.observeTool(definition)),
+        ...(this.#mcpServers.length
+          ? {
+            toolsets: [this.mcpToolset()],
+          }
+          : {}),
         maxConcurrency: 1,
         maxTurns: this.config.maxTurns ?? 100,
         historyProcessors: historyBudget === undefined ? [] : [
-          tokenTrimHistoryProcessor<AgentRunDeps>(historyBudget),
+          (messages, context) =>
+            tokenTrimHistoryProcessor<AgentRunDeps>(
+              adjustedHistoryTokenBudget(
+                historyBudget,
+                this.#promptEnvelopeReserve +
+                  estimatedEnvelopeTokens(context.toolSchemaChars ?? 0) +
+                  (this.#systemPromptInHistory
+                    ? 0
+                    : estimatedEnvelopeTokens(context.systemPromptChars ?? 0)),
+              ),
+              (message) =>
+                estimatedEnvelopeTokens(JSON.stringify(message).length),
+            )(messages, context),
         ],
         modelSettings: {
           allowSystemInMessages: true,
@@ -370,73 +400,98 @@ export class ZooAgent extends EventTarget {
     return {
       ...definition,
       execute: async (context, args) => {
-        const toolCallId = `${this.id}:tool:${++this.#toolSequence}`;
-        const startedAt = Date.now();
-        this.dispatchEvent(
-          new CustomEvent("toolstart", {
-            detail: {
-              toolCallId,
-              toolName: definition.name,
-              startedAt,
-              args,
-            },
-          }),
-        );
-        try {
-          const executed = await definition.execute(context, args);
-          const { result, telemetry } = unwrapObservedToolResult(executed);
-          const endedAt = Date.now();
-          this.dispatchEvent(
-            new CustomEvent("toolend", {
-              detail: {
-                toolCallId,
-                toolName: definition.name,
-                status: "success",
-                result,
-                telemetry,
-                startedAt,
-                endedAt,
-                durationMs: endedAt - startedAt,
-              },
-            }),
-          );
-          return result as never;
-        } catch (error) {
-          const endedAt = Date.now();
-          const telemetry = error instanceof ToolExecutionError
-            ? error.telemetry
-            : undefined;
-          this.dispatchEvent(
-            new CustomEvent("toolerror", {
-              detail: {
-                toolCallId,
-                toolName: definition.name,
-                error,
-                telemetry,
-                startedAt,
-                endedAt,
-                durationMs: endedAt - startedAt,
-              },
-            }),
-          );
-          this.dispatchEvent(
-            new CustomEvent("toolend", {
-              detail: {
-                toolCallId,
-                toolName: definition.name,
-                status: "error",
-                error,
-                telemetry,
-                startedAt,
-                endedAt,
-                durationMs: endedAt - startedAt,
-              },
-            }),
-          );
-          throw error;
-        }
+        return await this.observeToolCall(
+          definition.name,
+          args as Record<string, unknown>,
+          () => definition.execute(context, args),
+        ) as never;
       },
     };
+  }
+
+  private mcpToolset(): Toolset<AgentRunDeps> {
+    const prefixed = this.#mcpServers.map((server) => ({
+      name: server.name,
+      toolset: new PrefixedToolset(server.toolset, mcpToolPrefix(server.name)),
+    }));
+    return new ObservedToolset(
+      new OptionalMCPToolset(prefixed, (serverName, error) => {
+        this.dispatchEvent(
+          new CustomEvent("mcpunavailable", {
+            detail: { serverName, error, message: error.message },
+          }),
+        );
+      }),
+      this.#tools.map((tool) => tool.name),
+      this.observeToolCall.bind(this) as ObserveToolCall,
+    );
+  }
+
+  private async observeToolCall(
+    toolName: string,
+    args: Record<string, unknown>,
+    execute: () => Promise<unknown>,
+  ): Promise<unknown> {
+    const toolCallId = `${this.id}:tool:${++this.#toolSequence}`;
+    const startedAt = Date.now();
+    this.dispatchEvent(
+      new CustomEvent("toolstart", {
+        detail: { toolCallId, toolName, startedAt, args },
+      }),
+    );
+    try {
+      const executed = await execute();
+      const { result, telemetry } = unwrapObservedToolResult(executed);
+      const endedAt = Date.now();
+      this.dispatchEvent(
+        new CustomEvent("toolend", {
+          detail: {
+            toolCallId,
+            toolName,
+            status: "success",
+            result,
+            telemetry,
+            startedAt,
+            endedAt,
+            durationMs: endedAt - startedAt,
+          },
+        }),
+      );
+      return result;
+    } catch (error) {
+      const endedAt = Date.now();
+      const telemetry = error instanceof ToolExecutionError
+        ? error.telemetry
+        : undefined;
+      this.dispatchEvent(
+        new CustomEvent("toolerror", {
+          detail: {
+            toolCallId,
+            toolName,
+            error,
+            telemetry,
+            startedAt,
+            endedAt,
+            durationMs: endedAt - startedAt,
+          },
+        }),
+      );
+      this.dispatchEvent(
+        new CustomEvent("toolend", {
+          detail: {
+            toolCallId,
+            toolName,
+            status: "error",
+            error,
+            telemetry,
+            startedAt,
+            endedAt,
+            durationMs: endedAt - startedAt,
+          },
+        }),
+      );
+      throw error;
+    }
   }
 
   get toolNames(): readonly string[] {
@@ -461,11 +516,27 @@ export class ZooAgent extends EventTarget {
       if (event.kind === "response") exchange.response = event.response;
       else exchange.error = event.error;
     }
+    if (event.kind === "response") {
+      this.updatePromptEnvelopeReserve(event.response);
+    }
     this.dispatchEvent(
       new CustomEvent(
         event.kind === "response" ? "modelresponse" : "modelerror",
         { detail: event },
       ),
+    );
+  }
+
+  private updatePromptEnvelopeReserve(response: unknown): void {
+    const inputBudget = modelInputTokenBudget(this.config.context);
+    if (inputBudget === undefined) return;
+    const usage = asRecord(response)?.usage;
+    const inputTokens = asRecord(usage)?.inputTokens;
+    const total = asRecord(inputTokens)?.total;
+    if (typeof total !== "number" || !Number.isFinite(total)) return;
+    this.#promptEnvelopeReserve = Math.max(
+      this.#promptEnvelopeReserve,
+      Math.max(0, total - inputBudget),
     );
   }
 }

@@ -78,7 +78,6 @@ models:
     provider: ollama
     model: moondream:latest
 
-
 templates:
   coding-system: |
     {#IF name}
@@ -96,7 +95,6 @@ templates:
     {#END}
     This is your computer. You can use or modify it freely, including installing software and tools.
     How you spend your time is up to you.
-
 
 agents:
   - type: coding
@@ -120,6 +118,8 @@ agents:
       temperature: 0.6
     # Add vision to let the agent view image files via view_image.
     features: [shell, filesystem, vision]
+    # Its model-visible MCP tools are named mcp_context7_<tool>.
+    mcp: [context7]
     #prompt: Inspect your environment and report what is present, then yield.
 
   # With no prompt, this agent starts from a real listing of its private root.
@@ -133,12 +133,28 @@ agents:
     # captioningModel: local-moondream
     system: research-system
     maxTurns: 100
+    sampling:
+      temperature: 0.8
     # Add http to expose the structured http_request convenience tool.
     features: [shell, filesystem, vision]
+    mcp: [browser]
+    #prompt: Inspect your environment and report what is present, then yield.
 
 # Service factories are supplied by an embedding application. The standalone
 # distribution currently has no optional services enabled by default.
 services: []
+
+# Host-side MCP servers are opt-in per agent. Context7 supplies read-only
+# current library documentation, complementing AgentZoo's local tools.
+mcp:
+  - name: context7
+    type: stdio
+    command: npx
+    args: ["-y", "@upstash/context7-mcp@4.0.3"]
+
+  - name: browser
+    type: http
+    url: "http://127.0.0.1:9010/mcp"
 
 # Configured shell-backed tools. These extend the shell feature: each entry
 # becomes a named tool whose command is rendered from its parameters with

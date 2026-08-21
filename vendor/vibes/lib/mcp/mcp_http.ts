@@ -86,7 +86,7 @@ export class MCPHttpClient implements MCPClient {
   async listTools(): Promise<MCPTool[]> {
     const client = this._assertConnected();
     const result = await client.listTools();
-    return result.tools.map((t) => ({
+    return result.tools.map((t: { name: string; description?: string; inputSchema: unknown }) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema as Record<string, unknown>,

@@ -43,6 +43,30 @@ describing the scheduler, population, experiment, Docker, OverlayFS, or host
 paths. `/shared` exists naturally in the filesystem; tools do not prescribe a
 collaboration protocol for it.
 
+## MCP toolsets
+
+MCP servers are Zoo-owned host connections, not tools executed inside an agent's
+private runtime. A selected server is represented by a Vibes toolset, resolved
+on every model turn; Vibes lazily discovers its tools and caches that server's
+tool list. AgentZoo creates a transport only on first discovery and performs one
+clean reconnect/re-discovery when a previously healthy server no longer answers
+discovery. It never replays a failed tool call. If a selected server remains
+unavailable, AgentZoo omits it for that activation and emits a prominent
+MCP-unavailable activity event. AgentZoo prefixes every server's tool names as
+`mcp_<server>_...` before composition, then records MCP calls through the same
+correlated tool lifecycle events as built-in tools.
+
+Tool schemas are part of every provider request. AgentZoo measures the resolved
+per-turn tool surface—including selected MCP tools—before history trimming and
+reserves it together with the system prompt and configured output allowance.
+Large MCP servers therefore intentionally leave less room for conversation
+history; they are capability, trust, and context-window decisions, not free
+configuration.
+
+The current Vibes MCP adapter returns textual MCP content to the model. Do not
+use MCP in this version when a workflow requires preservation of structured or
+image-only MCP tool results.
+
 ## Lifecycle tools
 
 ### `yield`
@@ -178,8 +202,8 @@ features: [shell, filesystem, vision]
 ```
 
 It exposes `view_image`, which lets the model view an image file from the
-computer. `path` selects the image as an absolute path or a path relative to
-the current working directory; an optional `cwd` sets the directory the path is
+computer. `path` selects the image as an absolute path or a path relative to the
+current working directory; an optional `cwd` sets the directory the path is
 resolved from and defaults to the current working directory. The complete image
 is read and returned to the model. The image type is detected from the file's
 magic bytes (PNG, JPEG, GIF, WebP, BMP, and JPEG 2000); a file that is not a

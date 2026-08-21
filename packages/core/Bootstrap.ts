@@ -26,6 +26,7 @@ import {
 } from "./tools/LifecycleTools.ts";
 import type { RuntimeEnv, RuntimeManager } from "./types.ts";
 import type { ModelRuntimeConfig } from "./types.ts";
+import { MCPPool } from "./mcp/MCPPool.ts";
 
 export type ServiceFactory = () =>
   | Service
@@ -83,6 +84,7 @@ export async function buildAgentZoo(
   };
   let zoo: AgentZoo | undefined;
   let featureRegistry: FeatureRegistry<AgentRunDeps> | undefined;
+  let mcpPool: MCPPool | undefined;
 
   const stopRuntime = async () => {
     if (lifecycle.stop) await lifecycle.stop();
@@ -102,6 +104,7 @@ export async function buildAgentZoo(
 
   try {
     const population = await expandPopulation(config);
+    mcpPool = new MCPPool(config.mcp, workspace.root);
     featureRegistry = new FeatureRegistry<AgentRunDeps>();
     featureRegistry.register(new ShellFeature(config.tools));
     featureRegistry.register(new FilesystemFeature());
@@ -192,6 +195,7 @@ export async function buildAgentZoo(
           models,
           options.modelFactory ?? createLanguageModel,
           orderedTools,
+          mcpPool.select(member.id, member.mcp),
         ),
       );
       initialPrompts[member.id] = composeInitialPrompt(
@@ -212,6 +216,7 @@ export async function buildAgentZoo(
       initialPrompts,
       clock: options.clock,
       random: options.random,
+      mcpPool,
       dispose,
     });
     for (const [name, factory] of Object.entries(options.services ?? {})) {
@@ -356,6 +361,7 @@ interface PopulationMember {
   systemPrompt?: string;
   prompt?: string;
   features: string[];
+  mcp?: string[];
   cwd: string;
   maxTurns: number;
   context?: ModelRuntimeConfig["context"];
@@ -386,6 +392,7 @@ async function expandPopulation(
         systemPrompt: group.systemPrompt,
         prompt: group.prompt,
         features: [...group.features],
+        mcp: group.mcp ? [...group.mcp] : undefined,
         cwd: group.cwd,
         maxTurns: group.maxTurns,
         context: group.context,

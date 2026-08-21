@@ -93,6 +93,27 @@ const RuntimeConfigSchema = z.object({
   sharedWorkspace: NonEmptyString.default(".shared"),
 });
 
+const MCPServerName = Identifier;
+const MCPSelection = z.union([z.literal("*"), MCPServerName]);
+
+export const MCPServerConfigSchema = z.discriminatedUnion("type", [
+  z.object({
+    name: MCPServerName,
+    type: z.literal("stdio"),
+    command: NonEmptyString,
+    args: z.array(z.string()).default([]),
+    env: z.record(z.string(), z.string()).optional(),
+  }),
+  z.object({
+    name: MCPServerName,
+    type: z.literal("http"),
+    url: NonEmptyString.url(),
+    headers: z.record(z.string(), z.string()).optional(),
+  }),
+]);
+
+export type MCPServerConfig = z.infer<typeof MCPServerConfigSchema>;
+
 const AgentPopulationConfigSchema = z.object({
   type: Identifier,
   name: NonEmptyString.optional(),
@@ -104,6 +125,7 @@ const AgentPopulationConfigSchema = z.object({
   systemPrompt: NonEmptyString.optional(),
   prompt: NonEmptyString.optional(),
   features: z.array(Identifier).default(["shell", "filesystem"]),
+  mcp: z.array(MCPSelection).optional(),
   cwd: NonEmptyString.default("/root"),
   maxTurns: z.number().int().positive().default(100),
   ...ModelRuntimeConfigShape,
@@ -126,6 +148,20 @@ const AgentPopulationConfigSchema = z.object({
       message:
         "Do not use count with names; the list defines the population size",
     });
+  }
+  if (value.mcp) {
+    if (new Set(value.mcp).size !== value.mcp.length) {
+      context.addIssue({
+        code: "custom",
+        message: "Do not repeat MCP server selections",
+      });
+    }
+    if (value.mcp.includes("*") && value.mcp.length !== 1) {
+      context.addIssue({
+        code: "custom",
+        message: 'Use "*" alone to select every MCP server',
+      });
+    }
   }
 }).transform((value) => ({
   ...value,
@@ -170,12 +206,25 @@ export const ZooConfigSchema = z.object({
   services: z.array(Identifier).default([]),
   templates: z.record(NonEmptyString, z.string()).default({}),
   tools: z.record(ToolName, ShellToolConfigSchema).default({}),
+  mcp: z.array(MCPServerConfigSchema).default([]),
   runtime: RuntimeConfigSchema.default({
     backend: "docker",
     sharedWorkspace: ".shared",
   }),
   agents: z.array(AgentPopulationConfigSchema).min(1),
   completion: CompletionConfigSchema.default({ enabled: true }),
+}).superRefine((value, context) => {
+  const names = new Set<string>();
+  for (const [index, server] of value.mcp.entries()) {
+    if (names.has(server.name)) {
+      context.addIssue({
+        code: "custom",
+        path: ["mcp", index, "name"],
+        message: `MCP server name "${server.name}" is already configured`,
+      });
+    }
+    names.add(server.name);
+  }
 });
 
 export type ZooConfig = z.infer<typeof ZooConfigSchema>;
@@ -278,5 +327,42 @@ export function resolveConfigEnvironment(
       return [modelName, { ...model, apiKey }];
     }),
   );
-  return { ...config, models };
+  const mcp = config.mcp.map((server, index) => {
+    const resolveValue = (value: string, path: string): string =>
+      value.replace(/\$\{([^}]+)\}/g, (_match, name: string) => {
+        const resolved = getEnvironment(name);
+        if (!resolved) {
+          throw new ConfigValidationError([
+            `/${path}: Environment variable "${name}" is not set or is empty`,
+          ]);
+        }
+        return resolved;
+      });
+    if (server.type === "stdio") {
+      return {
+        ...server,
+        command: resolveValue(server.command, `mcp/${index}/command`),
+        args: server.args.map((arg, argIndex) =>
+          resolveValue(arg, `mcp/${index}/args/${argIndex}`)
+        ),
+        env: server.env && Object.fromEntries(
+          Object.entries(server.env).map(([key, value]) => [
+            key,
+            resolveValue(value, `mcp/${index}/env/${key}`),
+          ]),
+        ),
+      };
+    }
+    return {
+      ...server,
+      url: resolveValue(server.url, `mcp/${index}/url`),
+      headers: server.headers && Object.fromEntries(
+        Object.entries(server.headers).map(([key, value]) => [
+          key,
+          resolveValue(value, `mcp/${index}/headers/${key}`),
+        ]),
+      ),
+    };
+  });
+  return { ...config, models, mcp };
 }

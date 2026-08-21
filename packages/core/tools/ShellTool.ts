@@ -110,7 +110,7 @@ Use dedicated command tools when one directly matches the operation. Use the she
       description: this.description,
       parameters: ShellParameters,
       argsValidator: validateShellArguments,
-      execute: async (context, parameters) => {
+      execute: (context, parameters) => {
         const command = parameters.command!;
         return executeCommand(
           context.deps,
@@ -169,9 +169,13 @@ Use dedicated command tools when one directly matches the operation. Use the she
         const tmuxArgs = [
           "new-session",
           "-d",
-          "-s", shellQuote(params.name),
-          "-c", shellQuote(effectiveCwd),
-          "bash", "-c", shellQuote(params.command),
+          "-s",
+          shellQuote(params.name),
+          "-c",
+          shellQuote(effectiveCwd),
+          "bash",
+          "-c",
+          shellQuote(params.command),
         ].join(" ");
         const result = await context.deps.runtime.exec(`tmux ${tmuxArgs}`, {
           cwd: context.deps.cwd,
@@ -344,12 +348,14 @@ async function executeCommand(
 
 /** Compile a params config block into a runtime Zod object schema. */
 function compileParamSchema(
-  params: Readonly<Record<string, {
-    type: "string" | "number" | "boolean";
-    required: boolean;
-    array: boolean;
-    description: string;
-  }>>,
+  params: Readonly<
+    Record<string, {
+      type: "string" | "number" | "boolean";
+      required: boolean;
+      array: boolean;
+      description: string;
+    }>
+  >,
 ): z.ZodObject<Record<string, z.ZodTypeAny>> {
   const shape: Record<string, z.ZodTypeAny> = {};
   for (const [name, def] of Object.entries(params)) {
@@ -381,10 +387,12 @@ function compileParamSchema(
  * Booleans and numbers pass through unchanged ({#IF} needs real booleans).
  */
 function shellEscapeParams(
-  paramDefs: Readonly<Record<string, {
-    type: "string" | "number" | "boolean";
-    array: boolean;
-  }>>,
+  paramDefs: Readonly<
+    Record<string, {
+      type: "string" | "number" | "boolean";
+      array: boolean;
+    }>
+  >,
   params: Record<string, unknown>,
 ): Record<string, unknown> {
   const escaped: Record<string, unknown> = {};

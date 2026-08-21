@@ -422,6 +422,27 @@ Deno.test("activity display includes shell timeout recovery guidance", () => {
   ]);
 });
 
+Deno.test("activity display makes optional MCP loss conspicuous", () => {
+  const display = formatActivity({
+    sequence: 1,
+    at: 0,
+    kind: "agent:mcp:unavailable",
+    agentId: "rowan",
+    agentName: "Rowan",
+    message: "Rowan continues without MCP server browseros",
+    detail: {
+      serverName: "browseros",
+      message: "MCP server browseros is unavailable while discovering tools",
+    },
+  });
+  assertStringIncludes(display.headline, "MCP unavailable");
+  assertStringIncludes(display.details.join("\n"), "browseros");
+  assertStringIncludes(
+    display.details.join("\n"),
+    "Continuing with the remaining capabilities.",
+  );
+});
+
 Deno.test("wake activity shows environment entries instead of a blank row", () => {
   const display = formatActivity({
     sequence: 1,

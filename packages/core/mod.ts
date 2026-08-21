@@ -32,4 +32,6 @@ export * from "./ToolSupport.ts";
 export * from "./Providers.ts";
 export * from "./tools/LifecycleTools.ts";
 export * from "./Bootstrap.ts";
+export * from "./mcp/MCPPool.ts";
+export * from "./mcp/ObservedToolset.ts";
 export type * from "./types.ts";
