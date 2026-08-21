@@ -489,13 +489,23 @@ Deno.test("terminal activity cards retain typed input and render the screen with
     "terminal: universe",
     "sent: garden",
     "enter: true",
-    "result: sent",
   ]);
   assertEquals(activity[1].details, [
     "terminal: universe",
     "range: all retained scrollback",
     "screen: Welcome to the garden",
     "  >",
+  ]);
+  const collapsed = buildActivityFragments(
+    activity,
+    100,
+    10,
+    new Set(),
+  );
+  assertEquals(collapsed[0].body, [
+    "✓ complete",
+    "terminal: universe",
+    "sent: garden",
   ]);
 });
 

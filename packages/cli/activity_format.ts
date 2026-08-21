@@ -211,7 +211,7 @@ function toolStartDisplay(
     toolName,
     headline: `${actorLabel(event)} — ${toolName}`,
     status: "running",
-    compact: details.slice(0, 1),
+    compact: details.slice(0, 2),
     details,
   };
 }
@@ -425,7 +425,10 @@ function toolResultLines(toolName: string, value: unknown): string[] {
     toolName === "terminal_clear" || toolName === "terminal_kill"
   ) {
     return [
-      ...labelledLines("result", result.status),
+      ...(result.status === "sent" || result.status === "cleared" ||
+          result.status === "killed"
+        ? []
+        : labelledLines("result", result.status)),
       ...labelledLines("error", result.error),
     ];
   }
