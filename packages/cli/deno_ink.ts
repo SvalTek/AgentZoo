@@ -10,20 +10,20 @@
 import type { Node as YogaNode, Yoga } from "npm:yoga-wasm-web@0.3.3";
 import stringWidth from "npm:string-width@7.2.0";
 
-// JSR intentionally does not expose its internal modules as typed subpaths.
-// Keep the compatibility boundary runtime-only rather than copying the package.
+// The renderer is vendored so local fixes survive; JSR keeps its internals
+// private, so the compatibility boundary stays runtime-only.
 const { Ink } = await import(
-  "https://jsr.io/@deno-ink/core/0.2.1/src/ink.ts"
+  "../../vendor/deno-ink/src/ink.ts"
 ) as unknown as {
   Ink: { prototype: InkInternals };
 };
 const { wrapText } = await import(
-  "https://jsr.io/@deno-ink/core/0.2.1/src/output.ts"
+  "../../vendor/deno-ink/src/output.ts"
 ) as unknown as {
   wrapText(text: string, width: number): string;
 };
 const { applyStyles } = await import(
-  "https://jsr.io/@deno-ink/core/0.2.1/src/styles.ts"
+  "../../vendor/deno-ink/src/styles.ts"
 ) as unknown as {
   applyStyles(node: YogaNode, style: Record<string, unknown>, yoga: Yoga): void;
 };
@@ -115,4 +115,4 @@ export function wrappedLines(text: string, width: number): readonly string[] {
   return wrapText(text, Math.max(1, Math.floor(width))).split("\n");
 }
 
-export * from "jsr:@deno-ink/core@0.2.1";
+export * from "../../vendor/deno-ink/src/mod.ts";
