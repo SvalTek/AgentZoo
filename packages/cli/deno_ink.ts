@@ -52,6 +52,12 @@ ink.rebuildYogaTree = function (node, parentYogaNode): void {
 
   if (node.nodeName === "ink-text") {
     const text = textContent(node);
+    // The renderer truncates instead of wrapping for these styles, so a long
+    // source line is one row. Wrapping here would reserve rows that the
+    // renderer leaves blank, which stretches every border below the text.
+    const truncating = node.style.wrap === "truncate" ||
+      node.style.wrap === "truncate-start" ||
+      node.style.wrap === "truncate-middle";
     yogaNode.setMeasureFunc((availableWidth, widthMode) => {
       const naturalWidth = widestLine(text);
       const constrained = widthMode !== this.yoga!.MEASURE_MODE_UNDEFINED &&
@@ -64,7 +70,9 @@ ink.rebuildYogaTree = function (node, parentYogaNode): void {
         width: widthMode === this.yoga!.MEASURE_MODE_EXACTLY
           ? Math.floor(availableWidth)
           : width,
-        height: wrapText(text, renderedWidth).split("\n").length,
+        height: truncating
+          ? text.split("\n").length
+          : wrapText(text, renderedWidth).split("\n").length,
       };
     });
     // Nested Text is virtual styling content. A measured Yoga leaf cannot have

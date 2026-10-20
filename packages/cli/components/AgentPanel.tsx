@@ -24,13 +24,13 @@ function AgentRow({ agent }: { agent: ZooAgentSnapshot }) {
       borderColor={stateColor(agent.state)}
       paddingX={1}
     >
-      <Box width={22}>
+      <Box width={22} flexShrink={0}>
         <Text color={stateColor(agent.state)} bold wrap="truncate">
           {agent.name === agent.id ? agent.id : `${agent.name} (${agent.id})`}
         </Text>
       </Box>
-      <Box width={13}>
-        <Text>{agent.state}</Text>
+      <Box width={13} flexShrink={0}>
+        <Text wrap="truncate">{agent.state}</Text>
       </Box>
       <Box width={28} flexShrink={1}>
         <Text dimColor wrap="truncate">{agent.type ?? "agent"} · {agent.model}</Text>
@@ -38,7 +38,11 @@ function AgentRow({ agent }: { agent: ZooAgentSnapshot }) {
       <Box flexGrow={1}>
         <Text wrap="truncate">{agent.currentActivity}</Text>
       </Box>
-      <Text dimColor>{formatElapsed(elapsed)}</Text>
+      {/* The elapsed column must never shrink: ink-text is a flex item that
+          otherwise wraps to two rows and stretches the whole agent row. */}
+      <Box flexShrink={0}>
+        <Text dimColor>{formatElapsed(elapsed)}</Text>
+      </Box>
     </Box>
   );
 }
