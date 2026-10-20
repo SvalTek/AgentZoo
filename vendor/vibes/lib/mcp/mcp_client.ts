@@ -1,4 +1,10 @@
-import type { MCPCallResult, MCPTool } from "./mcp_types.ts";
+import type {
+  MCPCallResult,
+  MCPReadResourceResult,
+  MCPResource,
+  MCPResourceTemplate,
+  MCPTool,
+} from "./mcp_types.ts";
 
 // ---------------------------------------------------------------------------
 // MCPClient interface
@@ -18,6 +24,18 @@ export interface MCPClient {
 
   /** List all tools available on the connected MCP server. */
   listTools(): Promise<MCPTool[]>;
+
+  /** List resources when the server advertises the resources capability. */
+  listResources?(): Promise<MCPResource[]>;
+
+  /** List resource URI templates when supported by the server. */
+  listResourceTemplates?(): Promise<MCPResourceTemplate[]>;
+
+  /** Read a resource URI when the server advertises the resources capability. */
+  readResource?(uri: string): Promise<MCPReadResourceResult>;
+
+  /** Whether the connected server advertised the resources capability. */
+  supportsResources?(): boolean;
 
   /**
    * Call a tool on the MCP server.

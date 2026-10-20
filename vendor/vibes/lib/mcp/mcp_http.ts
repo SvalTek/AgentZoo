@@ -5,6 +5,9 @@ import type {
   ElicitationCallback,
   MCPCallResult,
   MCPContentItem,
+  MCPReadResourceResult,
+  MCPResource,
+  MCPResourceTemplate,
   MCPTool,
 } from "./mcp_types.ts";
 
@@ -91,6 +94,25 @@ export class MCPHttpClient implements MCPClient {
       description: t.description,
       inputSchema: t.inputSchema as Record<string, unknown>,
     }));
+  }
+
+  async listResources(): Promise<MCPResource[]> {
+    const result = await this._assertConnected().listResources();
+    return result.resources as MCPResource[];
+  }
+
+  async listResourceTemplates(): Promise<MCPResourceTemplate[]> {
+    const result = await this._assertConnected().listResourceTemplates();
+    return result.resourceTemplates as MCPResourceTemplate[];
+  }
+
+  async readResource(uri: string): Promise<MCPReadResourceResult> {
+    return await this._assertConnected().readResource({ uri }) as
+      MCPReadResourceResult;
+  }
+
+  supportsResources(): boolean {
+    return Boolean(this._assertConnected().getServerCapabilities()?.resources);
   }
 
   async callTool(

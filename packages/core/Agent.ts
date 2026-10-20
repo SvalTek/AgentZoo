@@ -6,7 +6,7 @@ import type {
   ToolDefinition,
 } from "@vibesjs/sdk";
 import { tokenTrimHistoryProcessor } from "@vibesjs/sdk";
-import { PrefixedToolset, type Toolset } from "@vibesjs/sdk";
+import { FilteredToolset, PrefixedToolset, type Toolset } from "@vibesjs/sdk";
 import type { LanguageModel, ModelMessage } from "npm:ai@^6";
 import { TextTemplate } from "@agent-zoo/shared";
 import type {
@@ -25,6 +25,8 @@ import {
   OptionalMCPToolset,
 } from "./mcp/ObservedToolset.ts";
 import { type MCPServerEntry, mcpToolPrefix } from "./mcp/MCPPool.ts";
+import { createMCPListToolsTool } from "./mcp/ListToolsTool.ts";
+import { createMCPResourceTools } from "./mcp/ResourceTools.ts";
 
 /** The per-run environment AgentZoo exposes to Vibes tools. */
 export interface AgentRunDeps {
@@ -40,6 +42,7 @@ export interface AgentRunDeps {
 
 export interface AgentActivationControl {
   requested?: "yield" | "complete";
+  enabledMcpServers?: Set<string>;
 }
 
 export interface ModelExchange {
@@ -61,6 +64,7 @@ export interface FailedActivationRecord {
 
 const MalformedToolCallCorrection =
   "Automated correction: The previous tool call was malformed and could not be processed. Retry the intended tool call using the tool's parameter schema exactly.";
+const UndirectedActivationPrompt = "Begin.";
 
 /** Error carrying the provider transcript Vibes does not include on failure. */
 export class AgentActivationError extends Error {
@@ -115,6 +119,10 @@ const AgentZooSystemTemplate = new TextTemplate(`${RuntimeEnvironmentContract}
 
 {#IF hasFeatures}
 {featurePrompt}
+{#END}
+
+{#IF hasMcpTools}
+{mcpTools}
 {#END}`);
 
 export async function buildAgentSystemPrompt(
@@ -123,11 +131,30 @@ export async function buildAgentSystemPrompt(
 ): Promise<string> {
   const args: Record<string, unknown> = {
     hasFeatures: features.length > 0,
+    hasMcpTools: typeof featureArgs.mcpTools === "string" &&
+      featureArgs.mcpTools.trim().length > 0,
   };
   if (features.length) {
     args.featurePrompt = () => buildFeaturePrompt(features, featureArgs);
   }
+  if (args.hasMcpTools) args.mcpTools = featureArgs.mcpTools;
   return await AgentZooSystemTemplate.render(args);
+}
+
+function formatMcpTools(servers: readonly MCPServerEntry[]): string {
+  if (!servers.length) return "";
+  return `## MCP tools
+
+These MCP servers are available to you:
+${
+    servers.map((server) => `- \`${server.name}\`: ${server.description}`).join(
+      "\n",
+    )
+  }
+
+Call \`list_tools\` with an MCP server name when you want to use that server. Its
+tools will be available on your next turn. Use \`list_resources\` and
+\`read_resource\` to discover and read its MCP resources.`;
 }
 
 /**
@@ -181,8 +208,35 @@ export class ZooAgent extends EventTarget {
     this.runtime = runtime;
     this.#createModel = createModel;
     this.#models = models;
-    this.#tools = [...tools];
     this.#mcpServers = [...mcpServers];
+    const mcpBuiltinNames = new Set([
+      "list_tools",
+      "list_resources",
+      "read_resource",
+    ]);
+    if (
+      this.#mcpServers.length &&
+      tools.some((tool) => mcpBuiltinNames.has(tool.name))
+    ) {
+      const duplicate = tools.find((tool) => mcpBuiltinNames.has(tool.name))!;
+      throw new Error(
+        `Agent "${config.id}" has duplicate tool name "${duplicate.name}"`,
+      );
+    }
+    const onMcpUnavailable = (serverName: string, error: Error) => {
+      this.dispatchEvent(
+        new CustomEvent("mcpunavailable", {
+          detail: { serverName, error, message: error.message },
+        }),
+      );
+    };
+    const mcpBuiltins = this.#mcpServers.length
+      ? [
+        ...createMCPResourceTools(this.#mcpServers, onMcpUnavailable),
+        createMCPListToolsTool(this.#mcpServers, onMcpUnavailable),
+      ]
+      : [];
+    this.#tools = [...tools, ...mcpBuiltins];
   }
 
   async prepare(): Promise<void> {
@@ -200,7 +254,13 @@ export class ZooAgent extends EventTarget {
     options: AgentActivationOptions = {},
   ): Promise<AgentActivationResult> {
     const appendPrompt = options.appendPrompt ?? true;
-    const promptRole = appendPrompt ? options.role ?? "user" : "none";
+    const undirectedStartup = !appendPrompt && !this.#history.length &&
+      prompt.trim().length === 0;
+    const effectivePrompt = undirectedStartup
+      ? UndirectedActivationPrompt
+      : prompt;
+    const effectiveAppendPrompt = appendPrompt || undirectedStartup;
+    const promptRole = effectiveAppendPrompt ? options.role ?? "user" : "none";
     if (options.initialSystemContext) {
       if (this.#vibes || this.#history.length) {
         throw new Error(
@@ -217,7 +277,7 @@ export class ZooAgent extends EventTarget {
     const exchanges: ModelExchange[] = [];
     this.#activeModelExchanges = exchanges;
     try {
-      const result = await (await this.getVibes()).run(prompt, {
+      const result = await (await this.getVibes()).run(effectivePrompt, {
         deps: {
           agentId: this.id,
           provider: this.#models.get(this.config.model).provider,
@@ -230,7 +290,7 @@ export class ZooAgent extends EventTarget {
         },
         messageHistory: this.#history,
         messageRole: promptRole === "none" ? undefined : promptRole,
-        appendPrompt,
+        appendPrompt: effectiveAppendPrompt,
         systemPromptAsMessage: this.#systemPromptInHistory,
       });
       this.#history = [...result.messages];
@@ -251,7 +311,7 @@ export class ZooAgent extends EventTarget {
       };
     } catch (error) {
       throw new AgentActivationError(error, {
-        prompt,
+        prompt: effectivePrompt,
         promptRole,
         systemPrompt: this.#resolvedSystemPrompt,
         messages: providerTranscript(exchanges),
@@ -335,6 +395,7 @@ export class ZooAgent extends EventTarget {
           type: this.config.type,
           model: this.config.model,
           shellEnvironment: this.#initialSystemContext ?? "",
+          mcpTools: formatMcpTools(this.#mcpServers),
         },
       );
       this.#resolvedSystemPrompt = this.currentSystemPrompt();
@@ -412,7 +473,16 @@ export class ZooAgent extends EventTarget {
   private mcpToolset(): Toolset<AgentRunDeps> {
     const prefixed = this.#mcpServers.map((server) => ({
       name: server.name,
-      toolset: new PrefixedToolset(server.toolset, mcpToolPrefix(server.name)),
+      toolset: new PrefixedToolset(
+        new FilteredToolset(
+          server.toolset,
+          (context) =>
+            context.deps.control.enabledMcpServers?.has(
+              server.name,
+            ) ?? false,
+        ),
+        mcpToolPrefix(server.name),
+      ),
     }));
     return new ObservedToolset(
       new OptionalMCPToolset(prefixed, (serverName, error) => {
@@ -558,10 +628,13 @@ export function observeLanguageModel(
       }
       return async (options: unknown) => {
         const promptIdentity = modelPromptIdentity(options);
-        const effectiveOptions = promptIdentity &&
+        const correctedOptions = promptIdentity &&
             promptsNeedingToolCallCorrection.has(promptIdentity)
           ? addMalformedToolCallCorrection(options)
           : options;
+        const effectiveOptions = normalizeProviderSystemMessages(
+          correctedOptions,
+        );
         const callId = `model:${++sequence}`;
         const observed = observableModelRequest(
           effectiveOptions,
@@ -631,6 +704,54 @@ function addMalformedToolCallCorrection(value: unknown): unknown {
   }
   return { ...request, prompt };
 }
+/** Keep provider-bound conversations valid while preserving all system text. */
+function normalizeProviderSystemMessages(value: unknown): unknown {
+  const request = asRecord(value);
+  const messages = request?.prompt;
+  if (!request || !Array.isArray(messages)) return value;
+  const systemIndexes = messages.flatMap((message, index) =>
+    asRecord(message)?.role === "system" ? [index] : []
+  );
+  if (systemIndexes.length <= 1) return value;
+  const firstSystemIndex = systemIndexes[0];
+  const firstSystem = asRecord(messages[firstSystemIndex]);
+  if (!firstSystem) return value;
+  const mergedContent = systemIndexes
+    .slice(1)
+    .reduce(
+      (content, index) =>
+        mergeMessageContent(
+          content,
+          asRecord(messages[index])?.content,
+        ),
+      firstSystem.content,
+    );
+  const prompt = messages.filter((_, index) =>
+    !systemIndexes.includes(index) || index === firstSystemIndex
+  );
+  prompt[firstSystemIndex] = { ...firstSystem, content: mergedContent };
+  if (firstSystemIndex !== 0) {
+    const [leadingSystem] = prompt.splice(firstSystemIndex, 1);
+    prompt.unshift(leadingSystem);
+  }
+  return { ...request, prompt };
+}
+
+function mergeMessageContent(left: unknown, right: unknown): unknown {
+  if (typeof left === "string" && typeof right === "string") {
+    return `${left}\n\n${right}`;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return [...left, ...right];
+  }
+  if (typeof left === "string" && Array.isArray(right)) {
+    return [{ type: "text", text: left }, ...right];
+  }
+  if (Array.isArray(left) && typeof right === "string") {
+    return [...left, { type: "text", text: right }];
+  }
+  return `${String(left)}\n\n${String(right)}`;
+}
 
 function observableModelRequest(
   value: unknown,
@@ -655,7 +776,10 @@ function deltaModelRequest(
   previousPrompt: readonly unknown[],
 ): Record<string, unknown> {
   const prompt = Array.isArray(request.prompt) ? request.prompt : [];
-  const omitSystem = previousPrompt.length > 0;
+  const omitSystem = previousPrompt.length > 0 &&
+    isSystemMessage(prompt[0]) &&
+    isSystemMessage(previousPrompt[0]) &&
+    sameLoggedValue(prompt[0], previousPrompt[0]);
   const currentConversation = omitSystem && isSystemMessage(prompt[0])
     ? prompt.slice(1)
     : prompt;

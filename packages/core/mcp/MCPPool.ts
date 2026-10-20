@@ -3,6 +3,9 @@
 import {
   type MCPClient,
   MCPHttpClient,
+  type MCPReadResourceResult,
+  type MCPResource,
+  type MCPResourceTemplate,
   MCPStdioClient,
   MCPToolset,
   type RunContext,
@@ -13,7 +16,16 @@ import type { AgentRunDeps } from "../Agent.ts";
 
 export interface MCPServerEntry {
   readonly name: string;
+  /** Configured model-facing purpose for this selected server. */
+  readonly description: string;
   readonly toolset: Toolset<AgentRunDeps>;
+  readonly resources: MCPResourceAccess;
+}
+
+export interface MCPResourceAccess {
+  listResources(): Promise<MCPResource[]>;
+  listResourceTemplates(): Promise<MCPResourceTemplate[]>;
+  readResource(uri: string): Promise<MCPReadResourceResult>;
 }
 
 /** A server could not safely expose its tools for this model turn. */
@@ -24,12 +36,19 @@ export class MCPServerUnavailableError extends Error {
     readonly recoveryError?: unknown,
   ) {
     super(
-      `MCP server "${serverName}" is unavailable while discovering tools: ${
+      `MCP server "${serverName}" is unavailable during discovery: ${
         errorMessage(recoveryError ?? initialError)
       }`,
       { cause: recoveryError ?? initialError },
     );
     this.name = "MCPServerUnavailableError";
+  }
+}
+
+export class MCPResourceUnsupportedError extends Error {
+  constructor(readonly serverName: string) {
+    super(`MCP server "${serverName}" does not advertise resources`);
+    this.name = "MCPResourceUnsupportedError";
   }
 }
 
@@ -50,10 +69,16 @@ export class MCPPool {
     this.#servers = configs.map((config) => {
       const resolved = substituteSharedPathTokens(config, hostSharedPath);
       const client = clientFactory(resolved);
+      const managed = new ManagedMCPToolset<AgentRunDeps>(
+        resolved.name,
+        client,
+      );
       return {
         name: resolved.name,
+        description: resolved.description,
         client,
-        toolset: new ManagedMCPToolset<AgentRunDeps>(resolved.name, client),
+        toolset: managed,
+        resources: managed,
       };
     });
   }
@@ -68,7 +93,12 @@ export class MCPPool {
   ): MCPServerEntry[] {
     if (!names?.length) return [];
     if (names.length === 1 && names[0] === "*") {
-      return this.#servers.map(({ name, toolset }) => ({ name, toolset }));
+      return this.#servers.map(({ name, description, toolset, resources }) => ({
+        name,
+        description,
+        toolset,
+        resources,
+      }));
     }
     return names.map((name) => {
       const server = this.#servers.find((candidate) => candidate.name === name);
@@ -77,7 +107,12 @@ export class MCPPool {
           `Agent "${agentId}" references unknown MCP server "${name}"`,
         );
       }
-      return { name: server.name, toolset: server.toolset };
+      return {
+        name: server.name,
+        description: server.description,
+        toolset: server.toolset,
+        resources: server.resources,
+      };
     });
   }
 
@@ -98,6 +133,7 @@ export class MCPPool {
  */
 class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
   #state: "new" | "ready" = "new";
+  #connecting?: Promise<void>;
   #toolset: MCPToolset<TDeps>;
   readonly #name: string;
   readonly #client: MCPClient;
@@ -112,31 +148,7 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
   }
 
   async tools(context: import("@vibesjs/sdk").RunContext<TDeps>) {
-    try {
-      return await this.discover(context);
-    } catch (initialError) {
-      if (this.#state !== "ready") {
-        await this.reset().catch(() => undefined);
-        throw new MCPServerUnavailableError(this.#name, initialError);
-      }
-      try {
-        await this.reset();
-        return await this.discover(context);
-      } catch (recoveryError) {
-        await this.reset().catch(() => undefined);
-        throw new MCPServerUnavailableError(
-          this.#name,
-          initialError,
-          recoveryError,
-        );
-      }
-    }
-  }
-
-  private async discover(context: import("@vibesjs/sdk").RunContext<TDeps>) {
-    if (this.#state === "new") await this.#client.connect();
-    const tools = await this.#toolset.tools(context);
-    this.#state = "ready";
+    const tools = await this.withRecovery(() => this.discover(context));
     return tools.map((tool) => ({
       ...tool,
       execute: async (callContext: RunContext<TDeps>, args: unknown) => {
@@ -149,6 +161,90 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
         }
       },
     }));
+  }
+
+  listResources(): Promise<MCPResource[]> {
+    return this.withRecovery(() => {
+      this.assertResourcesSupported();
+      return this.#client.listResources!();
+    });
+  }
+
+  listResourceTemplates(): Promise<MCPResourceTemplate[]> {
+    return this.withRecovery(() => {
+      this.assertResourcesSupported();
+      return this.#client.listResourceTemplates!();
+    });
+  }
+
+  readResource(uri: string): Promise<MCPReadResourceResult> {
+    return this.withRecovery(() => {
+      this.assertResourcesSupported();
+      return this.#client.readResource!(uri);
+    });
+  }
+
+  private async discover(context: import("@vibesjs/sdk").RunContext<TDeps>) {
+    const tools = await this.#toolset.tools(context);
+    return tools;
+  }
+
+  private async withRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    const wasReady = this.#state === "ready";
+    try {
+      if (!wasReady) {
+        await this.connect();
+      }
+      return await operation();
+    } catch (initialError) {
+      if (initialError instanceof MCPResourceUnsupportedError) {
+        throw initialError;
+      }
+      if (!wasReady) {
+        await this.reset().catch(() => undefined);
+        throw new MCPServerUnavailableError(this.#name, initialError);
+      }
+      try {
+        await this.reset();
+        await this.connect();
+        return await operation();
+      } catch (recoveryError) {
+        await this.reset().catch(() => undefined);
+        if (recoveryError instanceof MCPResourceUnsupportedError) {
+          throw recoveryError;
+        }
+        throw new MCPServerUnavailableError(
+          this.#name,
+          initialError,
+          recoveryError,
+        );
+      }
+    }
+  }
+
+  /**
+   * Connect at most once for all concurrent callers. Discovery and resource
+   * reads may run in parallel, and two transports on one server would leak.
+   */
+  private connect(): Promise<void> {
+    if (this.#state === "ready") return Promise.resolve();
+    this.#connecting ??= (async () => {
+      await this.#client.connect();
+      this.#state = "ready";
+    })().finally(() => {
+      this.#connecting = undefined;
+    });
+    return this.#connecting;
+  }
+
+  private assertResourcesSupported(): void {
+    if (
+      !this.#client.listResources || !this.#client.listResourceTemplates ||
+      !this.#client.readResource ||
+      this.#client.supportsResources?.() === false
+    ) {
+      throw new MCPResourceUnsupportedError(this.#name);
+    }
   }
 
   private async reset(): Promise<void> {

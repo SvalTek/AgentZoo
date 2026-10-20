@@ -20,10 +20,12 @@ Consequences:
 - The configured `cwd` refers to a path inside the agent environment.
 - Shell and filesystem convenience tools see the same namespace. If `shell`
   writes `/root/a.txt`, `read_file` reads that same file.
-- Each agent receives a private minimal `/dev`, including its own devpts and
-  `/dev/shm`, and a persistent private PID namespace with its own `/proc`.
-  Background processes remain visible to later commands in the same environment
-  but are not visible or signalable from another agent environment.
+- Each agent receives a private minimal `/dev` with a private `/dev/shm`, and a
+  persistent private PID namespace with its own `/proc`. The devpts instance is
+  shared with the runtime host so an attached terminal resolves its pty, which
+  `docker exec` allocated in that instance. Background processes remain visible
+  to later commands in the same environment but are not visible or signalable
+  from another agent environment.
 - Debian package management is available inside the private root; packages
   installed by one agent remain private to that agent.
 
@@ -46,26 +48,32 @@ collaboration protocol for it.
 ## MCP toolsets
 
 MCP servers are Zoo-owned host connections, not tools executed inside an agent's
-private runtime. A selected server is represented by a Vibes toolset, resolved
-on every model turn; Vibes lazily discovers its tools and caches that server's
-tool list. AgentZoo creates a transport only on first discovery and performs one
-clean reconnect/re-discovery when a previously healthy server no longer answers
-discovery. It never replays a failed tool call. If a selected server remains
-unavailable, AgentZoo omits it for that activation and emits a prominent
-MCP-unavailable activity event. AgentZoo prefixes every server's tool names as
-`mcp_<server>_...` before composition, then records MCP calls through the same
-correlated tool lifecycle events as built-in tools.
+private runtime. Each assigned server is represented by its own Vibes toolset.
+The model initially sees the assigned server names and descriptions plus
+`list_tools`, `list_resources`, and `read_resource`. Calling `list_tools`
+discovers one server's tools and exposes that server's direct tools on the next
+model turn. `list_resources` returns its resources and resource templates;
+`read_resource` reads a discovered URI. Unrequested toolsets stay hidden and do
+not connect. Vibes caches each discovered server's tool list. AgentZoo creates a
+transport only on first discovery and performs one clean reconnect/re-discovery
+when a previously healthy server no longer answers discovery. It never replays a
+failed tool call. If a selected server remains unavailable, AgentZoo omits it
+for that activation and emits a prominent MCP-unavailable activity event.
+AgentZoo prefixes every server's tool names as `mcp_<server>_` before
+composition, then records MCP calls through the same correlated tool lifecycle
+events as built-in tools.
 
-Tool schemas are part of every provider request. AgentZoo measures the resolved
-per-turn tool surface—including selected MCP tools—before history trimming and
-reserves it together with the system prompt and configured output allowance.
-Large MCP servers therefore intentionally leave less room for conversation
-history; they are capability, trust, and context-window decisions, not free
-configuration.
+Tool schemas are part of each provider request. AgentZoo measures the resolved
+per-turn tool surface—including MCP servers requested during the current
+activation—before history trimming and reserves it together with the system
+prompt and configured output allowance. Unrequested MCP schemas do not consume
+that context budget. The three small MCP discovery and resource builtins are
+present for agents assigned MCP servers.
 
-The current Vibes MCP adapter returns textual MCP content to the model. Do not
-use MCP in this version when a workflow requires preservation of structured or
-image-only MCP tool results.
+MCP tool results are returned as text, and resource reads as JSON containing
+text or base64 resource content. These results are not passed as native
+multimodal content; do not rely on MCP for workflows that require native image
+or other structured-content handling.
 
 ## Interactive terminals
 

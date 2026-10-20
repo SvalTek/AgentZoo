@@ -155,6 +155,7 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
     await Deno.readTextFile(
       new URL("../../../agent-zoo.example.yaml", import.meta.url),
     ),
+    () => "example-key",
   );
   assert(!forbidden.test(Object.values(example.templates).join("\n")));
 
@@ -166,6 +167,10 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
   );
   assert(shellPrompt && !/@agent(?:\W|$)/i.test(shellPrompt));
   assert(shellPrompt.includes('PS1="\\\\u@localhost:'));
+  assert(
+    containerfile.includes("/opt/runtime/rootfs-template/run"),
+    "the unbooted agent rootfs must provide /run for Debian runtime state",
+  );
   assert(!/agent[ -]?zoo/i.test(new DockerRuntimeManager("shared").hostName));
 });
 
@@ -1287,12 +1292,20 @@ Deno.test("AgentZoo system prompt renders enabled feature guidance from Context"
   try {
     const promptWithFeatures = await buildAgentSystemPrompt(
       ["shell", "filesystem"],
-      { shellEnvironment: "You are logged into the shell as root." },
+      {
+        shellEnvironment: "You are logged into the shell as root.",
+        mcpTools:
+          "## MCP tools\n\n- `docs`: Look up documentation.\n\nCall `list_tools` with an MCP server name when you want to use that server. Call `list_resources` and `read_resource` to access MCP resources.",
+      },
     );
     assert(promptWithFeatures.includes("## Shell"));
     assert(promptWithFeatures.includes("logged into the shell as root"));
     assert(promptWithFeatures.includes("## Filesystem tools"));
     assert(promptWithFeatures.includes("Use apply_patch for related changes"));
+    assert(promptWithFeatures.includes("## MCP tools"));
+    assert(promptWithFeatures.includes("`docs`: Look up documentation."));
+    assert(promptWithFeatures.includes("Call `list_tools`"));
+    assert(promptWithFeatures.includes("`list_resources`"));
   } finally {
     Context.delete("features");
   }
@@ -1385,19 +1398,26 @@ Deno.test("AgentZoo system stays in history for taskless startup and idle wake i
   const secondPrompt = requests[1].prompt as Array<Record<string, unknown>>;
   assertEquals(
     firstPrompt.filter((message) => message.role === "system").length,
-    2,
+    1,
   );
-  assertEquals(firstPrompt.some((message) => message.role === "user"), false);
+  assertEquals(firstPrompt.map((message) => message.role), [
+    "system",
+    "user",
+  ]);
+  assertEquals(
+    firstPrompt.at(-1)?.content,
+    [{ type: "text", text: "Begin." }],
+  );
   assert(JSON.stringify(firstPrompt).includes("## Environment"));
   assert(JSON.stringify(firstPrompt).includes("Configured guidance."));
   assertEquals(
-    secondPrompt.filter((message) => message.role === "system").length,
-    3,
+    secondPrompt.map((message) => message.role),
+    ["system", "user", "assistant"],
   );
-  assertEquals(secondPrompt.some((message) => message.role === "user"), false);
   assert(JSON.stringify(secondPrompt).includes("## Environment"));
+  assert(JSON.stringify(secondPrompt).includes("Configured guidance."));
   assert(
-    JSON.stringify(secondPrompt.at(-1)).includes(
+    JSON.stringify(secondPrompt[0]).includes(
       "Automated activity update: You have been idle for 17 minutes.",
     ),
   );
@@ -1405,15 +1425,15 @@ Deno.test("AgentZoo system stays in history for taskless startup and idle wake i
     Record<string, unknown>
   >;
   assertEquals(loggedRequests[1].promptMode, "delta");
-  assertEquals(loggedRequests[1].systemMode, "omitted-after-initial");
-  assertEquals(secondLoggedPrompt.length, 1);
+  assertEquals(loggedRequests[1].systemMode, "full");
+  assertEquals(secondLoggedPrompt.length, 3);
   assertEquals(secondLoggedPrompt[0].role, "system");
   assert(
     JSON.stringify(secondLoggedPrompt).includes(
       "Automated activity update: You have been idle for 17 minutes.",
     ),
   );
-  assert(!JSON.stringify(secondLoggedPrompt).includes("## Environment"));
+  assert(JSON.stringify(secondLoggedPrompt).includes("## Environment"));
 
   const promptedAgent = new ZooAgent(
     { id: "beta", model: "local" },
@@ -1511,16 +1531,19 @@ Deno.test("malformed provider tool calls add a system correction on retry", asyn
 
   assertEquals(providerPrompts.length, 2);
   assertEquals(providerPrompts[0], prompt);
-  assertEquals(providerPrompts[1].length, prompt.length + 1);
-  const repairedSystem = providerPrompts[1].at(-1) as Record<string, unknown>;
+  // Providers reject multiple system messages, so the correction is merged
+  // into the leading system message instead of appended as a second one.
+  assertEquals(providerPrompts[1].length, prompt.length);
+  const repairedSystem = providerPrompts[1][0] as Record<string, unknown>;
   assertEquals(repairedSystem.role, "system");
+  assert(String(repairedSystem.content).includes("Base system context."));
   assert(String(repairedSystem.content).includes("tool call was malformed"));
-  assertEquals(providerPrompts[1][0], prompt[0]);
+  assertEquals(providerPrompts[1][1], prompt[1]);
   assertEquals(
     providerPrompts[1].filter((message) =>
       (message as Record<string, unknown>).role === "system"
     ).length,
-    2,
+    1,
   );
   assertEquals(events.map((event) => event.kind), [
     "request",
@@ -1528,10 +1551,11 @@ Deno.test("malformed provider tool calls add a system correction on retry", asyn
     "request",
     "response",
   ]);
-  assertEquals(events[2].request?.systemMode, "omitted-after-initial");
+  // The correction changes the system message, so the retry must resend it.
+  assertEquals(events[2].request?.systemMode, "full");
   assertEquals(
     (events[2].request?.prompt as unknown[]).length,
-    1,
+    2,
   );
   assert(
     JSON.stringify(events[2].request?.prompt).includes(

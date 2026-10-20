@@ -72,7 +72,7 @@ Deno.test({
           "/bin/bash",
           "--login",
           "-c",
-          "echo alpha > /tmp/private; echo handoff > /shared/handoff",
+          "test -d /run && touch /run/adduser; echo alpha > /tmp/private; echo handoff > /shared/handoff",
         ],
       );
       const betaResult = await beta.exec(
@@ -757,6 +757,104 @@ Deno.test({
         "! command -v jq && test ! -e /usr/bin/jq && test ! -e /dev/shm/alpha-only",
       ]);
       assertEquals(isolated.exitCode, 0, JSON.stringify(isolated));
+    } finally {
+      await runtime.purge();
+      await Deno.remove(shared, { recursive: true });
+    }
+  },
+});
+
+/**
+ * Drives `chroot-exec` from a real pty the way `docker exec -t` does: the
+ * harness process is a session leader whose pty is the controlling terminal.
+ */
+const interactivePtyProbe = `
+import os, pty, select, sys, time
+
+agent = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("runtime-host", [
+        "runtime-host", "chroot-exec", agent,
+        "--command-id", "8d1f2c8e-0000-4000-8000-000000000000",
+        "--cwd", "/", "--", "/bin/bash",
+    ])
+
+def drain(seconds):
+    out = b""
+    while True:
+        ready, _, _ = select.select([fd], [], [], seconds)
+        if not ready:
+            return out
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            return out
+        if not chunk:
+            return out
+        out += chunk
+
+def send(data, seconds=0.6):
+    os.write(fd, data)
+    time.sleep(seconds)
+    return drain(0.05)
+
+output = drain(1.5)
+output += send(b"tty\\n")
+output += send(b"exec 9<>/dev/tty && echo DEVTTY ok\\n")
+output += send(b"python3 -c 'import sys,time;print(12345,flush=True);time.sleep(300)'\\n")
+deadline = time.time() + 10
+while b"12345" not in output and time.time() < deadline:
+    output += drain(0.1)
+output += send(b"\\x03")
+output += send(b"echo RC=$?\\n")
+output += send(b"exit\\n")
+output += drain(0.5)
+sys.stdout.write(output.decode("utf-8", "replace"))
+`;
+
+Deno.test({
+  name: "Docker agent attach keeps the caller's controlling terminal",
+  ignore: !dockerIntegrationEnabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const shared = await Deno.makeTempDir({
+      prefix: "agent-zoo-attach-test-",
+    });
+    const runtime = new DockerRuntimeManager(
+      shared,
+      "agent-runtime:test",
+      `agent-runtime-attach-test-${crypto.randomUUID()}`,
+    );
+    try {
+      const alpha = await runtime.createEnv("attach-alpha");
+      assertEquals(alpha.agentId, "attach-alpha");
+      const probe = new Deno.Command("docker.exe", {
+        args: [
+          "exec",
+          "--interactive",
+          runtime.hostName,
+          "python3",
+          "-",
+          "attach-alpha",
+        ],
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+      const writer = probe.stdin.getWriter();
+      await writer.write(new TextEncoder().encode(interactivePtyProbe));
+      await writer.close();
+      const result = await probe.output();
+      const output = new TextDecoder().decode(result.stdout) +
+        new TextDecoder().decode(result.stderr);
+      assertEquals(result.code, 0, output);
+      assert(output.includes("/dev/pts/"), output);
+      assert(output.includes("DEVTTY ok"), output);
+      // 130 proves the tty delivered SIGINT to the foreground job, which in
+      // turn requires the shell to own the terminal and job control.
+      assert(output.includes("RC=130"), output);
     } finally {
       await runtime.purge();
       await Deno.remove(shared, { recursive: true });

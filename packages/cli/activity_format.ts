@@ -325,6 +325,25 @@ function toolInputLines(toolName: string, value: unknown): string[] {
 }
 
 function toolResultLines(toolName: string, value: unknown): string[] {
+  if (toolName === "skills_list") {
+    const skills = parseArray(value);
+    if (!skills) return labelledLines("result", value);
+    return skills.length
+      ? [
+        `result: ${skills.length} skill${skills.length === 1 ? "" : "s"}`,
+        ...skills.map((skill) => {
+          const item = asRecord(skill);
+          const name = typeof item?.name === "string" ? item.name : "(unnamed)";
+          const description = typeof item?.description === "string"
+            ? item.description
+            : "";
+          return description
+            ? `skill: ${name} — ${description}`
+            : `skill: ${name}`;
+        }),
+      ]
+      : ["skills: (none)"];
+  }
   const result = parseResult(value);
   if (!result) return labelledLines("result", value);
   if (toolName === "shell") {
@@ -515,6 +534,17 @@ function parseResult(value: unknown): Record<string, unknown> | undefined {
   return asRecord(value);
 }
 
+function parseArray(value: unknown): unknown[] | undefined {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function actorLabel(event: ZooActivityEvent): string {
   return event.agentName
     ? `${event.agentName}${event.agentId ? ` (${event.agentId})` : ""}`
@@ -533,19 +563,50 @@ function labelledLines(label: string, value: unknown): string[] {
   ];
 }
 
-function formatError(value: unknown): string {
-  if (value instanceof Error) {
-    return value.message ? `${value.name}: ${value.message}` : value.name;
+function formatError(value: unknown, depth = 0): string {
+  if (depth > 4) return "[nested error details omitted]";
+  const error = value instanceof Error
+    ? value as Error & Record<string, unknown>
+    : asRecord(value);
+  if (!error) {
+    return value === undefined ? "Details unavailable." : String(value);
   }
-  const error = asRecord(value);
-  if (error && typeof error.message === "string") {
-    return typeof error.name === "string"
-      ? `${error.name}: ${error.message}`
-      : error.message;
+  const name = typeof error.name === "string" ? error.name : undefined;
+  const message = typeof error.message === "string" ? error.message : undefined;
+  if (!name && !message) return "Details unavailable.";
+
+  const lines = [name && message ? `${name}: ${message}` : name ?? message!];
+  if (error.statusCode !== undefined) {
+    lines.push(`status: ${String(error.statusCode)}`);
   }
-  return value === undefined || (error && !error.name && !error.message)
-    ? "Details unavailable."
-    : String(value);
+  if (typeof error.url === "string") lines.push(`url: ${error.url}`);
+  if (typeof error.responseBody === "string") {
+    lines.push(`response: ${truncateErrorText(error.responseBody)}`);
+  }
+  if (typeof error.data === "string") {
+    lines.push(`data: ${truncateErrorText(error.data)}`);
+  }
+  if (error.isRetryable !== undefined) {
+    lines.push(`retryable: ${String(error.isRetryable)}`);
+  }
+  if (error.cause !== undefined) {
+    lines.push(`cause: ${formatError(error.cause, depth + 1)}`);
+  }
+  if (error.lastError !== undefined) {
+    lines.push(`last error: ${formatError(error.lastError, depth + 1)}`);
+  }
+  if (Array.isArray(error.errors)) {
+    error.errors.forEach((nested, index) => {
+      lines.push(`attempt ${index + 1}: ${formatError(nested, depth + 1)}`);
+    });
+  }
+  return lines.join("\n");
+}
+
+function truncateErrorText(value: string, limit = 8_192): string {
+  return value.length <= limit
+    ? value
+    : `${value.slice(0, limit)}… [truncated]`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

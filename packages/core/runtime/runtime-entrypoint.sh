@@ -30,7 +30,12 @@ mount_agent_dev() {
   mknod -m 666 "$dev/tty" c 5 0
   mkdir -m 755 "$dev/pts"
   mkdir -m 1777 "$dev/shm"
-  mount -t devpts -o nosuid,noexec,newinstance,ptmxmode=0666,mode=0620,gid=5 devpts "$dev/pts"
+  # Share the runtime container's devpts instance instead of creating a
+  # private one: the pty an interactive caller is attached to belongs to that
+  # instance, and only there does /dev/pts/<n> resolve to the same device.
+  # A private instance makes ttyname(), `tty`, and ps(1)'s TTY column fail
+  # inside the chroot even when the controlling terminal is set correctly.
+  mount --bind /dev/pts "$dev/pts"
   ln -s pts/ptmx "$dev/ptmx"
   mount -t tmpfs -o nosuid,nodev,mode=1777,size=64m tmpfs "$dev/shm"
   ln -s /proc/self/fd "$dev/fd"
@@ -163,12 +168,30 @@ if [[ "${1:-}" == "chroot-exec-private" ]]; then
   [[ -n "$command_id" ]] || { echo "command id required" >&2; exit 2; }
   # The directory change happens after chroot, so it is evaluated in the
   # private merged root rather than against the runtime host filesystem.
+  run_command=(
+    chroot "${root}/merged" /bin/bash -c 'cd -- "$1" && shift && exec "$@"'
+    bash "$cwd" "$@"
+  )
+  # Interactive callers arrive on the pty allocated by `docker exec -t`.
+  # Starting the shell in a new session there would leave it without a
+  # controlling terminal, so job control, ttyname(), `tty`, and /dev/tty all
+  # fail even though fds 0-2 are still the pty; adopt the terminal in the new
+  # session instead. The launcher is replaced rather than backgrounded
+  # because an asynchronous command in a non-interactive shell inherits
+  # SIGINT/SIGQUIT as ignored, which survives exec and makes Ctrl-C dead in
+  # the attached shell.
+  if [[ -t 0 ]]; then
+    exec setsid --ctty env --default-signal=INT --default-signal=QUIT \
+      "${run_command[@]}"
+  fi
   mkdir -p "${root}/commands"
   command_file="${root}/commands/${command_id}.pid"
   # An asynchronous command in a non-interactive shell otherwise receives
   # /dev/null on stdin. Preserve Docker exec's input for write/edit tools.
   exec 3<&0
-  setsid chroot "${root}/merged" /bin/bash -c 'cd -- "$1" && shift && exec "$@"' bash "$cwd" "$@" <&3 &
+  # Piped execs have no terminal and run in their own session so cancellation
+  # can signal the whole process group.
+  setsid "${run_command[@]}" <&3 &
   command_pid="$!"
   printf '%s\n' "$command_pid" > "$command_file"
   status=0

@@ -9,6 +9,11 @@ runtime:
   backend: docker
   sharedWorkspace: .shared
 
+# Host-side, project-relative Markdown skills. Agents with the `skills` feature
+# can discover their names and load full instructions only when needed.
+skills:
+  directory: agentzoo_skills
+
 completion:
   # When false, agents keep cycling until AgentZoo is stopped externally.
   enabled: true
@@ -74,6 +79,21 @@ models:
       # topK is not supported by the current Ollama
       minP: 0.05
 
+  local-kobold:
+    provider: openai-compatible
+    baseUrl: http://127.0.0.1:5001/v1/
+    apiKey: ENV[KOBOLDCPP_API_KEY]
+    model: local
+    reasoning: true
+    reasoningEffort: high
+    context:
+      window: 16384
+      maxOutputTokens: 5120
+    sampling:
+      temperature: 0.9
+      topP: 0.9
+      minP: 0.05
+
   local-moondream:
     provider: ollama
     model: moondream:latest
@@ -85,7 +105,7 @@ templates:
     {#ELSE}
     You are {agent}.
     {#END}
-    This is your computer. You can use or modify it freely, including installing software and tools.
+    You are a developer and this is your computer. You can use or modify it freely, including installing software and tools.
     How you spend your time is up to you.
   research-system: |
     {#IF name}
@@ -93,7 +113,7 @@ templates:
     {#ELSE}
     You are {agent}.
     {#END}
-    This is your computer. You can use or modify it freely, including installing software and tools.
+    You are a researcher and this is your computer. You can use or modify it freely, including installing software and tools.
     How you spend your time is up to you.
 
 agents:
@@ -102,9 +122,9 @@ agents:
     names:
       - Alice
       - Bob
-    model: local-ornith
+    model: local-kobold
     # model: local-gemma
-    # captioningModel: local-moondream
+    captioningModel: local-moondream
     # Optional: dedicated vision model for image captioning.
     # When set, view_image delegates to this model instead of the agent's
     # own model. Required for non-vision models. For Ollama, the agent's
@@ -117,8 +137,8 @@ agents:
     sampling:
       temperature: 0.6
     # Add vision to let the agent view image files via view_image.
-    features: [shell, filesystem, vision]
-    # Its model-visible MCP tools are named mcp_context7_<tool>.
+    features: [shell, filesystem, vision, terminal, skills]
+    # Use list_tools, list_resources and read_resource for context7 MCP access.
     mcp: [context7]
     #prompt: Inspect your environment and report what is present, then yield.
 
@@ -128,15 +148,15 @@ agents:
     # per-member names; names determines the population size instead of count.
     name: Rowan
     count: 1
-    model: local-ornith
+    model: local-kobold
     # model: local-gemma
-    # captioningModel: local-moondream
+    captioningModel: local-moondream
     system: research-system
     maxTurns: 100
     sampling:
       temperature: 0.8
     # Add http to expose the structured http_request convenience tool.
-    features: [shell, filesystem, vision]
+    features: [shell, filesystem, vision, terminal, skills]
     mcp: [browser]
     #prompt: Inspect your environment and report what is present, then yield.
 
@@ -148,11 +168,13 @@ services: []
 # current library documentation, complementing AgentZoo's local tools.
 mcp:
   - name: context7
+    description: Look up current documentation and examples for software libraries.
     type: stdio
     command: npx
     args: ["-y", "@upstash/context7-mcp@4.0.3"]
 
   - name: browser
+    description: It's a real browser, You can use it to browse and interact with the Internet.
     type: http
     url: "http://127.0.0.1:9010/mcp"
 

@@ -21,6 +21,7 @@ import { VisionFeature } from "./tools/ViewImageTool.ts";
 import { HttpFeature } from "./tools/HttpRequestTool.ts";
 import { TerminalFeature } from "./tools/TerminalTool.ts";
 import { FeatureRegistry } from "./Feature.ts";
+import { SkillsFeature } from "./SkillsFeature.ts";
 import {
   createCompletionTool,
   createYieldTool,
@@ -112,6 +113,9 @@ export async function buildAgentZoo(
     featureRegistry.register(new VisionFeature());
     featureRegistry.register(new HttpFeature());
     featureRegistry.register(new TerminalFeature());
+    featureRegistry.register(
+      new SkillsFeature(resolve(baseDir, config.skills.directory)),
+    );
     Context.set("features", featureRegistry);
     const initialPrompts: Record<string, string | undefined> = {};
     const builtAgents: ZooAgent[] = [];
@@ -360,8 +364,9 @@ export function composeInitialPrompt(
   return parts.length ? parts.join("\n") : undefined;
 }
 
-interface PopulationMember {
+export interface PopulationMember {
   id: string;
+  semanticId: string;
   name?: string;
   type: string;
   model: string;
@@ -377,7 +382,7 @@ interface PopulationMember {
   sampling?: ModelRuntimeConfig["sampling"];
 }
 
-async function expandPopulation(
+export async function expandPopulation(
   config: ZooConfig,
 ): Promise<PopulationMember[]> {
   const members: PopulationMember[] = [];
@@ -393,6 +398,7 @@ async function expandPopulation(
       ids.add(id);
       members.push({
         id,
+        semanticId,
         name: group.names?.[offset - 1] ?? group.name,
         type: group.type,
         model: group.model,

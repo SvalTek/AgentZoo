@@ -93,12 +93,17 @@ const RuntimeConfigSchema = z.object({
   sharedWorkspace: NonEmptyString.default(".shared"),
 });
 
+const SkillsConfigSchema = z.object({
+  directory: NonEmptyString.default(".agentzoo_skills"),
+}).default({ directory: ".agentzoo_skills" });
+
 const MCPServerName = Identifier;
 const MCPSelection = z.union([z.literal("*"), MCPServerName]);
 
 export const MCPServerConfigSchema = z.discriminatedUnion("type", [
   z.object({
     name: MCPServerName,
+    description: NonEmptyString,
     type: z.literal("stdio"),
     command: NonEmptyString,
     args: z.array(z.string()).default([]),
@@ -106,6 +111,7 @@ export const MCPServerConfigSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     name: MCPServerName,
+    description: NonEmptyString,
     type: z.literal("http"),
     url: NonEmptyString.url(),
     headers: z.record(z.string(), z.string()).optional(),
@@ -207,6 +213,7 @@ export const ZooConfigSchema = z.object({
   templates: z.record(NonEmptyString, z.string()).default({}),
   tools: z.record(ToolName, ShellToolConfigSchema).default({}),
   mcp: z.array(MCPServerConfigSchema).default([]),
+  skills: SkillsConfigSchema,
   runtime: RuntimeConfigSchema.default({
     backend: "docker",
     sharedWorkspace: ".shared",
