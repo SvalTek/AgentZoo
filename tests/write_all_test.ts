@@ -20,4 +20,11 @@ Deno.test("writeAll rejects a stream that accepts no bytes", () => {
     Error,
     "accepted no bytes",
   );
+  // A stream that collects bytes without returning a count must not be read
+  // as progress: `undefined <= 0` is false and would skip the tail.
+  assertThrows(
+    () => writeAll({ writeSync: () => undefined as unknown as number }, bytes),
+    Error,
+    "accepted no bytes",
+  );
 });

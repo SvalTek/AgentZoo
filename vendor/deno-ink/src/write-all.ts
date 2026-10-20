@@ -15,7 +15,7 @@ export function writeAll(
   let offset = 0;
   while (offset < bytes.length) {
     const written = stream.writeSync(bytes.subarray(offset));
-    if (written <= 0) {
+    if (!Number.isInteger(written) || written <= 0) {
       throw new Error(
         `Terminal stream accepted no bytes: ${
           bytes.length - offset

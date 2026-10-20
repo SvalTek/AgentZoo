@@ -17,9 +17,10 @@ const { Ink } = await import(
 ) as unknown as {
   Ink: { prototype: InkInternals };
 };
-const { wrapText } = await import(
+const { truncateText, wrapText } = await import(
   "../../vendor/deno-ink/src/output.ts"
 ) as unknown as {
+  truncateText(text: string, maxWidth: number): string;
   wrapText(text: string, width: number): string;
 };
 const { applyStyles } = await import(
@@ -71,7 +72,10 @@ ink.rebuildYogaTree = function (node, parentYogaNode): void {
           ? Math.floor(availableWidth)
           : width,
         height: truncating
-          ? text.split("\n").length
+          // Measure the string the renderer will actually paint: its
+          // truncation counts the whole text (newlines included) against the
+          // width, so a multi-line value can collapse to one row.
+          ? truncateText(text, renderedWidth).split("\n").length
           : wrapText(text, renderedWidth).split("\n").length,
       };
     });

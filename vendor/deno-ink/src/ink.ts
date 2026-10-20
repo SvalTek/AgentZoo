@@ -232,8 +232,8 @@ export class Ink {
     if (this.options.patchConsole && !this.inCI) {
       const encoder = new TextEncoder();
       this.patchedConsole = patchConsole(
-        (data) => this.options.stdout.writeSync(encoder.encode(data)),
-        (data) => this.options.stderr.writeSync(encoder.encode(data))
+        (data) => writeAll(this.options.stdout, encoder.encode(data)),
+        (data) => writeAll(this.options.stderr, encoder.encode(data))
       );
     }
   }
@@ -592,14 +592,14 @@ export class Ink {
     const stdoutContext: StdoutContextValue = {
       stdout: this.options.stdout,
       write: (data: string) => {
-        this.options.stdout.writeSync(Ink.textEncoder.encode(data));
+        writeAll(this.options.stdout, Ink.textEncoder.encode(data));
       },
     };
 
     const stderrContext: StderrContextValue = {
       stderr: this.options.stderr,
       write: (data: string) => {
-        this.options.stderr.writeSync(Ink.textEncoder.encode(data));
+        writeAll(this.options.stderr, Ink.textEncoder.encode(data));
       },
     };
 
