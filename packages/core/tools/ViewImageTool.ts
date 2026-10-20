@@ -29,6 +29,7 @@ import {
   observedToolResult,
   ToolExecutionError,
 } from "../ToolSupport.ts";
+import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
 
 const ReadImageParameters = z.object({
   path: z.string().optional().describe(
@@ -108,7 +109,8 @@ function detectImageMime(bytes: Uint8Array): string | undefined {
  */
 export class VisionFeature implements Feature<AgentRunDeps> {
   readonly id = "vision";
-  readonly description = "View an image file from the computer.";
+  readonly description =
+    "View an image file from the computer. Accepts PNG, JPEG, GIF, WebP, BMP, or JPEG 2000 up to 209715200 bytes. Returns the image itself, or a text description when a captioning model is configured.";
 
   async createTools(): Promise<readonly ToolDefinition<AgentRunDeps>[]> {
     return [await this.createTool()];
@@ -123,7 +125,7 @@ export class VisionFeature implements Feature<AgentRunDeps> {
       argsValidator: validateViewImageArguments,
       execute: async (context, input) => {
         const path = input.path!;
-        const cwd = input.cwd ?? context.deps.cwd;
+        const cwd = resolveRuntimeDirectory(context.deps.cwd, input.cwd);
         const raw = await execute(context.deps, [
           "/bin/bash",
           "-c",

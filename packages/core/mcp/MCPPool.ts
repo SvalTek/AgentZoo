@@ -200,6 +200,9 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
       if (initialError instanceof MCPResourceUnsupportedError) {
         throw initialError;
       }
+      // A JSON-RPC error means the server answered: the transport is healthy,
+      // and reconnecting would only repeat the same request.
+      if (isServerResponseError(initialError)) throw initialError;
       if (!wasReady) {
         await this.reset().catch(() => undefined);
         throw new MCPServerUnavailableError(this.#name, initialError);
@@ -213,6 +216,7 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
         if (recoveryError instanceof MCPResourceUnsupportedError) {
           throw recoveryError;
         }
+        if (isServerResponseError(recoveryError)) throw recoveryError;
         throw new MCPServerUnavailableError(
           this.#name,
           initialError,
@@ -256,6 +260,14 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
 
 export function mcpToolPrefix(serverName: string): string {
   return `mcp_${serverName.replaceAll("-", "_")}_`;
+}
+
+/**
+ * A JSON-RPC error (numeric `code`) is a server response, not a transport
+ * failure: the connection worked and the request itself was rejected.
+ */
+export function isServerResponseError(error: unknown): boolean {
+  return typeof (error as { code?: unknown } | null)?.code === "number";
 }
 
 export function substituteSharedPathTokens(

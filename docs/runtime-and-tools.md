@@ -61,7 +61,10 @@ when a previously healthy server no longer answers discovery. It never replays a
 failed tool call. If a selected server remains unavailable, AgentZoo omits it
 for that activation and emits a prominent MCP-unavailable activity event.
 AgentZoo prefixes every server's tool names as `mcp_<server>_` before
-composition, then records MCP calls through the same correlated tool lifecycle
+composition and normalizes the tool part to provider-safe `[A-Za-z0-9_-]`
+characters, truncated to 64 characters, so one unusual MCP tool name cannot
+reject a whole request. `list_tools` reports those exact names and their input
+schemas. MCP calls are recorded through the same correlated tool lifecycle
 events as built-in tools.
 
 Tool schemas are part of each provider request. AgentZoo measures the resolved
@@ -88,9 +91,14 @@ The feature exposes `terminal_create`, `terminal_list`, `terminal_read`,
 Sessions persist across model turns, activations, yields, and idle periods; an
 agent may stop them explicitly, and runtime teardown stops all of them.
 
-`terminal_read` returns a bounded plain-text tmux capture. Interactive programs
-therefore receive a real terminal while AgentZoo renders only inert text in its
-own TUI. Use `terminal_send` for literal text (optionally followed by Enter) and
+`terminal_read` returns a bounded plain-text tmux capture, capped at 65,536
+characters and keeping the most recent content. It reports whether the
+terminal's program is still alive and its exit code once it has finished; the
+pane survives a program that exits so its final screen stays readable.
+`historyLimit` (default 50,000) sets the retained scrollback for the session and
+is applied before the pane is created. Interactive programs therefore receive a
+real terminal while AgentZoo renders only inert text in its own TUI. Use
+`terminal_send` for literal text (optionally followed by Enter) and
 `terminal_keys` for symbolic keys such as `Up`, `Escape`, or `C-c`.
 
 ## Lifecycle tools
@@ -109,8 +117,8 @@ system-role message containing
 Description: `Signal that you have nothing else to do.`
 
 Available only when completion is enabled. Its population-level agreement
-semantics remain internal to the runner. An optional `reason` parameter can
-briefly explain why no further action is needed.
+semantics remain internal to the runner. An optional `reason` briefly explains
+why no further action is needed and is recorded as the activation output.
 
 ## `shell` feature
 
@@ -128,15 +136,25 @@ are:
 - `cwd` — optional directory path only; defaults to the agent's configured cwd.
   Commands, operators, and redirects belong in `command`, not `cwd`.
 - `timeoutMs` — optional positive timeout, capped at 1,800,000 ms. The default
-  is 120,000 ms. On timeout, the runtime terminates the command and its
-  descendant process group before returning control. A pipeline or package
-  installation does not continue secretly after a timed-out result. Unrelated
-  background processes started by an earlier completed command are not
+  is 120,000 ms. Package-manager commands (apt, dpkg, npm, yarn, pnpm, pip,
+  brew) require at least 300,000 ms. On timeout, the runtime terminates the
+  command and its descendant process group before returning control. A pipeline
+  or package installation does not continue secretly after a timed-out result.
+  Unrelated background processes started by an earlier completed command are not
   terminated.
 
-Model-visible stdout and stderr are each bounded to 65,536 characters and report
-whether truncation occurred. Durable telemetry retains the complete available
-runtime result.
+Model-visible stdout and stderr are each bounded to 65,536 characters, keeping
+the first 65,536 characters, and report whether truncation occurred. `exitCode`
+does not describe a command failure when `timedOut` or `aborted` is true. Durable
+telemetry retains the complete available runtime result.
+
+The feature also exposes `start_background`, `get_background`, `send_background`,
+and `stop_background`, which manage named long-running processes in tmux
+sessions. A background session keeps its pane after the command exits, so
+`get_background` still returns the captured output and the exit status
+(`alive: false`). Its output is capped at 65,536 characters, keeping the most
+recent content, and `last` selects trailing lines. A missing name returns
+`status: "not_found"`.
 
 When a tool can identify a specific input or operation failure, its error also
 states the smallest safe correction. Provider-facing schemas describe each
@@ -156,9 +174,10 @@ execution boundary as `shell`.
 ### `read_file`
 
 Reads UTF-8 text from `path`. `offset` defaults to 0 and `limit` defaults to
-65,536 bytes, with a maximum of 262,144. The result reports file size, bytes
-read, truncation, and `nextOffset` when more data remains. Binary/non-UTF-8
-content produces a neutral error.
+65,536 bytes, with a maximum of 262,144. `offset`, `limit`, and `nextOffset` are
+byte positions; pass `nextOffset` back as `offset` to continue. The result
+reports file size, bytes read, and truncation. Binary/non-UTF-8 content and a
+file that cannot be read produce a neutral error naming the cause.
 
 ### `write_file`
 
@@ -166,9 +185,10 @@ Writes the multiline `content` string to `path`. Normal line breaks are accepted
 directly. With no `mode`, it uses `create`: a new file is created, but an
 existing path is never replaced. Use `mode: append` to add content. Replacing an
 entire existing file is deliberately explicit and requires both
-`mode: overwrite` and `force: true`. Missing parent directories are not created
-automatically. For a small exact change to an existing file, prefer `edit_file`;
-for larger or multi-region changes, prefer `apply_patch`.
+`mode: overwrite` and `force: true`. The result reports `bytesWritten` for this
+call and `sizeBytes` for the file afterwards. Missing parent directories are not
+created automatically. For a small exact change to an existing file, prefer
+`edit_file`; for larger or multi-region changes, prefer `apply_patch`.
 
 ### `edit_file`
 
@@ -176,20 +196,29 @@ Replaces the exact `oldText` with `newText`. Both accept normal multiline text;
 an empty `newText` deletes the match. `oldText` and `newText` are each limited
 to 8,192 characters. By default there must be exactly one match. Zero matches
 and ambiguous multiple matches fail. Set `replaceAll: true` to replace every
-exact match. Files larger than 4 MiB and binary files are rejected.
+exact match. Matching and replacement use the file's own line-ending convention,
+so LF text edits a CRLF file without mixing endings. Files larger than 4 MiB and
+binary files are rejected.
 
 ### `apply_patch`
 
 Applies the multiline `patch` string as a unified diff using `git apply`. Paths
 are resolved from the optional `cwd`, or the agent's configured working
 directory when omitted. Inside a Git worktree it uses normal repository-aware
-`git apply`; elsewhere it falls back to `git apply --no-index`. The patch is
-checked before it is applied and the result summarizes changed files.
+`git apply`; elsewhere it falls back to `git apply --no-index`. Hunk line counts
+must be exact; a hunk may begin or end with a changed line, so trailing context
+is not required. Hunk lines are rewritten to the target file's line ending, so
+an LF patch edits a CRLF file without mixing endings. The patch is checked
+before it is applied; parse errors, missing files, and context mismatches are
+reported separately with the patching tool's own diagnostic, and the result
+summarizes changed files relative to `cwd`.
 
 ### `list_directory`
 
 Lists only immediate entries in `path`, or the configured cwd when omitted.
-Results include name, type, and size. It does not recurse.
+Results include name, type, and size. It does not recurse. A symlinked directory
+is followed when `path` itself is the link; an entry's `sizeBytes` is the link
+target path length for a symlink.
 
 ### `search_files`
 
@@ -201,7 +230,9 @@ are:
 
 With neither filter, `name` defaults to `*` for bounded recursive discovery.
 `maxResults` defaults to 50 and is capped at 200. Text results include paths,
-line numbers, and bounded snippets. The result reports truncation.
+line numbers, and bounded snippets, and text search reads symlinked files. Paths
+are reported as the search resolved them beneath `path`. The result reports
+truncation.
 
 ## Optional `http` feature
 
@@ -214,8 +245,11 @@ features: [shell, filesystem, http]
 It exposes `http_request`, a raw HTTP/HTTPS request tool. Inputs include URL,
 method, headers, and body. It follows at most five redirects and enforces a
 120-second request limit. The model receives selected response headers and at
-most 65,536 bytes of body content, with truncation indicated. Durable telemetry
-retains up to 1 MiB of response body.
+most 65,536 bytes of body content: `bodyBytes` counts captured response bytes
+(up to 1 MiB), `bodyBytesReturned` counts the bytes included, `truncated`
+reports that the returned body is incomplete, and `captureTruncated` reports
+that the response exceeded the capture limit. Durable telemetry retains up to
+1 MiB of response body.
 
 The feature does not add search, browser automation, or research behavior.
 
@@ -233,7 +267,8 @@ current working directory; an optional `cwd` sets the directory the path is
 resolved from and defaults to the current working directory. The complete image
 is read and returned to the model. The image type is detected from the file's
 magic bytes (PNG, JPEG, GIF, WebP, BMP, and JPEG 2000); a file that is not a
-recognized image produces an error.
+recognized image produces an error, as does an image larger than 209,715,200
+bytes.
 
 When the agent configures `captioningModel`, `view_image` delegates captioning
 to that model instead of the agent's own model. Otherwise it uses the agent's

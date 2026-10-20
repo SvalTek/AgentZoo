@@ -1,6 +1,11 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
-import { assertEquals, assertRejects, assertThrows } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "@std/assert";
 import {
   FilteredToolset,
   type MCPClient,
@@ -25,6 +30,7 @@ import {
   parseConfig,
   substituteSharedPathTokens,
 } from "../mod.ts";
+import { MCPNamedToolset } from "../mcp/NamedToolset.ts";
 import type { ZooActor } from "../Zoo.ts";
 import type { AgentActivationResult, AgentConfig } from "../types.ts";
 
@@ -328,6 +334,7 @@ Deno.test("list_tools loads one MCP toolset for the next model turn", async () =
   assertEquals(JSON.parse(String(result)), [{
     name: "mcp_chatroom_search",
     description: "Search the server.",
+    inputSchema: { type: "object" },
   }]);
   assertEquals(client.connects, 1);
   assertEquals((await gated.tools(context)).map((tool) => tool.name), [
@@ -507,4 +514,76 @@ Deno.test("Zoo does not pre-connect MCP servers and disconnects on shutdown", as
   zoo.registerAgent(new CompletingActor());
   await zoo.run();
   assertEquals(disconnects, 1);
+});
+
+Deno.test("MCP tool names are sanitized into provider-safe identifiers", async () => {
+  const client = new FakeMCPClient([{
+    name: "get.issue",
+    description: "Fetch one issue.",
+    inputSchema: { type: "object" },
+  }]);
+  const [server] = new MCPPool(
+    [{
+      name: "issue-tracker",
+      description: "Track issues.",
+      type: "stdio",
+      command: "tracker",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["issue-tracker"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  const listing = JSON.parse(
+    String(await createMCPListToolsTool([server]).execute(context, {
+      mcp_name: "issue-tracker",
+    } as never)),
+  ) as Array<{ name: string; inputSchema: unknown }>;
+  assertEquals(listing[0].name, "mcp_issue_tracker_get_issue");
+  assertEquals(listing[0].inputSchema, { type: "object" });
+  assertEquals(
+    (await new MCPNamedToolset(server.toolset, "issue-tracker").tools(
+      context,
+    )).map((tool) => tool.name),
+    ["mcp_issue_tracker_get_issue"],
+  );
+});
+
+Deno.test("MCP resource rejection surfaces the server error, not an outage", async () => {
+  const client = new FakeMCPClient();
+  client.readResource = () =>
+    Promise.reject(
+      Object.assign(new Error("Resource not found"), { code: -32602 }),
+    );
+  const [server] = new MCPPool(
+    [{
+      name: "chatroom",
+      description: "Talk with other agents.",
+      type: "stdio",
+      command: "chatroom",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["chatroom"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  const readResource = createMCPResourceTools([server]).find((tool) =>
+    tool.name === "read_resource"
+  )!;
+  const failure = await assertRejects(
+    () =>
+      readResource.execute(context, {
+        mcp_name: "chatroom",
+        uri: "agent-chat://missing",
+      } as never),
+    Error,
+    "rejected the resource request",
+  );
+  assert(failure.message.includes("Resource not found"));
+  assertEquals(client.connects, 1);
+  assertEquals(client.disconnects, 0);
 });

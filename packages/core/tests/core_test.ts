@@ -631,7 +631,7 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
       "5 redirects",
       "120 seconds",
       "bodyEncoding",
-      "truncation status",
+      "truncated",
     ]
   ) assert(exposed.http_request.includes(term));
 });

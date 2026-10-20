@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { AgentRunDeps } from "../Agent.ts";
 import { actionableToolError } from "../ToolSupport.ts";
 import {
+  isServerResponseError,
   MCPResourceUnsupportedError,
   type MCPServerEntry,
   MCPServerUnavailableError,
@@ -57,6 +58,13 @@ export function createMCPResourceTools(
       throw actionableToolError([
         `MCP server "${server.name}" is currently unavailable.`,
         "Try the resource request again later.",
+      ], error);
+    }
+    if (isServerResponseError(error)) {
+      throw actionableToolError([
+        `MCP server "${server.name}" rejected the resource request.`,
+        error instanceof Error ? error.message : String(error),
+        "Call list_resources to see the URIs this server publishes.",
       ], error);
     }
     throw error;

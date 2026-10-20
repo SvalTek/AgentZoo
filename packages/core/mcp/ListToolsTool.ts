@@ -7,8 +7,8 @@ import { actionableToolError } from "../ToolSupport.ts";
 import {
   type MCPServerEntry,
   MCPServerUnavailableError,
-  mcpToolPrefix,
 } from "./MCPPool.ts";
+import { mcpToolName } from "./NamedToolset.ts";
 
 const ListToolsParameters = z.object({
   mcp_name: z.string().min(1).describe(
@@ -61,8 +61,9 @@ export function createMCPListToolsTool(
       context.deps.control.enabledMcpServers.add(server.name);
 
       return JSON.stringify(tools.map((definition) => ({
-        name: `${mcpToolPrefix(server.name)}${definition.name}`,
+        name: mcpToolName(server.name, definition.name),
         description: definition.description,
+        inputSchema: definition.inputSchema ?? z.toJSONSchema(definition.parameters),
       })));
     },
   });

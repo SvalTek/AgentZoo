@@ -20,6 +20,8 @@ export interface ToolDefinition<TDeps = undefined> {
   name: string;
   description: string;
   parameters: ZodType;
+  /** Raw JSON Schema when the definition was built from one (MCP tools). */
+  inputSchema?: Record<string, unknown>;
   execute: (
     ctx: RunContext<TDeps>,
     args: z.infer<ZodType>,
@@ -185,6 +187,7 @@ export function fromSchema<TDeps = undefined>(opts: {
     name: opts.name,
     description: opts.description,
     parameters: wrappedSchema,
+    inputSchema: opts.jsonSchema,
     maxRetries: opts.maxRetries,
     execute: (ctx: RunContext<TDeps>, args: z.infer<ZodType>) =>
       opts.execute(ctx, args as Record<string, unknown>),

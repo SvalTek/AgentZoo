@@ -7,7 +7,7 @@ import type { AgentRunDeps } from "../Agent.ts";
 const NoParameters = z.object({});
 const CompletionParameters = z.object({
   reason: z.string().min(1).optional().describe(
-    "An optional brief explanation of why no further action is needed.",
+    "An optional brief explanation of why no further action is needed. It is reported as the outcome.",
   ),
 });
 
@@ -30,9 +30,10 @@ export function createCompletionTool(): ToolDefinition<AgentRunDeps> {
     description: "Signal that you have nothing else to do.",
     parameters: CompletionParameters,
     isOutput: true,
-    execute: (context) => {
+    execute: (context, parameters) => {
       context.deps.control.requested = "complete";
-      return Promise.resolve("Recorded.");
+      const { reason } = parameters as z.infer<typeof CompletionParameters>;
+      return Promise.resolve(reason?.trim() || "Recorded.");
     },
   };
 }

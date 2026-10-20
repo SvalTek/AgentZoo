@@ -4,7 +4,7 @@ import { isAbsolute, join, normalize } from "@std/path/posix";
 import { actionableToolError } from "../ToolSupport.ts";
 
 /**
- * Resolve a model-supplied directory against the agent's working directory.
+ * Resolve a model-supplied directory against the runtime working directory.
  *
  * Tool descriptions accept relative directories, but every runtime requires an
  * absolute `cwd` and rejects the rest with an internal error. Resolving here

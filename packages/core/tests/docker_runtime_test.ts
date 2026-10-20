@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { resolve } from "@std/path";
 import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
 import { FilesystemFeature } from "../tools/FilesystemTools.ts";
+import { ShellFeature } from "../tools/ShellTool.ts";
 import { VisionFeature } from "../tools/ViewImageTool.ts";
 import { HttpFeature } from "../tools/HttpRequestTool.ts";
 import { unwrapObservedToolResult } from "../ToolSupport.ts";
@@ -616,6 +617,67 @@ Deno.test({
       });
       assertEquals((searched.results as unknown[]).length, 1);
       assertEquals(searched.truncated, true);
+
+      const shellTools = new Map(
+        (await new ShellFeature().createTools()).map((tool) => [
+          tool.name,
+          tool,
+        ]),
+      );
+      const invokeShell = async (
+        env: RuntimeEnv,
+        name: string,
+        args: unknown,
+      ) => {
+        const tool = shellTools.get(name) as ToolDefinition<AgentRunDeps>;
+        const value = await tool.execute({
+          deps: {
+            agentId: env.agentId,
+            provider: "openai-compatible",
+            model: "test-model",
+            runtime: env,
+            cwd: "/root",
+            control: {},
+          },
+        } as never, args);
+        return unwrapObservedToolResult(value).result as Record<
+          string,
+          unknown
+        >;
+      };
+      await invokeShell(alpha, "start_background", {
+        name: "bg-finished",
+        command: "echo bg-output-line",
+      });
+      let background: Record<string, unknown> = {};
+      for (let attempt = 0; attempt < 100; attempt++) {
+        background = await invokeShell(alpha, "get_background", {
+          name: "bg-finished",
+        });
+        if (background.found === true && background.alive === false) break;
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 50);
+        await promise;
+      }
+      // A finished background process keeps its pane, so the output and exit
+      // status stay available instead of reading as an unknown session.
+      assertEquals(background.found, true, JSON.stringify(background));
+      assertEquals(background.alive, false, JSON.stringify(background));
+      assertEquals(background.exitCode, 0, JSON.stringify(background));
+      assert(
+        String(background.output).includes("bg-output-line"),
+        JSON.stringify(background),
+      );
+      assertEquals(
+        (await invokeShell(alpha, "stop_background", { name: "bg-finished" }))
+          .status,
+        "stopped",
+      );
+      assertEquals(
+        (await invokeShell(alpha, "get_background", { name: "bg-finished" }))
+          .found,
+        false,
+      );
 
       const visionTools = new Map(
         (await new VisionFeature().createTools()).map((tool) => [

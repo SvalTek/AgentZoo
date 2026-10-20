@@ -368,7 +368,11 @@ the selected configuration file. A directory may contain flat `name.md` files or
 `name/SKILL.md` packages. Optional YAML frontmatter supplies `name` and
 `description`; otherwise the filename or package directory supplies the name.
 The directory is read by the Zoo host, so it is a project-owned instruction
-source rather than a Docker agent-writable directory.
+source rather than a Docker agent-writable directory. `skills_list` returns
+`{ skills, problems }`: a file with invalid frontmatter or a duplicate name is
+reported under `problems` with its path, and the remaining skills stay
+available. A skill without a description is listed as
+`(no description in frontmatter)`.
 
 ### `mcp`
 

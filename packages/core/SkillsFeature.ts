@@ -43,15 +43,16 @@ the current task; do not assume an unloaded skill's contents.`);
       tool<AgentRunDeps, typeof ListSkillsParameters>({
         name: "skills_list",
         description:
-          "List available project skills with their names and descriptions. Call this before loading a skill.",
+          "List available project skills with their names and descriptions, plus any skill files that could not be read. Call this before loading a skill.",
         parameters: ListSkillsParameters,
         execute: async () => {
-          const skills = await this.discover();
-          return JSON.stringify(
-            [...skills.values()]
+          const { skills, problems } = await this.discover();
+          return JSON.stringify({
+            skills: [...skills.values()]
               .sort((left, right) => left.name.localeCompare(right.name))
               .map(({ name, description }) => ({ name, description })),
-          );
+            problems,
+          });
         },
       }),
       tool<AgentRunDeps, typeof LoadSkillParameters>({
@@ -60,10 +61,15 @@ the current task; do not assume an unloaded skill's contents.`);
           "Load the complete instructions for a project skill discovered with skills_list.",
         parameters: LoadSkillParameters,
         execute: async (_context, { name }) => {
-          const skill = (await this.discover()).get(name);
+          const { skills } = await this.discover();
+          const skill = skills.get(name);
           if (!skill) {
+            const available = [...skills.keys()].sort();
             throw actionableToolError([
               `Skill "${name}" was not found in the project skill directory.`,
+              available.length
+                ? `Available skills: ${available.join(", ")}.`
+                : "No skills are currently available.",
               "Call skills_list to see the skills currently available.",
             ]);
           }
@@ -73,12 +79,19 @@ the current task; do not assume an unloaded skill's contents.`);
     ];
   }
 
-  private async discover(): Promise<Map<string, Skill>> {
+  private async discover(): Promise<{
+    skills: Map<string, Skill>;
+    problems: Array<{ path: string; error: string }>;
+  }> {
+    const empty = {
+      skills: new Map<string, Skill>(),
+      problems: [] as Array<{ path: string; error: string }>,
+    };
     let root: string;
     try {
       root = await Deno.realPath(this.#directory);
     } catch (error) {
-      if (error instanceof Deno.errors.NotFound) return new Map();
+      if (error instanceof Deno.errors.NotFound) return empty;
       throw error;
     }
 
@@ -97,20 +110,42 @@ the current task; do not assume an unloaded skill's contents.`);
     }
 
     const skills = new Map<string, Skill>();
+    const sources = new Map<string, string>();
+    const problems: Array<{ path: string; error: string }> = [];
     for (const path of paths.sort()) {
       const canonical = await Deno.realPath(path);
       if (!isWithin(root, canonical)) continue;
       const content = await Deno.readTextFile(canonical);
-      const frontmatter = parseFrontmatter(content, canonical);
-      const name = frontmatter.name || skillName(path);
-      if (skills.has(name)) {
-        throw new Error(
-          `Project skill directory contains duplicate skill "${name}"`,
-        );
+      let frontmatter: { name: string; description: string };
+      try {
+        frontmatter = parseFrontmatter(content, canonical);
+      } catch (error) {
+        // One broken file must not hide the skills that are valid.
+        problems.push({
+          path: canonical,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
       }
-      skills.set(name, { name, description: frontmatter.description, content });
+      const name = frontmatter.name || skillName(path);
+      const previous = sources.get(name);
+      if (previous) {
+        problems.push({
+          path: canonical,
+          error:
+            `Duplicate skill "${name}" is also defined by ${previous}; rename one of them.`,
+        });
+        continue;
+      }
+      sources.set(name, canonical);
+      skills.set(name, {
+        name,
+        description: frontmatter.description ||
+          "(no description in frontmatter)",
+        content,
+      });
     }
-    return skills;
+    return { skills, problems };
   }
 }
 
