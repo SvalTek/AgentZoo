@@ -113,7 +113,9 @@ export const MCPServerConfigSchema = z.discriminatedUnion("type", [
     name: MCPServerName,
     description: NonEmptyString,
     type: z.literal("http"),
-    url: NonEmptyString.url(),
+    // Validity is checked after `${NAME}` expansion, so an endpoint supplied
+    // entirely by an environment variable never fails schema validation first.
+    url: NonEmptyString,
     headers: z.record(z.string(), z.string()).optional(),
   }),
 ]);
@@ -345,6 +347,15 @@ export function resolveConfigEnvironment(
         }
         return resolved;
       });
+    const resolveUrl = (value: string, path: string): string => {
+      const resolved = resolveValue(value, path);
+      try {
+        new URL(resolved);
+      } catch {
+        throw new ConfigValidationError([`/${path}: Invalid URL`]);
+      }
+      return resolved;
+    };
     if (server.type === "stdio") {
       return {
         ...server,
@@ -362,7 +373,7 @@ export function resolveConfigEnvironment(
     }
     return {
       ...server,
-      url: resolveValue(server.url, `mcp/${index}/url`),
+      url: resolveUrl(server.url, `mcp/${index}/url`),
       headers: server.headers && Object.fromEntries(
         Object.entries(server.headers).map(([key, value]) => [
           key,

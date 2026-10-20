@@ -1,0 +1,5 @@
+# Keep the working tree LF on every platform. Windows checkouts with
+# core.autocrlf rewrite scripts copied straight into the runtime image, where
+# `#!/usr/bin/env bash` then fails with a CRLF shebang. The TypeScript, YAML,
+# and Markdown sources are formatted for LF as well.
+* text=auto eol=lf

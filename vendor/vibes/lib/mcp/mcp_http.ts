@@ -88,22 +88,50 @@ export class MCPHttpClient implements MCPClient {
 
   async listTools(): Promise<MCPTool[]> {
     const client = this._assertConnected();
-    const result = await client.listTools();
-    return result.tools.map((t: { name: string; description?: string; inputSchema: unknown }) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema as Record<string, unknown>,
-    }));
+    const tools: MCPTool[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await client.listTools(cursor ? { cursor } : undefined);
+      tools.push(
+        ...result.tools.map((
+          t: { name: string; description?: string; inputSchema: unknown },
+        ) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema as Record<string, unknown>,
+        })),
+      );
+      cursor = result.nextCursor;
+    } while (cursor);
+    return tools;
   }
 
   async listResources(): Promise<MCPResource[]> {
-    const result = await this._assertConnected().listResources();
-    return result.resources as MCPResource[];
+    const client = this._assertConnected();
+    const resources: MCPResource[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await client.listResources(
+        cursor ? { cursor } : undefined,
+      );
+      resources.push(...(result.resources as MCPResource[]));
+      cursor = result.nextCursor;
+    } while (cursor);
+    return resources;
   }
 
   async listResourceTemplates(): Promise<MCPResourceTemplate[]> {
-    const result = await this._assertConnected().listResourceTemplates();
-    return result.resourceTemplates as MCPResourceTemplate[];
+    const client = this._assertConnected();
+    const templates: MCPResourceTemplate[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await client.listResourceTemplates(
+        cursor ? { cursor } : undefined,
+      );
+      templates.push(...(result.resourceTemplates as MCPResourceTemplate[]));
+      cursor = result.nextCursor;
+    } while (cursor);
+    return templates;
   }
 
   async readResource(uri: string): Promise<MCPReadResourceResult> {

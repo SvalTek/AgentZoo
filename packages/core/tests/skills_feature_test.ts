@@ -39,6 +39,24 @@ Deno.test("SkillsFeature discovers flat and packaged project skills", async () =
   }
 });
 
+Deno.test("SkillsFeature reads frontmatter values as YAML scalars", async () => {
+  const directory = await Deno.makeTempDir();
+  try {
+    await Deno.writeTextFile(
+      `${directory}/quoted.md`,
+      '---\nname: "quoted-skill"\ndescription: >\n  Folded\n  description.\n---\nLoad me.',
+    );
+    const list = (await new SkillsFeature(directory).createTools()).find((
+      tool,
+    ) => tool.name === "skills_list")!;
+    assertEquals(JSON.parse(await list.execute({} as never, {}) as string), [
+      { name: "quoted-skill", description: "Folded description." },
+    ]);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
 Deno.test("SkillsFeature treats a missing project skill directory as empty", async () => {
   const directory = await Deno.makeTempDir();
   await Deno.remove(directory, { recursive: true });

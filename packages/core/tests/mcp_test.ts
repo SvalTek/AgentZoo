@@ -181,6 +181,42 @@ agents:
   );
 });
 
+Deno.test("MCP http endpoints expand environment variables before validation", () => {
+  const source = `
+mcp:
+  - name: docs
+    description: Read documentation.
+    type: http
+    url: "\${MCP_ENDPOINT}"
+agents:
+  - type: coder
+    model: test
+`;
+  const config = parseConfig(
+    source,
+    (name) =>
+      name === "MCP_ENDPOINT" ? "https://mcp.example.test/stream" : undefined,
+  );
+  const server = config.mcp[0];
+  if (server.type !== "http") throw new Error("Expected http MCP config");
+  assertEquals(server.url, "https://mcp.example.test/stream");
+
+  assertThrows(
+    () =>
+      parseConfig(
+        source,
+        (name) => name === "MCP_ENDPOINT" ? "not a URL" : undefined,
+      ),
+    Error,
+    "/mcp/0/url: Invalid URL",
+  );
+  assertThrows(
+    () => parseConfig(source, () => undefined),
+    Error,
+    'Environment variable "MCP_ENDPOINT"',
+  );
+});
+
 Deno.test("MCP shared path tokens are explicit", () => {
   const resolved = substituteSharedPathTokens({
     name: "shared",

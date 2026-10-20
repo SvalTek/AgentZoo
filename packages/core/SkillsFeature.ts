@@ -1,6 +1,7 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
 import { isAbsolute, relative, resolve } from "@std/path";
+import { parse as parseYaml } from "@std/yaml";
 import type { ToolDefinition } from "@vibesjs/sdk";
 import { z } from "zod";
 import { TextTemplate } from "@agent-zoo/shared";
@@ -100,7 +101,7 @@ the current task; do not assume an unloaded skill's contents.`);
       const canonical = await Deno.realPath(path);
       if (!isWithin(root, canonical)) continue;
       const content = await Deno.readTextFile(canonical);
-      const frontmatter = parseFrontmatter(content);
+      const frontmatter = parseFrontmatter(content, canonical);
       const name = frontmatter.name || skillName(path);
       if (skills.has(name)) {
         throw new Error(
@@ -115,12 +116,35 @@ the current task; do not assume an unloaded skill's contents.`);
 
 function parseFrontmatter(
   content: string,
+  path: string,
 ): { name: string; description: string } {
   const block = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
-  if (!block) return { name: "", description: "" };
+  if (block === undefined || block.trim() === "") {
+    return { name: "", description: "" };
+  }
+  let frontmatter: unknown;
+  try {
+    frontmatter = parseYaml(block);
+  } catch (error) {
+    throw new TypeError(
+      `Project skill frontmatter is not valid YAML: ${path}`,
+      { cause: error },
+    );
+  }
+  if (
+    frontmatter === null || typeof frontmatter !== "object" ||
+    Array.isArray(frontmatter)
+  ) {
+    throw new TypeError(
+      `Project skill frontmatter must be a YAML mapping: ${path}`,
+    );
+  }
+  const fields = frontmatter as Record<string, unknown>;
   return {
-    name: block.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? "",
-    description: block.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? "",
+    name: typeof fields.name === "string" ? fields.name.trim() : "",
+    description: typeof fields.description === "string"
+      ? fields.description.trim()
+      : "",
   };
 }
 

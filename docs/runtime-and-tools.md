@@ -20,12 +20,13 @@ Consequences:
 - The configured `cwd` refers to a path inside the agent environment.
 - Shell and filesystem convenience tools see the same namespace. If `shell`
   writes `/root/a.txt`, `read_file` reads that same file.
-- Each agent receives a private minimal `/dev` with a private `/dev/shm`, and a
-  persistent private PID namespace with its own `/proc`. The devpts instance is
-  shared with the runtime host so an attached terminal resolves its pty, which
-  `docker exec` allocated in that instance. Background processes remain visible
-  to later commands in the same environment but are not visible or signalable
-  from another agent environment.
+- Each agent receives a private minimal `/dev` with its own `/dev/pts` and
+  `/dev/shm`, and a persistent private PID namespace with its own `/proc`. An
+  attached terminal allocates its pty from the agent's own devpts instance, so
+  `tty`, `ttyname()`, and job control work without exposing sibling agents'
+  or the operator's terminals. Background processes remain visible to later
+  commands in the same environment but are not visible or signalable from
+  another agent environment.
 - Debian package management is available inside the private root; packages
   installed by one agent remain private to that agent.
 

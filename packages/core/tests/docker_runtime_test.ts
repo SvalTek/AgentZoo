@@ -324,7 +324,7 @@ Deno.test({
             content: "accidental replacement",
           }),
         Error,
-        "The file already exists.",
+        "the file already exists.",
       );
       await assertRejects(
         () =>
@@ -359,7 +359,7 @@ Deno.test({
             newText: "x",
           }),
         Error,
-        "The requested text was not found.",
+        "The requested text was not found",
       );
       await assertRejects(
         () =>
@@ -757,6 +757,53 @@ Deno.test({
         "! command -v jq && test ! -e /usr/bin/jq && test ! -e /dev/shm/alpha-only",
       ]);
       assertEquals(isolated.exitCode, 0, JSON.stringify(isolated));
+    } finally {
+      await runtime.purge();
+      await Deno.remove(shared, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "Docker agent terminal devices stay inside their own environment",
+  ignore: !dockerIntegrationEnabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const shared = await Deno.makeTempDir({
+      prefix: "agent-zoo-pts-test-",
+    });
+    const runtime = new DockerRuntimeManager(
+      shared,
+      "agent-runtime:test",
+      `agent-runtime-pts-test-${crypto.randomUUID()}`,
+    );
+    try {
+      const alpha = await runtime.createEnv("pts-alpha");
+      const beta = await runtime.createEnv("pts-beta");
+      // A pty allocated inside alpha's chroot must come from alpha's own
+      // devpts instance, so no sibling agent can name or open it.
+      const holder = alpha.exec([
+        "/bin/bash",
+        "-c",
+        "script -q -e -c 'sleep 2' /dev/null",
+      ]);
+      let alphaListing = "";
+      for (let attempt = 0; attempt < 100; attempt++) {
+        alphaListing = (await alpha.exec(["/bin/bash", "-c", "ls -A /dev/pts"]))
+          .stdout;
+        if (alphaListing.trim() !== "") break;
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 50);
+        await promise;
+      }
+      assert(
+        alphaListing.split("\n").some((entry) => /^[0-9]+$/.test(entry.trim())),
+        `alpha should see its own pty: ${JSON.stringify(alphaListing)}`,
+      );
+      const betaListing = await beta.exec(["/bin/bash", "-c", "ls -A /dev/pts"]);
+      assertEquals(betaListing.stdout.trim(), "ptmx");
+      await holder;
     } finally {
       await runtime.purge();
       await Deno.remove(shared, { recursive: true });
