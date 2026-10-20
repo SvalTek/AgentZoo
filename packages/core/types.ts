@@ -291,6 +291,7 @@ export interface ZooActivityEvent {
     | "agent:tool:start"
     | "agent:tool:end"
     | "agent:tool:error"
+    | "agent:mcp:unavailable"
     | "agent:error";
   readonly agentId?: string;
   /** Optional configured display name for the identified agent. */

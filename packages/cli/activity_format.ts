@@ -139,6 +139,19 @@ function messageDisplays(
       width,
     )];
   }
+  if (event.kind === "agent:mcp:unavailable") {
+    const detail = asRecord(event.detail);
+    return [messageDisplay(
+      event,
+      "MCP unavailable",
+      [
+        `Server: ${String(detail?.serverName ?? "unknown")}`,
+        String(detail?.message ?? event.message),
+        "Continuing with the remaining capabilities.",
+      ],
+      width,
+    )];
+  }
   if (event.kind === "agent:yield" || event.kind === "agent:complete") {
     return [messageDisplay(event, event.kind.slice(6), [], width)];
   }
@@ -198,7 +211,7 @@ function toolStartDisplay(
     toolName,
     headline: `${actorLabel(event)} — ${toolName}`,
     status: "running",
-    compact: details.slice(0, 1),
+    compact: details.slice(0, 2),
     details,
   };
 }
@@ -215,7 +228,8 @@ function toolEndDisplay(
     envelope?.status === "error";
   const failed = explicitFailure ||
     (toolName === "shell" && typeof result?.exitCode === "number" &&
-      result.exitCode !== 0);
+      result.exitCode !== 0) ||
+    result?.status === "error";
   const resultLines = explicitFailure
     ? labelledLines("error", formatError(envelope?.error ?? event.detail))
     : toolResultLines(toolName, result ?? envelope?.result ?? event.detail);
@@ -273,10 +287,63 @@ function toolInputLines(toolName: string, value: unknown): string[] {
       ...recordLines(input, ["method", "url"]),
     ];
   }
+  if (toolName === "terminal_create") {
+    const command = typeof input.command === "string"
+      ? [input.command, ...(Array.isArray(input.args) ? input.args : [])]
+        .join(" ")
+      : "interactive Bash shell";
+    return [
+      ...labelledLines("terminal", input.name),
+      ...labelledLines("start", command),
+      ...labelledLines("cwd", input.cwd),
+      ...labelledLines("history", input.historyLimit),
+    ];
+  }
+  if (toolName === "terminal_read") {
+    const range = input.start === undefined && input.end === undefined
+      ? "all retained scrollback"
+      : `${String(input.start ?? "-")}…${String(input.end ?? "screen")}`;
+    return [...labelledLines("terminal", input.name), `range: ${range}`];
+  }
+  if (toolName === "terminal_send") {
+    return [
+      ...labelledLines("terminal", input.name),
+      ...labelledLines("sent", input.text),
+      `enter: ${input.enter === false ? "false" : "true"}`,
+    ];
+  }
+  if (toolName === "terminal_keys") {
+    return [
+      ...labelledLines("terminal", input.name),
+      `keys: ${Array.isArray(input.keys) ? input.keys.join(", ") : "(none)"}`,
+    ];
+  }
+  if (toolName === "terminal_clear" || toolName === "terminal_kill") {
+    return [...labelledLines("terminal", input.name)];
+  }
   return recordLines(input);
 }
 
 function toolResultLines(toolName: string, value: unknown): string[] {
+  if (toolName === "skills_list") {
+    const skills = parseArray(value);
+    if (!skills) return labelledLines("result", value);
+    return skills.length
+      ? [
+        `result: ${skills.length} skill${skills.length === 1 ? "" : "s"}`,
+        ...skills.map((skill) => {
+          const item = asRecord(skill);
+          const name = typeof item?.name === "string" ? item.name : "(unnamed)";
+          const description = typeof item?.description === "string"
+            ? item.description
+            : "";
+          return description
+            ? `skill: ${name} — ${description}`
+            : `skill: ${name}`;
+        }),
+      ]
+      : ["skills: (none)"];
+  }
   const result = parseResult(value);
   if (!result) return labelledLines("result", value);
   if (toolName === "shell") {
@@ -344,6 +411,44 @@ function toolResultLines(toolName: string, value: unknown): string[] {
           : "";
         return [`${type}: ${name}${size}`];
       }),
+    ];
+  }
+  if (toolName === "terminal_create") {
+    return [
+      `result: ${String(result.status ?? "created")}`,
+      ...labelledLines("cwd", result.cwd),
+      ...labelledLines(
+        "program",
+        Array.isArray(result.command) ? result.command.join(" ") : undefined,
+      ),
+      ...labelledLines("history", result.historyLimit),
+      ...labelledLines("error", result.error),
+    ];
+  }
+  if (toolName === "terminal_list") {
+    const terminals = Array.isArray(result.terminals) ? result.terminals : [];
+    return terminals.length
+      ? terminals.map((name) => `terminal: ${String(name)}`)
+      : ["terminals: (none)"];
+  }
+  if (toolName === "terminal_read") {
+    return [
+      ...labelledLines("screen", result.output),
+      ...(result.truncated ? ["screen: truncated"] : []),
+      ...labelledLines("result", result.status),
+      ...labelledLines("error", result.error),
+    ];
+  }
+  if (
+    toolName === "terminal_send" || toolName === "terminal_keys" ||
+    toolName === "terminal_clear" || toolName === "terminal_kill"
+  ) {
+    return [
+      ...(result.status === "sent" || result.status === "cleared" ||
+          result.status === "killed"
+        ? []
+        : labelledLines("result", result.status)),
+      ...labelledLines("error", result.error),
     ];
   }
   return recordLines(result, ["path"]);
@@ -429,6 +534,17 @@ function parseResult(value: unknown): Record<string, unknown> | undefined {
   return asRecord(value);
 }
 
+function parseArray(value: unknown): unknown[] | undefined {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function actorLabel(event: ZooActivityEvent): string {
   return event.agentName
     ? `${event.agentName}${event.agentId ? ` (${event.agentId})` : ""}`
@@ -447,19 +563,50 @@ function labelledLines(label: string, value: unknown): string[] {
   ];
 }
 
-function formatError(value: unknown): string {
-  if (value instanceof Error) {
-    return value.message ? `${value.name}: ${value.message}` : value.name;
+function formatError(value: unknown, depth = 0): string {
+  if (depth > 4) return "[nested error details omitted]";
+  const error = value instanceof Error
+    ? value as Error & Record<string, unknown>
+    : asRecord(value);
+  if (!error) {
+    return value === undefined ? "Details unavailable." : String(value);
   }
-  const error = asRecord(value);
-  if (error && typeof error.message === "string") {
-    return typeof error.name === "string"
-      ? `${error.name}: ${error.message}`
-      : error.message;
+  const name = typeof error.name === "string" ? error.name : undefined;
+  const message = typeof error.message === "string" ? error.message : undefined;
+  if (!name && !message) return "Details unavailable.";
+
+  const lines = [name && message ? `${name}: ${message}` : name ?? message!];
+  if (error.statusCode !== undefined) {
+    lines.push(`status: ${String(error.statusCode)}`);
   }
-  return value === undefined || (error && !error.name && !error.message)
-    ? "Details unavailable."
-    : String(value);
+  if (typeof error.url === "string") lines.push(`url: ${error.url}`);
+  if (typeof error.responseBody === "string") {
+    lines.push(`response: ${truncateErrorText(error.responseBody)}`);
+  }
+  if (typeof error.data === "string") {
+    lines.push(`data: ${truncateErrorText(error.data)}`);
+  }
+  if (error.isRetryable !== undefined) {
+    lines.push(`retryable: ${String(error.isRetryable)}`);
+  }
+  if (error.cause !== undefined) {
+    lines.push(`cause: ${formatError(error.cause, depth + 1)}`);
+  }
+  if (error.lastError !== undefined) {
+    lines.push(`last error: ${formatError(error.lastError, depth + 1)}`);
+  }
+  if (Array.isArray(error.errors)) {
+    error.errors.forEach((nested, index) => {
+      lines.push(`attempt ${index + 1}: ${formatError(nested, depth + 1)}`);
+    });
+  }
+  return lines.join("\n");
+}
+
+function truncateErrorText(value: string, limit = 8_192): string {
+  return value.length <= limit
+    ? value
+    : `${value.slice(0, limit)}… [truncated]`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

@@ -6,6 +6,7 @@ import type {
   ToolDefinition,
 } from "@vibesjs/sdk";
 import { tokenTrimHistoryProcessor } from "@vibesjs/sdk";
+import { FilteredToolset, PrefixedToolset, type Toolset } from "@vibesjs/sdk";
 import type { LanguageModel, ModelMessage } from "npm:ai@^6";
 import { TextTemplate } from "@agent-zoo/shared";
 import type {
@@ -18,6 +19,14 @@ import type {
 import type { ModelRegistry } from "./ModelRegistry.ts";
 import { buildFeaturePrompt } from "./Feature.ts";
 import { ToolExecutionError, unwrapObservedToolResult } from "./ToolSupport.ts";
+import {
+  ObservedToolset,
+  type ObserveToolCall,
+  OptionalMCPToolset,
+} from "./mcp/ObservedToolset.ts";
+import { type MCPServerEntry, mcpToolPrefix } from "./mcp/MCPPool.ts";
+import { createMCPListToolsTool } from "./mcp/ListToolsTool.ts";
+import { createMCPResourceTools } from "./mcp/ResourceTools.ts";
 
 /** The per-run environment AgentZoo exposes to Vibes tools. */
 export interface AgentRunDeps {
@@ -33,6 +42,7 @@ export interface AgentRunDeps {
 
 export interface AgentActivationControl {
   requested?: "yield" | "complete";
+  enabledMcpServers?: Set<string>;
 }
 
 export interface ModelExchange {
@@ -54,6 +64,7 @@ export interface FailedActivationRecord {
 
 const MalformedToolCallCorrection =
   "Automated correction: The previous tool call was malformed and could not be processed. Retry the intended tool call using the tool's parameter schema exactly.";
+const UndirectedActivationPrompt = "Begin.";
 
 /** Error carrying the provider transcript Vibes does not include on failure. */
 export class AgentActivationError extends Error {
@@ -86,8 +97,16 @@ export function modelInputTokenBudget(
   return context.window - (context.maxOutputTokens ?? 0);
 }
 
-function estimatedTextTokens(value: string): number {
-  return Math.ceil(JSON.stringify(value).length / 4);
+/** Keep a positive history budget after reserving measured prompt-envelope cost. */
+export function adjustedHistoryTokenBudget(
+  baseBudget: number,
+  promptEnvelopeReserve: number,
+): number {
+  return Math.max(1, baseBudget - promptEnvelopeReserve);
+}
+
+function estimatedEnvelopeTokens(characters: number): number {
+  return Math.ceil(characters / 3);
 }
 
 /** Stable facts about every Docker-backed agent environment. */
@@ -100,6 +119,10 @@ const AgentZooSystemTemplate = new TextTemplate(`${RuntimeEnvironmentContract}
 
 {#IF hasFeatures}
 {featurePrompt}
+{#END}
+
+{#IF hasMcpTools}
+{mcpTools}
 {#END}`);
 
 export async function buildAgentSystemPrompt(
@@ -108,11 +131,30 @@ export async function buildAgentSystemPrompt(
 ): Promise<string> {
   const args: Record<string, unknown> = {
     hasFeatures: features.length > 0,
+    hasMcpTools: typeof featureArgs.mcpTools === "string" &&
+      featureArgs.mcpTools.trim().length > 0,
   };
   if (features.length) {
     args.featurePrompt = () => buildFeaturePrompt(features, featureArgs);
   }
+  if (args.hasMcpTools) args.mcpTools = featureArgs.mcpTools;
   return await AgentZooSystemTemplate.render(args);
+}
+
+function formatMcpTools(servers: readonly MCPServerEntry[]): string {
+  if (!servers.length) return "";
+  return `## MCP tools
+
+These MCP servers are available to you:
+${
+    servers.map((server) => `- \`${server.name}\`: ${server.description}`).join(
+      "\n",
+    )
+  }
+
+Call \`list_tools\` with an MCP server name when you want to use that server. Its
+tools will be available on your next turn. Use \`list_resources\` and
+\`read_resource\` to discover and read its MCP resources.`;
 }
 
 /**
@@ -126,6 +168,7 @@ export class ZooAgent extends EventTarget {
   readonly #createModel: LanguageModelFactory;
   readonly #models: ModelRegistry;
   readonly #tools: readonly ToolDefinition<AgentRunDeps>[];
+  readonly #mcpServers: readonly MCPServerEntry[];
   #vibes?: VibesAgent<AgentRunDeps>;
   #baseSystemPrompt?: string;
   #initialSystemContext?: string;
@@ -134,6 +177,7 @@ export class ZooAgent extends EventTarget {
   #history: ModelMessage[] = [];
   #activeModelExchanges?: ModelExchange[];
   #toolSequence = 0;
+  #promptEnvelopeReserve = 0;
 
   constructor(
     config: AgentConfig,
@@ -141,6 +185,7 @@ export class ZooAgent extends EventTarget {
     models: ModelRegistry,
     createModel: LanguageModelFactory,
     tools: readonly ToolDefinition<AgentRunDeps>[] = [],
+    mcpServers: readonly MCPServerEntry[] = [],
   ) {
     super();
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(config.id)) {
@@ -163,7 +208,35 @@ export class ZooAgent extends EventTarget {
     this.runtime = runtime;
     this.#createModel = createModel;
     this.#models = models;
-    this.#tools = [...tools];
+    this.#mcpServers = [...mcpServers];
+    const mcpBuiltinNames = new Set([
+      "list_tools",
+      "list_resources",
+      "read_resource",
+    ]);
+    if (
+      this.#mcpServers.length &&
+      tools.some((tool) => mcpBuiltinNames.has(tool.name))
+    ) {
+      const duplicate = tools.find((tool) => mcpBuiltinNames.has(tool.name))!;
+      throw new Error(
+        `Agent "${config.id}" has duplicate tool name "${duplicate.name}"`,
+      );
+    }
+    const onMcpUnavailable = (serverName: string, error: Error) => {
+      this.dispatchEvent(
+        new CustomEvent("mcpunavailable", {
+          detail: { serverName, error, message: error.message },
+        }),
+      );
+    };
+    const mcpBuiltins = this.#mcpServers.length
+      ? [
+        ...createMCPResourceTools(this.#mcpServers, onMcpUnavailable),
+        createMCPListToolsTool(this.#mcpServers, onMcpUnavailable),
+      ]
+      : [];
+    this.#tools = [...tools, ...mcpBuiltins];
   }
 
   async prepare(): Promise<void> {
@@ -181,7 +254,13 @@ export class ZooAgent extends EventTarget {
     options: AgentActivationOptions = {},
   ): Promise<AgentActivationResult> {
     const appendPrompt = options.appendPrompt ?? true;
-    const promptRole = appendPrompt ? options.role ?? "user" : "none";
+    const undirectedStartup = !appendPrompt && !this.#history.length &&
+      prompt.trim().length === 0;
+    const effectivePrompt = undirectedStartup
+      ? UndirectedActivationPrompt
+      : prompt;
+    const effectiveAppendPrompt = appendPrompt || undirectedStartup;
+    const promptRole = effectiveAppendPrompt ? options.role ?? "user" : "none";
     if (options.initialSystemContext) {
       if (this.#vibes || this.#history.length) {
         throw new Error(
@@ -198,7 +277,7 @@ export class ZooAgent extends EventTarget {
     const exchanges: ModelExchange[] = [];
     this.#activeModelExchanges = exchanges;
     try {
-      const result = await (await this.getVibes()).run(prompt, {
+      const result = await (await this.getVibes()).run(effectivePrompt, {
         deps: {
           agentId: this.id,
           provider: this.#models.get(this.config.model).provider,
@@ -211,7 +290,7 @@ export class ZooAgent extends EventTarget {
         },
         messageHistory: this.#history,
         messageRole: promptRole === "none" ? undefined : promptRole,
-        appendPrompt,
+        appendPrompt: effectiveAppendPrompt,
         systemPromptAsMessage: this.#systemPromptInHistory,
       });
       this.#history = [...result.messages];
@@ -232,7 +311,7 @@ export class ZooAgent extends EventTarget {
       };
     } catch (error) {
       throw new AgentActivationError(error, {
-        prompt,
+        prompt: effectivePrompt,
         promptRole,
         systemPrompt: this.#resolvedSystemPrompt,
         messages: providerTranscript(exchanges),
@@ -316,17 +395,12 @@ export class ZooAgent extends EventTarget {
           type: this.config.type,
           model: this.config.model,
           shellEnvironment: this.#initialSystemContext ?? "",
+          mcpTools: formatMcpTools(this.#mcpServers),
         },
       );
       this.#resolvedSystemPrompt = this.currentSystemPrompt();
       const inputBudget = modelInputTokenBudget(this.config.context);
-      const historyBudget = inputBudget === undefined ? undefined : Math.max(
-        1,
-        inputBudget -
-          (this.#systemPromptInHistory
-            ? 0
-            : estimatedTextTokens(this.#resolvedSystemPrompt)),
-      );
+      const historyBudget = inputBudget;
       this.#vibes = new Agent<AgentRunDeps>({
         name: this.config.name ?? this.id,
         model: observeLanguageModel(
@@ -339,10 +413,27 @@ export class ZooAgent extends EventTarget {
         systemPrompt: () => this.currentSystemPrompt(),
         instructions: this.config.systemPrompt,
         tools: this.#tools.map((definition) => this.observeTool(definition)),
+        ...(this.#mcpServers.length
+          ? {
+            toolsets: [this.mcpToolset()],
+          }
+          : {}),
         maxConcurrency: 1,
         maxTurns: this.config.maxTurns ?? 100,
         historyProcessors: historyBudget === undefined ? [] : [
-          tokenTrimHistoryProcessor<AgentRunDeps>(historyBudget),
+          (messages, context) =>
+            tokenTrimHistoryProcessor<AgentRunDeps>(
+              adjustedHistoryTokenBudget(
+                historyBudget,
+                this.#promptEnvelopeReserve +
+                  estimatedEnvelopeTokens(context.toolSchemaChars ?? 0) +
+                  (this.#systemPromptInHistory
+                    ? 0
+                    : estimatedEnvelopeTokens(context.systemPromptChars ?? 0)),
+              ),
+              (message) =>
+                estimatedEnvelopeTokens(JSON.stringify(message).length),
+            )(messages, context),
         ],
         modelSettings: {
           allowSystemInMessages: true,
@@ -370,73 +461,107 @@ export class ZooAgent extends EventTarget {
     return {
       ...definition,
       execute: async (context, args) => {
-        const toolCallId = `${this.id}:tool:${++this.#toolSequence}`;
-        const startedAt = Date.now();
-        this.dispatchEvent(
-          new CustomEvent("toolstart", {
-            detail: {
-              toolCallId,
-              toolName: definition.name,
-              startedAt,
-              args,
-            },
-          }),
-        );
-        try {
-          const executed = await definition.execute(context, args);
-          const { result, telemetry } = unwrapObservedToolResult(executed);
-          const endedAt = Date.now();
-          this.dispatchEvent(
-            new CustomEvent("toolend", {
-              detail: {
-                toolCallId,
-                toolName: definition.name,
-                status: "success",
-                result,
-                telemetry,
-                startedAt,
-                endedAt,
-                durationMs: endedAt - startedAt,
-              },
-            }),
-          );
-          return result as never;
-        } catch (error) {
-          const endedAt = Date.now();
-          const telemetry = error instanceof ToolExecutionError
-            ? error.telemetry
-            : undefined;
-          this.dispatchEvent(
-            new CustomEvent("toolerror", {
-              detail: {
-                toolCallId,
-                toolName: definition.name,
-                error,
-                telemetry,
-                startedAt,
-                endedAt,
-                durationMs: endedAt - startedAt,
-              },
-            }),
-          );
-          this.dispatchEvent(
-            new CustomEvent("toolend", {
-              detail: {
-                toolCallId,
-                toolName: definition.name,
-                status: "error",
-                error,
-                telemetry,
-                startedAt,
-                endedAt,
-                durationMs: endedAt - startedAt,
-              },
-            }),
-          );
-          throw error;
-        }
+        return await this.observeToolCall(
+          definition.name,
+          args as Record<string, unknown>,
+          () => definition.execute(context, args),
+        ) as never;
       },
     };
+  }
+
+  private mcpToolset(): Toolset<AgentRunDeps> {
+    const prefixed = this.#mcpServers.map((server) => ({
+      name: server.name,
+      toolset: new PrefixedToolset(
+        new FilteredToolset(
+          server.toolset,
+          (context) =>
+            context.deps.control.enabledMcpServers?.has(
+              server.name,
+            ) ?? false,
+        ),
+        mcpToolPrefix(server.name),
+      ),
+    }));
+    return new ObservedToolset(
+      new OptionalMCPToolset(prefixed, (serverName, error) => {
+        this.dispatchEvent(
+          new CustomEvent("mcpunavailable", {
+            detail: { serverName, error, message: error.message },
+          }),
+        );
+      }),
+      this.#tools.map((tool) => tool.name),
+      this.observeToolCall.bind(this) as ObserveToolCall,
+    );
+  }
+
+  private async observeToolCall(
+    toolName: string,
+    args: Record<string, unknown>,
+    execute: () => Promise<unknown>,
+  ): Promise<unknown> {
+    const toolCallId = `${this.id}:tool:${++this.#toolSequence}`;
+    const startedAt = Date.now();
+    this.dispatchEvent(
+      new CustomEvent("toolstart", {
+        detail: { toolCallId, toolName, startedAt, args },
+      }),
+    );
+    try {
+      const executed = await execute();
+      const { result, telemetry } = unwrapObservedToolResult(executed);
+      const endedAt = Date.now();
+      this.dispatchEvent(
+        new CustomEvent("toolend", {
+          detail: {
+            toolCallId,
+            toolName,
+            status: "success",
+            result,
+            telemetry,
+            startedAt,
+            endedAt,
+            durationMs: endedAt - startedAt,
+          },
+        }),
+      );
+      return result;
+    } catch (error) {
+      const endedAt = Date.now();
+      const telemetry = error instanceof ToolExecutionError
+        ? error.telemetry
+        : undefined;
+      this.dispatchEvent(
+        new CustomEvent("toolerror", {
+          detail: {
+            toolCallId,
+            toolName,
+            error,
+            telemetry,
+            startedAt,
+            endedAt,
+            durationMs: endedAt - startedAt,
+          },
+        }),
+      );
+      this.dispatchEvent(
+        new CustomEvent("toolend", {
+          detail: {
+            toolCallId,
+            toolName,
+            status: "error",
+            error,
+            telemetry,
+            startedAt,
+            endedAt,
+            durationMs: endedAt - startedAt,
+          },
+        }),
+      );
+      throw error;
+    }
   }
 
   get toolNames(): readonly string[] {
@@ -461,11 +586,27 @@ export class ZooAgent extends EventTarget {
       if (event.kind === "response") exchange.response = event.response;
       else exchange.error = event.error;
     }
+    if (event.kind === "response") {
+      this.updatePromptEnvelopeReserve(event.response);
+    }
     this.dispatchEvent(
       new CustomEvent(
         event.kind === "response" ? "modelresponse" : "modelerror",
         { detail: event },
       ),
+    );
+  }
+
+  private updatePromptEnvelopeReserve(response: unknown): void {
+    const inputBudget = modelInputTokenBudget(this.config.context);
+    if (inputBudget === undefined) return;
+    const usage = asRecord(response)?.usage;
+    const inputTokens = asRecord(usage)?.inputTokens;
+    const total = asRecord(inputTokens)?.total;
+    if (typeof total !== "number" || !Number.isFinite(total)) return;
+    this.#promptEnvelopeReserve = Math.max(
+      this.#promptEnvelopeReserve,
+      Math.max(0, total - inputBudget),
     );
   }
 }
@@ -487,10 +628,13 @@ export function observeLanguageModel(
       }
       return async (options: unknown) => {
         const promptIdentity = modelPromptIdentity(options);
-        const effectiveOptions = promptIdentity &&
+        const correctedOptions = promptIdentity &&
             promptsNeedingToolCallCorrection.has(promptIdentity)
           ? addMalformedToolCallCorrection(options)
           : options;
+        const effectiveOptions = normalizeProviderSystemMessages(
+          correctedOptions,
+        );
         const callId = `model:${++sequence}`;
         const observed = observableModelRequest(
           effectiveOptions,
@@ -560,6 +704,54 @@ function addMalformedToolCallCorrection(value: unknown): unknown {
   }
   return { ...request, prompt };
 }
+/** Keep provider-bound conversations valid while preserving all system text. */
+function normalizeProviderSystemMessages(value: unknown): unknown {
+  const request = asRecord(value);
+  const messages = request?.prompt;
+  if (!request || !Array.isArray(messages)) return value;
+  const systemIndexes = messages.flatMap((message, index) =>
+    asRecord(message)?.role === "system" ? [index] : []
+  );
+  if (systemIndexes.length <= 1) return value;
+  const firstSystemIndex = systemIndexes[0];
+  const firstSystem = asRecord(messages[firstSystemIndex]);
+  if (!firstSystem) return value;
+  const mergedContent = systemIndexes
+    .slice(1)
+    .reduce(
+      (content, index) =>
+        mergeMessageContent(
+          content,
+          asRecord(messages[index])?.content,
+        ),
+      firstSystem.content,
+    );
+  const prompt = messages.filter((_, index) =>
+    !systemIndexes.includes(index) || index === firstSystemIndex
+  );
+  prompt[firstSystemIndex] = { ...firstSystem, content: mergedContent };
+  if (firstSystemIndex !== 0) {
+    const [leadingSystem] = prompt.splice(firstSystemIndex, 1);
+    prompt.unshift(leadingSystem);
+  }
+  return { ...request, prompt };
+}
+
+function mergeMessageContent(left: unknown, right: unknown): unknown {
+  if (typeof left === "string" && typeof right === "string") {
+    return `${left}\n\n${right}`;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return [...left, ...right];
+  }
+  if (typeof left === "string" && Array.isArray(right)) {
+    return [{ type: "text", text: left }, ...right];
+  }
+  if (Array.isArray(left) && typeof right === "string") {
+    return [...left, { type: "text", text: right }];
+  }
+  return `${String(left)}\n\n${String(right)}`;
+}
 
 function observableModelRequest(
   value: unknown,
@@ -584,7 +776,10 @@ function deltaModelRequest(
   previousPrompt: readonly unknown[],
 ): Record<string, unknown> {
   const prompt = Array.isArray(request.prompt) ? request.prompt : [];
-  const omitSystem = previousPrompt.length > 0;
+  const omitSystem = previousPrompt.length > 0 &&
+    isSystemMessage(prompt[0]) &&
+    isSystemMessage(previousPrompt[0]) &&
+    sameLoggedValue(prompt[0], previousPrompt[0]);
   const currentConversation = omitSystem && isSystemMessage(prompt[0])
     ? prompt.slice(1)
     : prompt;

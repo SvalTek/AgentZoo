@@ -16,6 +16,10 @@ import type {
 
 export type RouterService = Service & { readonly router?: Router };
 
+export interface MCPPoolLifecycle {
+  disconnectAll(): Promise<void>;
+}
+
 /** Structural actor boundary used by the real ZooAgent and deterministic tests. */
 export interface ZooActor extends EventTarget {
   readonly id: string;
@@ -48,6 +52,7 @@ export interface AgentZooOptions {
   clock?: () => number;
   random?: () => number;
   recentActivityLimit?: number;
+  mcpPool?: MCPPoolLifecycle;
   dispose?: () => Promise<void>;
 }
 
@@ -65,6 +70,7 @@ export class AgentZoo extends EventTarget {
   readonly #initialPrompts: Readonly<Record<string, string | undefined>>;
   readonly #recentLimit: number;
   readonly #dispose?: () => Promise<void>;
+  readonly #mcpPool?: MCPPoolLifecycle;
   readonly #recentActivity: ZooActivityEvent[] = [];
   #state: ZooState = "created";
   #stateSince: number;
@@ -84,6 +90,7 @@ export class AgentZoo extends EventTarget {
     this.#initialPrompts = options.initialPrompts ?? {};
     this.#recentLimit = options.recentActivityLimit ?? 50;
     this.#dispose = options.dispose;
+    this.#mcpPool = options.mcpPool;
     this.#stateSince = this.#clock();
   }
 
@@ -164,6 +171,14 @@ export class AgentZoo extends EventTarget {
         toolCallId: detail.toolCallId,
         detail,
       });
+    });
+    actor.addEventListener("mcpunavailable", (event) => {
+      const detail = (event as CustomEvent).detail ?? {};
+      this.record(
+        "agent:mcp:unavailable",
+        `${label} continues without MCP server ${detail.serverName}: ${detail.message}`,
+        { agentId: actor.id, detail },
+      );
     });
     actor.addEventListener("modelrequest", (event) => {
       const detail = (event as CustomEvent).detail ?? {};
@@ -543,6 +558,11 @@ export class AgentZoo extends EventTarget {
           this.setAgentState(record, "stopped", "Stopped");
         }
       }
+    }
+    try {
+      await this.#mcpPool?.disconnectAll();
+    } catch (error) {
+      errors.push(error);
     }
     try {
       await this.#dispose?.();

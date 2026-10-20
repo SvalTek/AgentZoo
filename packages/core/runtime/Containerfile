@@ -47,7 +47,7 @@ RUN apt-get update \
     && printf '%s\n' 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'export PS1="\\u@localhost:\\w\\$ "' > /root/.bashrc \
     && mkdir -p /opt/runtime/rootfs-template \
     && cp -a /bin /etc /home /lib /lib64 /root /sbin /usr /var /opt/runtime/rootfs-template/ \
-    && mkdir -p /opt/runtime/rootfs-template/dev /opt/runtime/rootfs-template/proc /opt/runtime/rootfs-template/shared /opt/runtime/rootfs-template/tmp \
+    && mkdir -p /opt/runtime/rootfs-template/dev /opt/runtime/rootfs-template/proc /opt/runtime/rootfs-template/run /opt/runtime/rootfs-template/shared /opt/runtime/rootfs-template/tmp \
     && chmod 1777 /opt/runtime/rootfs-template/tmp
 
 # These are broadly useful, lightweight language/package tools for arbitrary work.

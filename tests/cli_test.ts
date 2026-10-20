@@ -2,9 +2,11 @@ import {
   assert,
   assertEquals,
   assertMatch,
+  assertRejects,
   assertStringIncludes,
+  assertThrows,
 } from "@std/assert";
-import { createCli } from "../cli_command.ts";
+import { createCli, resolvePopulationMember } from "../cli_command.ts";
 import {
   formatActivity,
   projectActivity,
@@ -17,6 +19,7 @@ import {
   tailViewportStart,
 } from "../packages/cli/activity_viewport.ts";
 import type { AgentZoo, ModelRegistry } from "@agent-zoo/core";
+import { expandPopulation, parseConfig } from "@agent-zoo/core";
 
 Deno.test("activity ScrollView fragments long messages before mounting them", () => {
   const displays = [{
@@ -142,6 +145,95 @@ Deno.test("Cliffy Docker purge requires and forwards explicit scope", async () =
     console.log = originalLog;
   }
   assertEquals(calls, [{ runId: "run-1", pruneImages: true }]);
+});
+
+const attachFixtureConfig = `
+agents:
+  - type: coding
+    names: [Alice, Bob]
+    model: local-qwen
+  - type: research
+    name: Rowan
+    model: local-qwen
+`;
+
+Deno.test("attach resolves agents by opaque id, semantic id, and name", async () => {
+  const population = await expandPopulation(parseConfig(attachFixtureConfig));
+  assertEquals(
+    population.map((member) => member.semanticId),
+    ["coding-1", "coding-2", "research-1"],
+  );
+  assertEquals(
+    resolvePopulationMember(population, population[1].id).id,
+    population[1].id,
+  );
+  assertEquals(
+    resolvePopulationMember(population, "coding-2").name,
+    "Bob",
+  );
+  assertEquals(
+    resolvePopulationMember(population, "Research-1").name,
+    "Rowan",
+  );
+  assertEquals(resolvePopulationMember(population, "alice").name, "Alice");
+  assertEquals(
+    resolvePopulationMember(population, population[0].id).name,
+    "Alice",
+  );
+});
+
+Deno.test("attach reports ambiguous names with authoritative stable ids", async () => {
+  const population = await expandPopulation(
+    parseConfig(`
+agents:
+  - type: coding
+    name: Alice
+    model: local-qwen
+  - type: research
+    name: Alice
+    model: local-qwen
+`),
+  );
+  const error = assertThrows(
+    () => resolvePopulationMember(population, "alice"),
+    Error,
+  );
+  assertStringIncludes(error.message, "ambiguous");
+  assertStringIncludes(error.message, population[0].id);
+  assertStringIncludes(error.message, population[1].id);
+  assertStringIncludes(error.message, "coding-1");
+  assertEquals(resolvePopulationMember(population, "research-1").name, "Alice");
+
+  const missing = assertThrows(
+    () => resolvePopulationMember(population, "nobody"),
+    Error,
+  );
+  assertStringIncludes(missing.message, "No configured agent");
+  assertStringIncludes(missing.message, population[0].id);
+});
+
+Deno.test("Cliffy attach command resolves before touching Docker", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "agent-zoo-attach-" });
+  const configPath = `${directory}/agent-zoo.yaml`;
+  await Deno.writeTextFile(configPath, attachFixtureConfig);
+  let entered = false;
+  try {
+    const error = await assertRejects(
+      () =>
+        createCli(() => Promise.resolve(), undefined, {
+          enter: () => {
+            entered = true;
+            return Promise.resolve(0);
+          },
+        }).parse(["attach", "nobody", "--config", configPath]),
+      Error,
+      "No configured agent",
+    );
+    assertStringIncludes((error as Error).message, "No configured agent");
+    assertEquals(entered, false);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
 });
 
 Deno.test("dashboard run timer formats the complete elapsed duration", () => {
@@ -422,6 +514,114 @@ Deno.test("activity display includes shell timeout recovery guidance", () => {
   ]);
 });
 
+Deno.test("terminal activity cards retain typed input and render the screen without duplicate metadata", () => {
+  const activity = projectActivity([
+    {
+      sequence: 1,
+      at: 0,
+      kind: "agent:tool:start",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-1",
+      toolName: "terminal_send",
+      message: "Alice called terminal_send",
+      detail: { name: "universe", text: "garden", enter: true },
+    },
+    {
+      sequence: 2,
+      at: 1,
+      kind: "agent:tool:end",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-1",
+      toolName: "terminal_send",
+      message: "Alice finished terminal_send",
+      detail: {
+        status: "success",
+        result: { name: "universe", status: "sent" },
+      },
+    },
+    {
+      sequence: 3,
+      at: 2,
+      kind: "agent:tool:start",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-2",
+      toolName: "terminal_read",
+      message: "Alice called terminal_read",
+      detail: { name: "universe" },
+    },
+    {
+      sequence: 4,
+      at: 3,
+      kind: "agent:tool:end",
+      agentId: "alice",
+      agentName: "Alice",
+      toolCallId: "terminal-2",
+      toolName: "terminal_read",
+      message: "Alice finished terminal_read",
+      detail: {
+        status: "success",
+        result: {
+          name: "universe",
+          found: true,
+          output: "Welcome to the garden\n> ",
+        },
+      },
+    },
+  ]);
+  assertEquals(activity.length, 2);
+  assertEquals(activity[0].type, "tool");
+  assertEquals(activity[1].type, "tool");
+  if (activity[0].type !== "tool" || activity[1].type !== "tool") {
+    throw new Error("Expected terminal tool cards");
+  }
+  assertEquals(activity[0].details, [
+    "terminal: universe",
+    "sent: garden",
+    "enter: true",
+  ]);
+  assertEquals(activity[1].details, [
+    "terminal: universe",
+    "range: all retained scrollback",
+    "screen: Welcome to the garden",
+    "  >",
+  ]);
+  const collapsed = buildActivityFragments(
+    activity,
+    100,
+    10,
+    new Set(),
+  );
+  assertEquals(collapsed[0].body, [
+    "✓ complete",
+    "terminal: universe",
+    "sent: garden",
+  ]);
+});
+
+Deno.test("activity display makes optional MCP loss conspicuous", () => {
+  const display = formatActivity({
+    sequence: 1,
+    at: 0,
+    kind: "agent:mcp:unavailable",
+    agentId: "rowan",
+    agentName: "Rowan",
+    message: "Rowan continues without MCP server browseros",
+    detail: {
+      serverName: "browseros",
+      message: "MCP server browseros is unavailable during discovery",
+    },
+  });
+  assertStringIncludes(display.headline, "MCP unavailable");
+  assertStringIncludes(display.details.join("\n"), "browseros");
+  assertStringIncludes(
+    display.details.join("\n"),
+    "Continuing with the remaining capabilities.",
+  );
+});
+
 Deno.test("wake activity shows environment entries instead of a blank row", () => {
   const display = formatActivity({
     sequence: 1,
@@ -515,6 +715,29 @@ Deno.test("directory activity retains the requested path once and summarizes ent
   ]);
 });
 
+Deno.test("skills activity displays the available skill names and descriptions", () => {
+  const display = formatActivity({
+    sequence: 1,
+    at: 0,
+    kind: "agent:tool:end",
+    agentId: "alpha",
+    toolName: "skills_list",
+    message: "alpha finished skills_list",
+    detail: {
+      status: "success",
+      result: JSON.stringify([
+        { name: "editing-files", description: "Edit existing files safely." },
+        { name: "interactive-work", description: "Work with live programs." },
+      ]),
+    },
+  });
+  assertEquals(display.details, [
+    "result: 2 skills",
+    "skill: editing-files — Edit existing files safely.",
+    "skill: interactive-work — Work with live programs.",
+  ]);
+});
+
 Deno.test("activity display shows patch snippets and changed-file results", () => {
   const start = formatActivity({
     sequence: 1,
@@ -551,6 +774,13 @@ Deno.test("activity display survives malformed provider errors and missing field
     "XML syntax error on line 2: element <function> closed by </parameter>",
   );
   providerError.name = "AI_APICallError";
+  Object.assign(providerError, {
+    statusCode: 500,
+    url: "http://localhost:11434/api/chat",
+    responseBody: "Jinja Exception: invalid turn sequence",
+    isRetryable: false,
+    cause: { name: "TypeError", message: "provider rejected request" },
+  });
   const displayed = formatActivity({
     sequence: 3,
     at: Date.parse("2026-08-12T09:12:21Z"),
@@ -568,6 +798,39 @@ Deno.test("activity display survives malformed provider errors and missing field
   assertEquals(displayed.headline, "Bob (coding-2) — error");
   assertStringIncludes(displayed.details.join("\n"), "AI_APICallError");
   assertStringIncludes(displayed.details.join("\n"), "XML syntax error");
+  assertStringIncludes(displayed.details.join("\n"), "status: 500");
+  assertStringIncludes(
+    displayed.details.join("\n"),
+    "Jinja Exception: invalid turn sequence",
+  );
+  assertStringIncludes(
+    displayed.details.join("\n"),
+    "cause: TypeError: provider rejected request",
+  );
+
+  const retryDisplayed = formatActivity({
+    sequence: 3.5,
+    at: Date.parse("2026-08-12T09:12:21Z"),
+    kind: "agent:model:error",
+    agentId: "coding-2",
+    message: "model request failed after retries",
+    detail: {
+      error: {
+        name: "AI_RetryError",
+        message: "Failed after 2 attempts",
+        lastError: providerError,
+        errors: [providerError],
+      },
+    },
+  });
+  assertStringIncludes(
+    retryDisplayed.details.join("\n"),
+    "last error: AI_APICallError: XML syntax error",
+  );
+  assertStringIncludes(
+    retryDisplayed.details.join("\n"),
+    "attempt 1: AI_APICallError: XML syntax error",
+  );
 
   const serialized = formatActivity({
     sequence: 4,
@@ -688,6 +951,29 @@ Deno.test(
               },
             },
           },
+          {
+            sequence: 5,
+            kind: "agent:model:error",
+            message: "alpha model request failed",
+            detail: {
+              error: Object.assign(
+                new Error("Internal Server Error"),
+                {
+                  name: "AI_APICallError",
+                  statusCode: 500,
+                  url: "http://localhost:11434/api/chat",
+                  responseHeaders: { "content-type": "application/json" },
+                  responseBody:
+                    "Jinja Exception: System message must be at the beginning.",
+                  isRetryable: false,
+                  requestBodyValues: { prompt: ["sensitive prompt"] },
+                  cause: Object.assign(new Error("HTTP 500"), {
+                    name: "APICallError",
+                  }),
+                },
+              ),
+            },
+          },
         ]
       ) {
         zoo.dispatchEvent(
@@ -725,6 +1011,23 @@ Deno.test(
       assertEquals(
         failure.detail.activation.modelExchanges[0].response,
         "full response",
+      );
+      const providerFailure = records.find((record) =>
+        record.kind === "agent:model:error"
+      );
+      assertEquals(providerFailure.detail.error.statusCode, 500);
+      assertEquals(
+        providerFailure.detail.error.url,
+        "http://localhost:11434/api/chat",
+      );
+      assertEquals(
+        providerFailure.detail.error.responseBody,
+        "Jinja Exception: System message must be at the beginning.",
+      );
+      assertEquals(providerFailure.detail.error.requestBodyValues, "[omitted]");
+      assertEquals(
+        providerFailure.detail.error.cause.message,
+        "HTTP 500",
       );
     } finally {
       await Deno.remove(directory, { recursive: true });

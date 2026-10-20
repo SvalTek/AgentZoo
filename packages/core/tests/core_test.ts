@@ -51,6 +51,7 @@ import {
 } from "../mod.ts";
 import { assertAgentId, SharedWorkspace } from "../mod.ts";
 import {
+  adjustedHistoryTokenBudget,
   AgentActivationError,
   type AgentRunDeps,
   buildAgentSystemPrompt,
@@ -154,6 +155,7 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
     await Deno.readTextFile(
       new URL("../../../agent-zoo.example.yaml", import.meta.url),
     ),
+    () => "example-key",
   );
   assert(!forbidden.test(Object.values(example.templates).join("\n")));
 
@@ -165,6 +167,10 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
   );
   assert(shellPrompt && !/@agent(?:\W|$)/i.test(shellPrompt));
   assert(shellPrompt.includes('PS1="\\\\u@localhost:'));
+  assert(
+    containerfile.includes("/opt/runtime/rootfs-template/run"),
+    "the unbooted agent rootfs must provide /run for Debian runtime state",
+  );
   assert(!/agent[ -]?zoo/i.test(new DockerRuntimeManager("shared").hostName));
 });
 
@@ -241,6 +247,31 @@ Deno.test("Vibes preserves provider-facing tool definition order", async () => {
   ]);
   assert(renderedTools.every((tool) => tool.description));
   assert(renderedTools.every((tool) => tool.inputSchema));
+});
+
+Deno.test("Vibes exposes the resolved tool schema envelope before history trimming", async () => {
+  let toolSchemaChars = 0;
+  const model = new FunctionModel(() => ({
+    content: [{ type: "text", text: "done" }],
+    finishReason: { unified: "stop", raw: "stop" },
+    usage: {
+      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 1, text: 1, reasoning: 0 },
+    },
+    warnings: [],
+  }));
+  const agent = new VibesAgent({
+    model,
+    tools: [createCompletionTool()],
+    historyProcessors: [
+      (messages, context) => {
+        toolSchemaChars = context.toolSchemaChars ?? 0;
+        return messages;
+      },
+    ],
+  });
+  await agent.run("Inspect the available tools.");
+  assert(toolSchemaChars > 0);
 });
 
 Deno.test("generic tools expose usable provider-facing instructions", async () => {
@@ -1119,6 +1150,8 @@ Deno.test("context input budget reserves maximum generation length", () => {
   );
   assertEquals(modelInputTokenBudget({ window: 4_096 }), 4_096);
   assertEquals(modelInputTokenBudget(undefined), undefined);
+  assertEquals(adjustedHistoryTokenBudget(24_576, 8_009), 16_567);
+  assertEquals(adjustedHistoryTokenBudget(1, 100), 1);
 });
 
 Deno.test("initial instructions and objective compose as one labelled user message", () => {
@@ -1259,12 +1292,20 @@ Deno.test("AgentZoo system prompt renders enabled feature guidance from Context"
   try {
     const promptWithFeatures = await buildAgentSystemPrompt(
       ["shell", "filesystem"],
-      { shellEnvironment: "You are logged into the shell as root." },
+      {
+        shellEnvironment: "You are logged into the shell as root.",
+        mcpTools:
+          "## MCP tools\n\n- `docs`: Look up documentation.\n\nCall `list_tools` with an MCP server name when you want to use that server. Call `list_resources` and `read_resource` to access MCP resources.",
+      },
     );
     assert(promptWithFeatures.includes("## Shell"));
     assert(promptWithFeatures.includes("logged into the shell as root"));
     assert(promptWithFeatures.includes("## Filesystem tools"));
     assert(promptWithFeatures.includes("Use apply_patch for related changes"));
+    assert(promptWithFeatures.includes("## MCP tools"));
+    assert(promptWithFeatures.includes("`docs`: Look up documentation."));
+    assert(promptWithFeatures.includes("Call `list_tools`"));
+    assert(promptWithFeatures.includes("`list_resources`"));
   } finally {
     Context.delete("features");
   }
@@ -1357,19 +1398,26 @@ Deno.test("AgentZoo system stays in history for taskless startup and idle wake i
   const secondPrompt = requests[1].prompt as Array<Record<string, unknown>>;
   assertEquals(
     firstPrompt.filter((message) => message.role === "system").length,
-    2,
+    1,
   );
-  assertEquals(firstPrompt.some((message) => message.role === "user"), false);
+  assertEquals(firstPrompt.map((message) => message.role), [
+    "system",
+    "user",
+  ]);
+  assertEquals(
+    firstPrompt.at(-1)?.content,
+    [{ type: "text", text: "Begin." }],
+  );
   assert(JSON.stringify(firstPrompt).includes("## Environment"));
   assert(JSON.stringify(firstPrompt).includes("Configured guidance."));
   assertEquals(
-    secondPrompt.filter((message) => message.role === "system").length,
-    3,
+    secondPrompt.map((message) => message.role),
+    ["system", "user", "assistant"],
   );
-  assertEquals(secondPrompt.some((message) => message.role === "user"), false);
   assert(JSON.stringify(secondPrompt).includes("## Environment"));
+  assert(JSON.stringify(secondPrompt).includes("Configured guidance."));
   assert(
-    JSON.stringify(secondPrompt.at(-1)).includes(
+    JSON.stringify(secondPrompt[0]).includes(
       "Automated activity update: You have been idle for 17 minutes.",
     ),
   );
@@ -1377,15 +1425,15 @@ Deno.test("AgentZoo system stays in history for taskless startup and idle wake i
     Record<string, unknown>
   >;
   assertEquals(loggedRequests[1].promptMode, "delta");
-  assertEquals(loggedRequests[1].systemMode, "omitted-after-initial");
-  assertEquals(secondLoggedPrompt.length, 1);
+  assertEquals(loggedRequests[1].systemMode, "full");
+  assertEquals(secondLoggedPrompt.length, 3);
   assertEquals(secondLoggedPrompt[0].role, "system");
   assert(
     JSON.stringify(secondLoggedPrompt).includes(
       "Automated activity update: You have been idle for 17 minutes.",
     ),
   );
-  assert(!JSON.stringify(secondLoggedPrompt).includes("## Environment"));
+  assert(JSON.stringify(secondLoggedPrompt).includes("## Environment"));
 
   const promptedAgent = new ZooAgent(
     { id: "beta", model: "local" },
@@ -1483,16 +1531,19 @@ Deno.test("malformed provider tool calls add a system correction on retry", asyn
 
   assertEquals(providerPrompts.length, 2);
   assertEquals(providerPrompts[0], prompt);
-  assertEquals(providerPrompts[1].length, prompt.length + 1);
-  const repairedSystem = providerPrompts[1].at(-1) as Record<string, unknown>;
+  // Providers reject multiple system messages, so the correction is merged
+  // into the leading system message instead of appended as a second one.
+  assertEquals(providerPrompts[1].length, prompt.length);
+  const repairedSystem = providerPrompts[1][0] as Record<string, unknown>;
   assertEquals(repairedSystem.role, "system");
+  assert(String(repairedSystem.content).includes("Base system context."));
   assert(String(repairedSystem.content).includes("tool call was malformed"));
-  assertEquals(providerPrompts[1][0], prompt[0]);
+  assertEquals(providerPrompts[1][1], prompt[1]);
   assertEquals(
     providerPrompts[1].filter((message) =>
       (message as Record<string, unknown>).role === "system"
     ).length,
-    2,
+    1,
   );
   assertEquals(events.map((event) => event.kind), [
     "request",
@@ -1500,10 +1551,11 @@ Deno.test("malformed provider tool calls add a system correction on retry", asyn
     "request",
     "response",
   ]);
-  assertEquals(events[2].request?.systemMode, "omitted-after-initial");
+  // The correction changes the system message, so the retry must resend it.
+  assertEquals(events[2].request?.systemMode, "full");
   assertEquals(
     (events[2].request?.prompt as unknown[]).length,
-    1,
+    2,
   );
   assert(
     JSON.stringify(events[2].request?.prompt).includes(
@@ -1851,14 +1903,24 @@ Deno.test("ShellFeature: emits raw shell plus configured tools", async () => {
       command: "rg {pattern}",
       description: "Search code",
       params: {
-        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+        pattern: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "Pattern",
+        },
       },
     },
     run_linter: {
       command: "eslint {file}",
       description: "Run linter",
       params: {
-        file: { type: "string", required: true, array: false, description: "File" },
+        file: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "File",
+        },
       },
     },
   }).createTools();
@@ -1883,9 +1945,24 @@ Deno.test("ShellFeature: configured tool Zod schema matches config", async () =>
       command: "rg {pattern}",
       description: "Search code",
       params: {
-        pattern: { type: "string", required: true, array: false, description: "Pattern" },
-        hidden: { type: "boolean", required: false, array: false, description: "Hidden" },
-        max_results: { type: "number", required: false, array: false, description: "Max" },
+        pattern: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "Pattern",
+        },
+        hidden: {
+          type: "boolean",
+          required: false,
+          array: false,
+          description: "Hidden",
+        },
+        max_results: {
+          type: "number",
+          required: false,
+          array: false,
+          description: "Max",
+        },
       },
     },
   }).createTools();
@@ -1907,7 +1984,12 @@ Deno.test("ShellFeature: configured tool with array param produces Zod array", a
       command: "echo {#FOR flag IN flags}{flag}{#END}",
       description: "Run with flags",
       params: {
-        flags: { type: "string", required: true, array: true, description: "Flags" },
+        flags: {
+          type: "string",
+          required: true,
+          array: true,
+          description: "Flags",
+        },
       },
     },
   }).createTools();
@@ -1915,7 +1997,10 @@ Deno.test("ShellFeature: configured tool with array param produces Zod array", a
   const schema = z.toJSONSchema(tool.parameters) as {
     properties?: Record<string, { type?: string; items?: unknown }>;
   };
-  const flagsProp = schema.properties?.flags as { type?: string; items?: unknown };
+  const flagsProp = schema.properties?.flags as {
+    type?: string;
+    items?: unknown;
+  };
   assertEquals(flagsProp.type, "array");
   assert(flagsProp.items !== undefined);
 });
@@ -1926,7 +2011,12 @@ Deno.test("ShellFeature: configured tool validate rejects missing required param
       command: "echo {pattern}",
       description: "Run",
       params: {
-        pattern: { type: "string", required: true, array: false, description: "Pattern" },
+        pattern: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "Pattern",
+        },
       },
     },
   }).createTools();
@@ -1941,8 +2031,18 @@ Deno.test("ShellFeature: configured tool validates optional params", async () =>
       command: "echo {pattern}",
       description: "Run",
       params: {
-        pattern: { type: "string", required: true, array: false, description: "Pattern" },
-        verbose: { type: "boolean", required: false, array: false, description: "Verbose" },
+        pattern: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "Pattern",
+        },
+        verbose: {
+          type: "boolean",
+          required: false,
+          array: false,
+          description: "Verbose",
+        },
       },
     },
   }).createTools();
@@ -1951,7 +2051,10 @@ Deno.test("ShellFeature: configured tool validates optional params", async () =>
   const result = tool.parameters.safeParse({ pattern: "test" });
   assert(result.success);
   // With optional param should also succeed
-  const withVerbose = tool.parameters.safeParse({ pattern: "test", verbose: true });
+  const withVerbose = tool.parameters.safeParse({
+    pattern: "test",
+    verbose: true,
+  });
   assert(withVerbose.success);
 });
 
@@ -1959,7 +2062,9 @@ Deno.test("ShellFeature: configured tool renders command via TextTemplate", asyn
   let receivedCommand: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(
       command: string | string[],
     ): Promise<CommandResult> {
@@ -1972,8 +2077,12 @@ Deno.test("ShellFeature: configured tool renders command via TextTemplate", asyn
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
 
   const tools = await new ShellFeature({
@@ -1981,8 +2090,18 @@ Deno.test("ShellFeature: configured tool renders command via TextTemplate", asyn
       command: "rg {pattern}\n{#IF hidden}\n--hidden\n{#END}",
       description: "Search",
       params: {
-        pattern: { type: "string", required: true, array: false, description: "Pattern" },
-        hidden: { type: "boolean", required: false, array: false, description: "Hidden" },
+        pattern: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "Pattern",
+        },
+        hidden: {
+          type: "boolean",
+          required: false,
+          array: false,
+          description: "Hidden",
+        },
       },
     },
   }).createTools();
@@ -2022,7 +2141,9 @@ Deno.test("ShellFeature: configured tool shell-escapes string params", async () 
   let receivedCommand: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(
       command: string | string[],
     ): Promise<CommandResult> {
@@ -2035,8 +2156,12 @@ Deno.test("ShellFeature: configured tool shell-escapes string params", async () 
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
 
   const tools = await new ShellFeature({
@@ -2044,7 +2169,12 @@ Deno.test("ShellFeature: configured tool shell-escapes string params", async () 
       command: "echo {msg}",
       description: "Echo",
       params: {
-        msg: { type: "string", required: true, array: false, description: "Message" },
+        msg: {
+          type: "string",
+          required: true,
+          array: false,
+          description: "Message",
+        },
       },
     },
   }).createTools();
@@ -2068,7 +2198,9 @@ Deno.test("ShellFeature: configured tool preserves array order for {#FOR}", asyn
   let receivedCommand: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(
       command: string | string[],
     ): Promise<CommandResult> {
@@ -2081,8 +2213,12 @@ Deno.test("ShellFeature: configured tool preserves array order for {#FOR}", asyn
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
 
   const tools = await new ShellFeature({
@@ -2090,7 +2226,12 @@ Deno.test("ShellFeature: configured tool preserves array order for {#FOR}", asyn
       command: "echo\n{#FOR item IN items}\n{item}\n{#END}",
       description: "Multi echo",
       params: {
-        items: { type: "string", required: true, array: true, description: "Items" },
+        items: {
+          type: "string",
+          required: true,
+          array: true,
+          description: "Items",
+        },
       },
     },
   }).createTools();
@@ -2115,7 +2256,9 @@ Deno.test("ShellFeature: configured tool preserves array order for {#FOR}", asyn
 Deno.test("ShellFeature: configured tool returns model-facing result", async () => {
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(): Promise<CommandResult> {
       return Promise.resolve({
         exitCode: 0,
@@ -2125,8 +2268,12 @@ Deno.test("ShellFeature: configured tool returns model-facing result", async () 
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
 
   const tools = await new ShellFeature({
@@ -2148,7 +2295,10 @@ Deno.test("ShellFeature: configured tool returns model-facing result", async () 
       control: {},
     },
   } as never, {});
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.exitCode, 0);
   assertEquals(result.stdout, "result-data");
   assertEquals(result.timedOut, false);
@@ -2168,7 +2318,9 @@ Deno.test("ShellFeature: start_background builds a tmux new-session command", as
   let received: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       received = Array.isArray(command) ? command.join(" ") : command;
       return Promise.resolve({
@@ -2179,8 +2331,12 @@ Deno.test("ShellFeature: start_background builds a tmux new-session command", as
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "start_background")!;
@@ -2194,7 +2350,10 @@ Deno.test("ShellFeature: start_background builds a tmux new-session command", as
       control: {},
     },
   } as never, { name: "server", command: "python3 -m http.server 8000" });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.status, "started");
   assertEquals(result.name, "server");
   assert(received!.startsWith("tmux new-session -d"));
@@ -2207,7 +2366,9 @@ Deno.test("ShellFeature: start_background shell-escapes the command", async () =
   let received: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       received = Array.isArray(command) ? command.join(" ") : command;
       return Promise.resolve({
@@ -2218,8 +2379,12 @@ Deno.test("ShellFeature: start_background shell-escapes the command", async () =
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "start_background")!;
@@ -2234,14 +2399,19 @@ Deno.test("ShellFeature: start_background shell-escapes the command", async () =
     },
   } as never, { name: "weird", command: "echo 'hi'" });
   // Single quotes inside the command must be escaped for the bash -c wrapper.
-  assert(received!.includes("'\\''"), `expected escaped quote, got: ${received}`);
+  assert(
+    received!.includes("'\\''"),
+    `expected escaped quote, got: ${received}`,
+  );
 });
 
 Deno.test("ShellFeature: stop_background kills the session", async () => {
   let received: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       received = Array.isArray(command) ? command.join(" ") : command;
       return Promise.resolve({
@@ -2252,8 +2422,12 @@ Deno.test("ShellFeature: stop_background kills the session", async () => {
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "stop_background")!;
@@ -2267,7 +2441,10 @@ Deno.test("ShellFeature: stop_background kills the session", async () => {
       control: {},
     },
   } as never, { name: "server" });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.status, "stopped");
   assert(received!.includes("tmux kill-session -t 'server'"));
 });
@@ -2275,7 +2452,9 @@ Deno.test("ShellFeature: stop_background kills the session", async () => {
 Deno.test("ShellFeature: stop_background reports not_found", async () => {
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(): Promise<CommandResult> {
       return Promise.resolve({
         exitCode: 1,
@@ -2285,8 +2464,12 @@ Deno.test("ShellFeature: stop_background reports not_found", async () => {
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "stop_background")!;
@@ -2300,14 +2483,19 @@ Deno.test("ShellFeature: stop_background reports not_found", async () => {
       control: {},
     },
   } as never, { name: "server" });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.status, "not_found");
 });
 
 Deno.test("ShellFeature: get_background returns output and liveness", async () => {
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       const cmd = Array.isArray(command) ? command.join(" ") : command;
       if (cmd.includes("has-session")) {
@@ -2345,8 +2533,12 @@ Deno.test("ShellFeature: get_background returns output and liveness", async () =
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "get_background")!;
@@ -2360,7 +2552,10 @@ Deno.test("ShellFeature: get_background returns output and liveness", async () =
       control: {},
     },
   } as never, { name: "server" });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.found, true);
   assertEquals(result.alive, true);
   assertEquals(result.output, "listening on 8000\n");
@@ -2369,7 +2564,9 @@ Deno.test("ShellFeature: get_background returns output and liveness", async () =
 Deno.test("ShellFeature: get_background reports not found", async () => {
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       const cmd = Array.isArray(command) ? command.join(" ") : command;
       if (cmd.includes("has-session")) {
@@ -2389,8 +2586,12 @@ Deno.test("ShellFeature: get_background reports not found", async () => {
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "get_background")!;
@@ -2404,7 +2605,10 @@ Deno.test("ShellFeature: get_background reports not found", async () => {
       control: {},
     },
   } as never, { name: "ghost" });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.found, false);
   assertEquals(result.alive, false);
 });
@@ -2413,7 +2617,9 @@ Deno.test("ShellFeature: get_background honours the n line limit", async () => {
   let received: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       const cmd = Array.isArray(command) ? command.join(" ") : command;
       if (cmd.includes("has-session")) {
@@ -2443,8 +2649,12 @@ Deno.test("ShellFeature: get_background honours the n line limit", async () => {
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "get_background")!;
@@ -2458,7 +2668,10 @@ Deno.test("ShellFeature: get_background honours the n line limit", async () => {
       control: {},
     },
   } as never, { name: "server", last: 50 });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.found, true);
   assertEquals(result.output, "tail\n");
   // -S -50 captures the last 50 lines instead of all history.
@@ -2469,7 +2682,9 @@ Deno.test("ShellFeature: send_background sends keys with Enter", async () => {
   let received: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       received = Array.isArray(command) ? command.join(" ") : command;
       return Promise.resolve({
@@ -2480,8 +2695,12 @@ Deno.test("ShellFeature: send_background sends keys with Enter", async () => {
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "send_background")!;
@@ -2495,7 +2714,10 @@ Deno.test("ShellFeature: send_background sends keys with Enter", async () => {
       control: {},
     },
   } as never, { name: "server", input: "GET /" });
-  const result = unwrapObservedToolResult(value).result as Record<string, unknown>;
+  const result = unwrapObservedToolResult(value).result as Record<
+    string,
+    unknown
+  >;
   assertEquals(result.status, "sent");
   assert(received!.includes("tmux send-keys -t 'server' 'GET /' Enter"));
 });
@@ -2504,7 +2726,9 @@ Deno.test("ShellFeature: send_background omits Enter when enter is false", async
   let received: string | undefined;
   const runtime = new class implements RuntimeEnv {
     readonly agentId = "alpha";
-    prepare(): Promise<void> { return Promise.resolve(); }
+    prepare(): Promise<void> {
+      return Promise.resolve();
+    }
     exec(command: string | string[]): Promise<CommandResult> {
       received = Array.isArray(command) ? command.join(" ") : command;
       return Promise.resolve({
@@ -2515,8 +2739,12 @@ Deno.test("ShellFeature: send_background omits Enter when enter is false", async
         aborted: false,
       });
     }
-    destroy(): Promise<void> { return Promise.resolve(); }
-    reset(): Promise<void> { return Promise.resolve(); }
+    destroy(): Promise<void> {
+      return Promise.resolve();
+    }
+    reset(): Promise<void> {
+      return Promise.resolve();
+    }
   }();
   const tools = await new ShellFeature().createTools();
   const tool = tools.find((t) => t.name === "send_background")!;
@@ -2536,13 +2764,15 @@ Deno.test("ShellFeature: send_background omits Enter when enter is false", async
 
 Deno.test("ShellFeature: feature gating — no shell feature means no configured tools", async () => {
   const features = new FeatureRegistry<AgentRunDeps>();
-  features.register(new ShellFeature({
-    custom_tool: {
-      command: "echo hi",
-      description: "Custom",
-      params: {},
-    },
-  }));
+  features.register(
+    new ShellFeature({
+      custom_tool: {
+        command: "echo hi",
+        description: "Custom",
+        params: {},
+      },
+    }),
+  );
   features.register(new FilesystemFeature());
   Context.set("features", features);
   try {

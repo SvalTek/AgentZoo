@@ -19,7 +19,8 @@ deno task dev
 
 Use another config with `deno task dev --config path/to/zoo.yaml`. The Cliffy
 command starts a deno-ink dashboard when attached to an interactive terminal.
-Press `q` or Ctrl+C for a graceful stop. Use `--no-ui` for line-oriented output.
+Press `q` or Ctrl+C for a graceful stop; press Ctrl+C again to force exit if
+shutdown is taking too long. Use `--no-ui` for line-oriented output.
 Supply a run-wide objective without editing YAML using `--task "..."`; it
 overrides the top-level `taskPrompt` for that run.
 

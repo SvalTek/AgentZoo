@@ -10,6 +10,38 @@ export type MCPTool = {
   inputSchema: Record<string, unknown>;
 };
 
+/** A resource published by an MCP server. */
+export type MCPResource = {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  size?: number;
+};
+
+/** A parameterized resource URI published by an MCP server. */
+export type MCPResourceTemplate = {
+  uriTemplate: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+};
+
+/** Text or base64 content returned when an MCP resource is read. */
+export type MCPResourceContent = {
+  uri: string;
+  mimeType?: string;
+  text?: string;
+  blob?: string;
+};
+
+/** Result of reading an MCP resource URI. */
+export type MCPReadResourceResult = {
+  contents: MCPResourceContent[];
+};
+
 /** A single content item returned by an MCP tool call. */
 export type MCPTextContent = { type: "text"; text: string };
 export type MCPImageContent = { type: "image"; data: string; mimeType: string };

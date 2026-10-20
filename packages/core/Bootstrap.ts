@@ -19,13 +19,16 @@ import { ShellFeature } from "./tools/ShellTool.ts";
 import { FilesystemFeature } from "./tools/FilesystemTools.ts";
 import { VisionFeature } from "./tools/ViewImageTool.ts";
 import { HttpFeature } from "./tools/HttpRequestTool.ts";
+import { TerminalFeature } from "./tools/TerminalTool.ts";
 import { FeatureRegistry } from "./Feature.ts";
+import { SkillsFeature } from "./SkillsFeature.ts";
 import {
   createCompletionTool,
   createYieldTool,
 } from "./tools/LifecycleTools.ts";
 import type { RuntimeEnv, RuntimeManager } from "./types.ts";
 import type { ModelRuntimeConfig } from "./types.ts";
+import { MCPPool } from "./mcp/MCPPool.ts";
 
 export type ServiceFactory = () =>
   | Service
@@ -83,6 +86,7 @@ export async function buildAgentZoo(
   };
   let zoo: AgentZoo | undefined;
   let featureRegistry: FeatureRegistry<AgentRunDeps> | undefined;
+  let mcpPool: MCPPool | undefined;
 
   const stopRuntime = async () => {
     if (lifecycle.stop) await lifecycle.stop();
@@ -102,11 +106,16 @@ export async function buildAgentZoo(
 
   try {
     const population = await expandPopulation(config);
+    mcpPool = new MCPPool(config.mcp, workspace.root);
     featureRegistry = new FeatureRegistry<AgentRunDeps>();
     featureRegistry.register(new ShellFeature(config.tools));
     featureRegistry.register(new FilesystemFeature());
     featureRegistry.register(new VisionFeature());
     featureRegistry.register(new HttpFeature());
+    featureRegistry.register(new TerminalFeature());
+    featureRegistry.register(
+      new SkillsFeature(resolve(baseDir, config.skills.directory)),
+    );
     Context.set("features", featureRegistry);
     const initialPrompts: Record<string, string | undefined> = {};
     const builtAgents: ZooAgent[] = [];
@@ -192,6 +201,7 @@ export async function buildAgentZoo(
           models,
           options.modelFactory ?? createLanguageModel,
           orderedTools,
+          mcpPool.select(member.id, member.mcp),
         ),
       );
       initialPrompts[member.id] = composeInitialPrompt(
@@ -212,6 +222,7 @@ export async function buildAgentZoo(
       initialPrompts,
       clock: options.clock,
       random: options.random,
+      mcpPool,
       dispose,
     });
     for (const [name, factory] of Object.entries(options.services ?? {})) {
@@ -284,6 +295,13 @@ async function configureGitIdentity(
 
 const BuiltinToolOrder = [
   "shell",
+  "terminal_create",
+  "terminal_list",
+  "terminal_read",
+  "terminal_send",
+  "terminal_keys",
+  "terminal_clear",
+  "terminal_kill",
   "apply_patch",
   "write_file",
   "edit_file",
@@ -346,8 +364,9 @@ export function composeInitialPrompt(
   return parts.length ? parts.join("\n") : undefined;
 }
 
-interface PopulationMember {
+export interface PopulationMember {
   id: string;
+  semanticId: string;
   name?: string;
   type: string;
   model: string;
@@ -356,13 +375,14 @@ interface PopulationMember {
   systemPrompt?: string;
   prompt?: string;
   features: string[];
+  mcp?: string[];
   cwd: string;
   maxTurns: number;
   context?: ModelRuntimeConfig["context"];
   sampling?: ModelRuntimeConfig["sampling"];
 }
 
-async function expandPopulation(
+export async function expandPopulation(
   config: ZooConfig,
 ): Promise<PopulationMember[]> {
   const members: PopulationMember[] = [];
@@ -378,6 +398,7 @@ async function expandPopulation(
       ids.add(id);
       members.push({
         id,
+        semanticId,
         name: group.names?.[offset - 1] ?? group.name,
         type: group.type,
         model: group.model,
@@ -386,6 +407,7 @@ async function expandPopulation(
         systemPrompt: group.systemPrompt,
         prompt: group.prompt,
         features: [...group.features],
+        mcp: group.mcp ? [...group.mcp] : undefined,
         cwd: group.cwd,
         maxTurns: group.maxTurns,
         context: group.context,

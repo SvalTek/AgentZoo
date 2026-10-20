@@ -8,11 +8,13 @@ import {
   cleanupManagedDockerResources,
   dockerRuntimeIdForProject,
   DockerRuntimeManager,
+  expandPopulation,
   listManagedDockerImages,
   listManagedDockerRuns,
   loadConfig,
   type ManagedDockerImage,
   type ManagedDockerRun,
+  type PopulationMember,
 } from "@agent-zoo/core";
 
 export interface DockerCliActions {
@@ -43,9 +45,48 @@ const defaultDockerActions: DockerCliActions = {
   cleanupProject: cleanupManagedDockerProject,
 };
 
+export interface AttachActions {
+  /** Attach an interactive shell to the agent's chroot; resolves with the exit code. */
+  enter(hostName: string, agentId: string, cwd: string): Promise<number>;
+}
+
+const defaultAttachActions: AttachActions = {
+  enter: enterAgentChroot,
+};
+
+async function enterAgentChroot(
+  hostName: string,
+  agentId: string,
+  cwd: string,
+): Promise<number> {
+  const child = new Deno.Command("docker.exe", {
+    args: [
+      "exec",
+      "--interactive",
+      "--tty",
+      hostName,
+      "runtime-host",
+      "chroot-exec",
+      agentId,
+      "--command-id",
+      crypto.randomUUID(),
+      "--cwd",
+      cwd,
+      "--",
+      "/bin/bash",
+    ],
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  }).spawn();
+  const status = await child.status;
+  return status.code;
+}
+
 export function createCli(
   run: (configPath: string, useUi: boolean, task?: string) => Promise<void>,
   dockerActions: DockerCliActions = defaultDockerActions,
+  attachActions: AttachActions = defaultAttachActions,
 ) {
   const root = new Command()
     .name("agent-zoo")
@@ -94,7 +135,9 @@ export function createCli(
           options.all === true,
         ].filter(Boolean).length;
         if (selectors !== 1) {
-          throw new Error("Specify exactly one of --config, --runtime, or --all");
+          throw new Error(
+            "Specify exactly one of --config, --runtime, or --all",
+          );
         }
 
         const pruneImages = options.pruneImages ?? false;
@@ -132,6 +175,25 @@ export function createCli(
       }),
   );
   root.command("agent", agent);
+
+  root.command(
+    "attach",
+    new Command()
+      .description(
+        "Open an interactive shell inside an agent's private environment.",
+      )
+      .arguments("<who:string>")
+      .option("-c, --config <path:string>", "AgentZoo YAML configuration path")
+      .action(async (options, who) => {
+        const configPath = await resolveConfigPath(options.config);
+        const code = await attachConfiguredAgent(
+          configPath,
+          who,
+          attachActions,
+        );
+        if (code !== 0) Deno.exit(code);
+      }),
+  );
 
   return root;
 }
@@ -174,6 +236,78 @@ async function purgeConfiguredAgent(
   } finally {
     await runtime.stop();
   }
+}
+
+/** Resolve `<who>` to a configured agent; the opaque id is authoritative. */
+export function resolvePopulationMember(
+  population: readonly PopulationMember[],
+  who: string,
+): PopulationMember {
+  const byId = population.find((member) => member.id === who);
+  if (byId) return byId;
+
+  const bySemantic = population.filter((member) =>
+    member.semanticId.toLowerCase() === who.toLowerCase()
+  );
+  if (bySemantic.length === 1) return bySemantic[0];
+  if (bySemantic.length > 1) {
+    throw new Error(
+      `Agent id "${who}" is ambiguous; rerun with one of these opaque ids:\n` +
+        formatAgentCandidates(bySemantic),
+    );
+  }
+
+  const byName = population.filter((member) =>
+    member.name?.toLowerCase() === who.toLowerCase()
+  );
+  if (byName.length === 1) return byName[0];
+  if (byName.length > 1) {
+    throw new Error(
+      `Agent name "${who}" is ambiguous; rerun with one of these opaque ids:\n` +
+        formatAgentCandidates(byName),
+    );
+  }
+
+  throw new Error(
+    `No configured agent matches "${who}"; known agents:\n` +
+      formatAgentCandidates(population),
+  );
+}
+
+function formatAgentCandidates(members: readonly PopulationMember[]): string {
+  return members.map((member) =>
+    `  ${member.id}  (${member.semanticId}${
+      member.name ? `, ${member.name}` : ""
+    })`
+  ).join("\n");
+}
+
+export async function attachConfiguredAgent(
+  configPath: string,
+  who: string,
+  attachActions: AttachActions = defaultAttachActions,
+): Promise<number> {
+  const config = await loadConfig(configPath);
+  const member = resolvePopulationMember(await expandPopulation(config), who);
+  const workspaceRoot = resolve(
+    dirname(configPath),
+    config.runtime.sharedWorkspace,
+  );
+  const runtime = new DockerRuntimeManager(
+    workspaceRoot,
+    undefined,
+    undefined,
+    { project: configPath },
+  );
+  // prepare() starts the container if stopped; create-agent re-mounts the
+  // overlay and revives agent-init after a container restart.
+  await runtime.createEnv(member.id);
+  console.log(
+    `Attaching to ${member.semanticId}${
+      member.name ? ` (${member.name})` : ""
+    } [${member.id}]...`,
+  );
+  return await attachActions.enter(runtime.hostName, member.id, member.cwd);
 }
 
 export function formatManagedDockerResources(

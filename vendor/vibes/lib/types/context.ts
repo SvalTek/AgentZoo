@@ -34,6 +34,10 @@ export interface RunContext<TDeps = undefined> {
   runId: string;
   /** Per-run metadata supplied by the caller. */
   metadata: Record<string, unknown>;
+  /** @internal Serialized model-prompt envelope sizes resolved for this turn. */
+  toolSchemaChars?: number;
+  /** @internal Resolved system/instruction prompt size for this turn. */
+  systemPromptChars?: number;
   /**
    * Metadata attached by tools after execution, keyed by tool call ID.
    * Tools call `attachMetadata(toolCallId, meta)` to populate this map.

@@ -505,16 +505,10 @@ export async function prepareTurn<TDeps, TOutput>(
     sequentialMutex,
   );
 
-  const historyProcessors = opts._override?.historyProcessors ??
-    agent.historyProcessors;
-  const msgsForModel = await applyHistoryProcessors(
-    historyProcessors,
-    messages,
-    ctx,
-  );
+  ctx.toolSchemaChars = serializedCharCount(toolMap);
 
-  // Resolve per-turn instructions and combine with system prompt.
-  // For 'prompted' mode with outputTemplate enabled, append the schema prompt.
+  // Resolve this before history processing so a processor can budget the full
+  // provider envelope rather than treating tool schemas/instructions as free.
   let baseSystem = await resolveSystemWithInstructions(
     agent,
     ctx,
@@ -535,6 +529,15 @@ export async function prepareTurn<TDeps, TOutput>(
     );
     baseSystem = baseSystem ? `${baseSystem}\n\n${schemaPrompt}` : schemaPrompt;
   }
+  ctx.systemPromptChars = baseSystem?.length ?? 0;
+
+  const historyProcessors = opts._override?.historyProcessors ??
+    agent.historyProcessors;
+  const msgsForModel = await applyHistoryProcessors(
+    historyProcessors,
+    messages,
+    ctx,
+  );
 
   const system = baseSystem;
 
@@ -549,6 +552,14 @@ export async function prepareTurn<TDeps, TOutput>(
     outputToolNames,
     resolvedTools,
   };
+}
+
+function serializedCharCount(value: unknown): number {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return 0;
+  }
 }
 
 /** Resolve effective model settings, merging agent-level with run/override-level. */

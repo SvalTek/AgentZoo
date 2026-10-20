@@ -23,11 +23,19 @@ export async function runStandalone(
   let startup: Awaited<ReturnType<typeof render>> | undefined;
   let zoo: AgentZoo | undefined;
   let activityLog: ActivityLog | undefined;
-  let signalHandled = false;
+  let interruptCount = 0;
   const stop = () => {
-    if (signalHandled) return;
-    signalHandled = true;
-    void zoo?.stop("SIGINT");
+    interruptCount++;
+    if (interruptCount > 1) {
+      console.error("Second Ctrl+C received; forcing exit.");
+      Deno.exit(130);
+    }
+    if (!interactive) {
+      console.error("Stopping gracefully. Press Ctrl+C again to force exit.");
+    }
+    void zoo?.stop("SIGINT").catch((error) => {
+      console.error("Graceful shutdown failed:", error);
+    });
   };
   try {
     startup = interactive
@@ -38,13 +46,22 @@ export async function runStandalone(
       : undefined;
     Deno.addSignalListener("SIGINT", stop);
     const config = await loadConfig(configPath);
+    if (interruptCount > 0) return;
     const built = await buildAgentZoo(config, {
       baseDir: dirname(configPath),
       taskPrompt: task,
       runtimeProject: configPath,
     });
     zoo = built.zoo;
+    if (interruptCount > 0) {
+      await zoo.stop("SIGINT");
+      return;
+    }
     activityLog = await ActivityLog.create(zoo, built.models, configPath);
+    if (interruptCount > 0) {
+      await zoo.stop("SIGINT");
+      return;
+    }
     if (interactive && startup) {
       startup.rerender(
         <ZooDashboard

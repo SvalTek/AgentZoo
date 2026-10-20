@@ -18,6 +18,7 @@ models:
 templates: {}
 runtime: {}
 services: []
+mcp: []
 agents:
   - type: example
     model: local-qwen
@@ -203,6 +204,38 @@ runtime:
 
 The host directory is mounted as `/shared` in every agent environment.
 
+## `mcp`
+
+Optional named host-side MCP servers. AgentZoo constructs them during build,
+connects and discovers a selected server lazily when an agent first needs its
+tools, and disconnects them during shutdown. An MCP server is trusted host-side
+code: use only servers and commands you trust.
+
+```yaml
+mcp:
+  - name: context7
+    description: Look up current documentation and examples for software libraries.
+    type: stdio
+    command: npx
+    args: ["-y", "@upstash/context7-mcp@4.0.3"]
+```
+
+Every server needs a unique lowercase `name` (letters, digits, and hyphens) and
+a non-empty `description`. AgentZoo lists the name and description in the system
+prompt only for agents assigned that server. The model calls `list_tools` with
+the server name to discover its tools; those direct `mcp_<server>_...` tools
+become available on the next model turn. `list_resources` and `read_resource`
+provide access to MCP resources and resource templates independently of the
+toolset. `stdio` needs `command` and optional `args`/`env`; `http` needs an
+HTTP(S) `url` and optional `headers`. `${NAME}` references in MCP transport
+strings are expanded from the environment during config loading; missing or
+empty values fail loading without disclosing the resolved secret.
+
+MCP processes run on the host, not in an agent's Docker root. Use
+`{shared.host}` for the host absolute shared-workspace path. `{shared.agent}`
+means the literal `/shared` when passing that string intentionally to another
+agent-facing system. A literal `/shared` is never rewritten.
+
 ## `agents`
 
 Each item describes a population group rather than one transient model call.
@@ -216,6 +249,7 @@ agents:
     system: neutral-system
     prompt: Examine the supplied materials.
     features: [shell, filesystem]
+    mcp: [github]
     cwd: /root
     maxTurns: 100
     context:
@@ -305,21 +339,58 @@ List of structured convenience interfaces shown to the model. Defaults to:
 features: [shell, filesystem]
 ```
 
-Supported built-in values are `shell`, `filesystem`, `http`, and `vision`.
-`vision` is opt-in and is not part of the default set. The lifecycle tool
-`yield` is always added. `complete` is added only when completion is enabled.
+Supported built-in values are `shell`, `filesystem`, `http`, `vision`,
+`terminal`, and `skills`. `vision` and `skills` are opt-in and are not part of
+the default set. The lifecycle tool `yield` is always added. `complete` is added
+only when completion is enabled.
 
 Features affect the model-visible tool list and add their own system guidance;
 the guidance follows the same feature-group order as the tools. They do not
 necessarily remove an underlying capability already available through `shell`.
+
+`terminal` is opt-in and provides persistent interactive terminals in the
+agent's own runtime. It is distinct from `shell`, which executes bounded
+one-shot commands.
+
+`skills` is opt-in and provides `skills_list` and `skills_load`. It lets an
+agent discover project Markdown skills by name and load their complete
+instructions only when needed.
+
+### `skills`
+
+```yaml
+skills:
+  directory: .agentzoo_skills
+```
+
+`directory` defaults to `.agentzoo_skills`. Relative paths are resolved beside
+the selected configuration file. A directory may contain flat `name.md` files or
+`name/SKILL.md` packages. Optional YAML frontmatter supplies `name` and
+`description`; otherwise the filename or package directory supplies the name.
+The directory is read by the Zoo host, so it is a project-owned instruction
+source rather than a Docker agent-writable directory.
+
+### `mcp`
+
+Selects host-side MCP servers for every member of this population. Omit it or
+use `[]` to expose none; use `["*"]` for every top-level server; or list exact
+names such as `[github, docs]`. Names must exist, may not repeat, and `"*"` must
+appear alone.
+
+Each selected server is exposed on demand and prefixed before Vibes combines
+toolsets. For example, after `list_tools` is called for `github`, its `search`
+tool is available as `mcp_github_search`, so it can coexist with another
+server's `search` and AgentZoo's own tools. A post-prefix collision with an
+explicitly identically named local tool is rejected rather than silently
+replaced.
 
 ### `cwd`
 
 Starting working directory inside the private agent environment. Defaults to
 `/root`. It is used by shell/filesystem tools. When `shell` is enabled, its
 system guidance observes the agent's actual login user (normally `root`),
-working directory, and bounded directory listing; without `shell`, AgentZoo
-does not make that observation.
+working directory, and bounded directory listing; without `shell`, AgentZoo does
+not make that observation.
 
 ### `maxTurns`
 

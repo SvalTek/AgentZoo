@@ -58,8 +58,9 @@ line-oriented mode.
 Configured names are displayed as `Alice (c4842989967d)`. Stable IDs remain the
 unambiguous identity even when several agents deliberately share one name.
 
-Press `q` or Ctrl+C to request a graceful shutdown. The alternate terminal
-screen and cursor are restored after cleanup.
+Press `q` or Ctrl+C to request a graceful shutdown. If cleanup is taking too
+long, press Ctrl+C again to force exit. The alternate terminal screen and cursor
+are restored after graceful cleanup.
 
 ## Scheduling behavior
 

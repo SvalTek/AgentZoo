@@ -81,7 +81,13 @@ Deno.test("runner preserves actors, tracks idle time, wakes with time, and compl
   let now = 10_000;
   const alpha = new FakeActor(
     "alpha",
-    { id: "alpha", name: "Alpha", type: "coding", model: "local", features: ["shell"] },
+    {
+      id: "alpha",
+      name: "Alpha",
+      type: "coding",
+      model: "local",
+      features: ["shell"],
+    },
     [{ outcome: "yield" }, { outcome: "complete" }],
     () => now += 1_000,
   );
@@ -282,7 +288,11 @@ Deno.test("shutdown still disposes runtime when an actor stop fails", async () =
   });
   zoo.registerAgent(actor);
 
-  await assertRejects(() => zoo.stop("test"), AggregateError, "shutdown failed");
+  await assertRejects(
+    () => zoo.stop("test"),
+    AggregateError,
+    "shutdown failed",
+  );
   assertEquals(actor.stopped, 1);
   assertEquals(disposed, 1);
 });
@@ -583,6 +593,10 @@ completion:
       "read_file",
       "list_directory",
       "search_files",
+      "start_background",
+      "stop_background",
+      "get_background",
+      "send_background",
       "yield",
     ]);
     assertEquals((built.zoo.getAgent("6d58953e1a16") as ZooAgent).toolNames, [
@@ -594,6 +608,10 @@ completion:
       "list_directory",
       "search_files",
       "http_request",
+      "start_background",
+      "stop_background",
+      "get_background",
+      "send_background",
       "yield",
     ]);
     assertEquals(built.zoo.getAgent("6d58953e1a16")?.config.features, [

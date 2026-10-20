@@ -30,6 +30,10 @@ mount_agent_dev() {
   mknod -m 666 "$dev/tty" c 5 0
   mkdir -m 755 "$dev/pts"
   mkdir -m 1777 "$dev/shm"
+  # A private devpts instance keeps one agent's terminal devices out of every
+  # other agent's view. Agent commands run as container root with DAC override,
+  # so a shared instance would let them open sibling terminals instead of only
+  # their own. Interactive attach allocates its pty from this instance.
   mount -t devpts -o nosuid,noexec,newinstance,ptmxmode=0666,mode=0620,gid=5 devpts "$dev/pts"
   ln -s pts/ptmx "$dev/ptmx"
   mount -t tmpfs -o nosuid,nodev,mode=1777,size=64m tmpfs "$dev/shm"
@@ -163,12 +167,37 @@ if [[ "${1:-}" == "chroot-exec-private" ]]; then
   [[ -n "$command_id" ]] || { echo "command id required" >&2; exit 2; }
   # The directory change happens after chroot, so it is evaluated in the
   # private merged root rather than against the runtime host filesystem.
+  run_command=(
+    chroot "${root}/merged" /bin/bash -c 'cd -- "$1" && shift && exec "$@"'
+    bash "$cwd" "$@"
+  )
+  # Interactive callers arrive on the pty allocated by `docker exec -t`, which
+  # belongs to the runtime host's devpts instance. That instance is not visible
+  # in the agent, so run the command on a pty from the agent's own devpts
+  # instead: `script` allocates it there, makes it the controlling terminal
+  # (job control, /dev/tty), keeps ttyname() and ps(1)'s TTY column working,
+  # and relays bytes and window size. The launcher is replaced rather than
+  # backgrounded because an asynchronous command in a non-interactive shell
+  # inherits SIGINT/SIGQUIT as ignored, which survives exec and makes Ctrl-C
+  # dead in the attached shell.
+  if [[ -t 0 ]]; then
+    [[ -x "${root}/merged/usr/bin/script" ]] || {
+      echo "interactive attach requires /usr/bin/script in the agent root" >&2
+      exit 6
+    }
+    printf -v quoted_arguments '%q ' "$@"
+    exec env --default-signal=INT --default-signal=QUIT \
+      chroot "${root}/merged" /usr/bin/script -q -e \
+      -c "cd -- $(printf '%q' "$cwd") && exec ${quoted_arguments}" /dev/null
+  fi
   mkdir -p "${root}/commands"
   command_file="${root}/commands/${command_id}.pid"
   # An asynchronous command in a non-interactive shell otherwise receives
   # /dev/null on stdin. Preserve Docker exec's input for write/edit tools.
   exec 3<&0
-  setsid chroot "${root}/merged" /bin/bash -c 'cd -- "$1" && shift && exec "$@"' bash "$cwd" "$@" <&3 &
+  # Piped execs have no terminal and run in their own session so cancellation
+  # can signal the whole process group.
+  setsid "${run_command[@]}" <&3 &
   command_pid="$!"
   printf '%s\n' "$command_pid" > "$command_file"
   status=0

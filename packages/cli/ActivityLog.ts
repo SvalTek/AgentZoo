@@ -132,7 +132,40 @@ function safeStringify(value: unknown): string {
   const seen = new WeakSet<object>();
   return JSON.stringify(value, (_key, item) => {
     if (item instanceof Error) {
-      return { name: item.name, message: item.message, stack: item.stack };
+      if (seen.has(item)) return "[Circular]";
+      seen.add(item);
+      const record = item as Error & Record<string, unknown>;
+      const serialized: Record<string, unknown> = {
+        name: item.name,
+        message: item.message,
+        stack: item.stack,
+      };
+      const keys = new Set([
+        ...Object.keys(record),
+        "url",
+        "statusCode",
+        "responseHeaders",
+        "responseBody",
+        "isRetryable",
+        "data",
+        "cause",
+        "reason",
+        "errors",
+        "lastError",
+      ]);
+      for (const key of keys) {
+        if (key === "name" || key === "message" || key === "stack") continue;
+        if (key === "requestBodyValues") continue;
+        if (!(key in record)) continue;
+        serialized[key] = key === "responseBody" &&
+            typeof record[key] === "string"
+          ? truncateDiagnosticText(record[key] as string)
+          : record[key];
+      }
+      if ("requestBodyValues" in record) {
+        serialized.requestBodyValues = "[omitted]";
+      }
+      return serialized;
     }
     if (typeof item === "bigint") return item.toString();
     if (item && typeof item === "object") {
@@ -141,4 +174,10 @@ function safeStringify(value: unknown): string {
     }
     return item;
   });
+}
+
+function truncateDiagnosticText(value: string, limit = 32_768): string {
+  return value.length <= limit
+    ? value
+    : `${value.slice(0, limit)}… [truncated]`;
 }

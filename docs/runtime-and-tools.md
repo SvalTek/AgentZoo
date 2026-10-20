@@ -20,10 +20,13 @@ Consequences:
 - The configured `cwd` refers to a path inside the agent environment.
 - Shell and filesystem convenience tools see the same namespace. If `shell`
   writes `/root/a.txt`, `read_file` reads that same file.
-- Each agent receives a private minimal `/dev`, including its own devpts and
-  `/dev/shm`, and a persistent private PID namespace with its own `/proc`.
-  Background processes remain visible to later commands in the same environment
-  but are not visible or signalable from another agent environment.
+- Each agent receives a private minimal `/dev` with its own `/dev/pts` and
+  `/dev/shm`, and a persistent private PID namespace with its own `/proc`. An
+  attached terminal allocates its pty from the agent's own devpts instance, so
+  `tty`, `ttyname()`, and job control work without exposing sibling agents'
+  or the operator's terminals. Background processes remain visible to later
+  commands in the same environment but are not visible or signalable from
+  another agent environment.
 - Debian package management is available inside the private root; packages
   installed by one agent remain private to that agent.
 
@@ -42,6 +45,53 @@ Tool names and descriptions expose immediate computer capabilities without
 describing the scheduler, population, experiment, Docker, OverlayFS, or host
 paths. `/shared` exists naturally in the filesystem; tools do not prescribe a
 collaboration protocol for it.
+
+## MCP toolsets
+
+MCP servers are Zoo-owned host connections, not tools executed inside an agent's
+private runtime. Each assigned server is represented by its own Vibes toolset.
+The model initially sees the assigned server names and descriptions plus
+`list_tools`, `list_resources`, and `read_resource`. Calling `list_tools`
+discovers one server's tools and exposes that server's direct tools on the next
+model turn. `list_resources` returns its resources and resource templates;
+`read_resource` reads a discovered URI. Unrequested toolsets stay hidden and do
+not connect. Vibes caches each discovered server's tool list. AgentZoo creates a
+transport only on first discovery and performs one clean reconnect/re-discovery
+when a previously healthy server no longer answers discovery. It never replays a
+failed tool call. If a selected server remains unavailable, AgentZoo omits it
+for that activation and emits a prominent MCP-unavailable activity event.
+AgentZoo prefixes every server's tool names as `mcp_<server>_` before
+composition, then records MCP calls through the same correlated tool lifecycle
+events as built-in tools.
+
+Tool schemas are part of each provider request. AgentZoo measures the resolved
+per-turn tool surface—including MCP servers requested during the current
+activation—before history trimming and reserves it together with the system
+prompt and configured output allowance. Unrequested MCP schemas do not consume
+that context budget. The three small MCP discovery and resource builtins are
+present for agents assigned MCP servers.
+
+MCP tool results are returned as text, and resource reads as JSON containing
+text or base64 resource content. These results are not passed as native
+multimodal content; do not rely on MCP for workflows that require native image
+or other structured-content handling.
+
+## Interactive terminals
+
+The opt-in `terminal` feature gives an agent persistent interactive terminals
+inside its own isolated runtime. It is for REPLs, TUIs, debuggers, interactive
+programs, SSH, and development servers that require later keyboard input. Use
+`shell` for ordinary one-shot commands instead.
+
+The feature exposes `terminal_create`, `terminal_list`, `terminal_read`,
+`terminal_send`, `terminal_keys`, `terminal_clear`, and `terminal_kill`.
+Sessions persist across model turns, activations, yields, and idle periods; an
+agent may stop them explicitly, and runtime teardown stops all of them.
+
+`terminal_read` returns a bounded plain-text tmux capture. Interactive programs
+therefore receive a real terminal while AgentZoo renders only inert text in its
+own TUI. Use `terminal_send` for literal text (optionally followed by Enter) and
+`terminal_keys` for symbolic keys such as `Up`, `Escape`, or `C-c`.
 
 ## Lifecycle tools
 
@@ -178,8 +228,8 @@ features: [shell, filesystem, vision]
 ```
 
 It exposes `view_image`, which lets the model view an image file from the
-computer. `path` selects the image as an absolute path or a path relative to
-the current working directory; an optional `cwd` sets the directory the path is
+computer. `path` selects the image as an absolute path or a path relative to the
+current working directory; an optional `cwd` sets the directory the path is
 resolved from and defaults to the current working directory. The complete image
 is read and returned to the model. The image type is detected from the file's
 magic bytes (PNG, JPEG, GIF, WebP, BMP, and JPEG 2000); a file that is not a
