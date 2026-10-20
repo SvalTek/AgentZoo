@@ -899,6 +899,45 @@ Deno.test({
         "does not match",
       );
 
+      // Deleting an empty file is still a change.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        ": > /root/empty-delete.txt",
+      ]);
+      const emptyDelete = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/empty-delete.txt",
+          "+++ /dev/null",
+          "@@ -0,0 +0,0 @@",
+        ].join("\n"),
+      });
+      assertEquals(emptyDelete.filesChanged, 1);
+      const emptyGone = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "test ! -e /root/empty-delete.txt",
+      ]);
+      assertEquals(emptyGone.exitCode, 0, JSON.stringify(emptyGone));
+
+      // Absolute patch paths are not applied outside the working directory.
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- /etc/hosts",
+              "+++ /etc/hosts",
+              "@@ -1 +1 @@",
+              "-x",
+              "+y",
+            ].join("\n"),
+          }),
+        Error,
+        "is absolute",
+      );
+
       // A symlink target is rejected rather than replaced by a regular file.
       await alpha.exec([
         "/bin/bash",

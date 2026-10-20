@@ -11,6 +11,7 @@ import {
   type RunContext,
   type Toolset,
 } from "@vibesjs/sdk";
+import { ErrorCode, McpError } from "npm:@modelcontextprotocol/sdk@^1/types.js";
 import type { MCPServerConfig } from "../Config.ts";
 import type { AgentRunDeps } from "../Agent.ts";
 
@@ -269,11 +270,13 @@ export function mcpToolPrefix(serverName: string): string {
  * recovery.
  */
 export function isServerResponseError(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code;
-  // JSON-RPC errors live in the reserved negative range. The SDK also reuses
-  // `code` for HTTP statuses and transport conditions, which must recover.
-  return typeof code === "number" && code <= -32000 && code >= -32768 &&
-    code !== -32000 && code !== -32001;
+  // The SDK raises McpError for a JSON-RPC response from the server, whatever
+  // the application-defined code is. HTTP, SSE, and stream failures are other
+  // error classes that must still trigger recovery. The two connection codes
+  // are McpError instances but describe transport conditions.
+  if (!(error instanceof McpError)) return false;
+  const code = (error as { code?: number }).code;
+  return code !== ErrorCode.ConnectionClosed && code !== ErrorCode.RequestTimeout;
 }
 
 export function substituteSharedPathTokens(

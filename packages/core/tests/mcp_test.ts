@@ -17,6 +17,7 @@ import {
   type Toolset,
 } from "@vibesjs/sdk";
 import { z } from "zod";
+import { ErrorCode, McpError } from "npm:@modelcontextprotocol/sdk@^1/types.js";
 import {
   type AgentRunDeps,
   AgentZoo,
@@ -565,9 +566,7 @@ Deno.test("MCP tool names are sanitized into unique provider-safe identifiers", 
 Deno.test("MCP resource rejection surfaces the server error, not an outage", async () => {
   const client = new FakeMCPClient();
   client.readResource = () =>
-    Promise.reject(
-      Object.assign(new Error("Resource not found"), { code: -32602 }),
-    );
+    Promise.reject(new McpError(-32602, "Resource not found"));
   const [server] = new MCPPool(
     [{
       name: "chatroom",
@@ -603,7 +602,7 @@ Deno.test("MCP transport error codes still trigger reconnection", async () => {
   const client = new FakeMCPClient();
   client.readResource = () =>
     Promise.reject(
-      Object.assign(new Error("Connection closed"), { code: -32000 }),
+      new McpError(ErrorCode.ConnectionClosed, "Connection closed"),
     );
   const [server] = new MCPPool(
     [{

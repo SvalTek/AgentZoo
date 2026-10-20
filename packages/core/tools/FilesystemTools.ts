@@ -905,8 +905,8 @@ async function stagePatch(
         "Remove every line in the hunk, or patch the file instead of deleting it.",
       ], { patch });
     }
-    // A section that leaves the text identical is not a change.
-    if (before !== null && updated === before) continue;
+    // A section that keeps the file is not a change; a deletion always is.
+    if (newPath !== null && before !== null && updated === before) continue;
     staged.set(path, {
       path,
       before,
@@ -1155,8 +1155,15 @@ function runPatchCommand(
 
 function patchFilePath(name: string, cwd: string): string | null {
   if (name === "/dev/null") return null;
+  const stripped = name.replace(/^[ab]\//, "");
+  if (stripped.startsWith("/")) {
+    throw actionableToolError([
+      `No files were changed: the patch path '${name}' is absolute.`,
+      "Patch paths must be relative to the directory of the applied patch.",
+    ]);
+  }
   try {
-    return resolveRuntimeDirectory(cwd, name.replace(/^[ab]\//, ""));
+    return resolveRuntimeDirectory(cwd, stripped);
   } catch (error) {
     throw actionableToolError([
       `No files were changed: the patch path '${name}' leaves the working directory.`,
