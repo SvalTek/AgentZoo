@@ -55,4 +55,7 @@ agent-zoo-*.jsonl
 *.local.json
 *.local.jsonc
 *.local.yaml
+# Local planning artifacts (temporary, not committed)
+plans/
 *.local.yml
+agent-zoo.yaml
