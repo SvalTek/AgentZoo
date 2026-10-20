@@ -13,6 +13,7 @@ import {
   ToolExecutionError,
   type ToolFeedback,
 } from "../ToolSupport.ts";
+import { relative as relativePath } from "@std/path/posix";
 import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
 
 const PathParameter = z.string().optional().describe(
@@ -149,23 +150,33 @@ test -e "$path" || exit 40
 test -f "$path" || exit 41
 size=$(stat -Lc %s -- "$path") || exit 42
 test "$size" -le "$limit" || exit 43
+stat -Lc %a -- "$path" || exit 42
 base64 -w0 -- "$path" || exit 44
 `;
 
+const PATH_KIND_SCRIPT = String.raw`
+path=$1
+if test -d "$path"; then printf "directory\\n"; exit 0; fi
+if test -e "$path" || test -L "$path"; then printf "exists\\n"; exit 0; fi
+printf "missing\\n"
+`;
+
 /**
- * Write content to a temporary file in the target directory. Existing targets
- * are copied first so their mode and ownership survive the later rename.
+ * Write content to a temporary file in the target directory.
+ *
+ * `action` is either `copy` (preserve an existing target's mode and owner) or
+ * `mode:<perm>` (a new file or a restore, which must not rely on the current
+ * on-disk target).
  */
 const WRITE_TEMP_SCRIPT = String.raw`
-target=$1 exists=$2
+target=$1 action=$2
 dir=$(dirname -- "$target")
 test -d "$dir" || exit 43
 tmp=$(mktemp "$dir/.agentzoo-patch.XXXXXX") || exit 55
-if test "$exists" = true; then
-  cp -p -- "$target" "$tmp" || { rm -f "$tmp"; exit 55; }
-else
-  chmod 644 "$tmp" || { rm -f "$tmp"; exit 55; }
-fi
+case "$action" in
+  copy) cp -p -- "$target" "$tmp" || { rm -f "$tmp"; exit 55; } ;;
+  mode:*) chmod "$${"{"}action#mode:}" "$tmp" || { rm -f "$tmp"; exit 55; } ;;
+esac
 base64 -d > "$tmp" || { rm -f "$tmp"; exit 55; }
 printf '%s\n' "$tmp"
 `;
@@ -679,6 +690,8 @@ interface StagedPatchFile {
   readonly path: string;
   /** Original text, or null when the patch creates the file. */
   readonly before: string | null;
+  /** Original permission bits, used when a rollback must recreate the file. */
+  readonly mode: string | null;
   /** Patched text, or null when the patch deletes the file. */
   readonly after: string | null;
   readonly additions: number;
@@ -697,9 +710,14 @@ async function stagePatch(
   patch: string,
   cwd: string,
 ): Promise<Map<string, StagedPatchFile>> {
+  // diff requires one consistent line ending, including the final line, and
+  // autoConvertLineEndings adapts the result to each file. Mixed or
+  // unterminated patches are normalised to LF before parsing.
+  const normalizedPatch = (patch.endsWith("\n") ? patch : `${patch}\n`)
+    .replaceAll("\r\n", "\n");
   let files;
   try {
-    files = parsePatch(patch);
+    files = parsePatch(normalizedPatch);
   } catch (error) {
     throw actionableToolError([
       "No files were changed: the patch could not be parsed.",
@@ -738,17 +756,37 @@ async function stagePatch(
         "Combine the changes for that file into one section.",
       ], { patch });
     }
-    const before = oldPath === null ? null : await readPatchFile(deps, oldPath, cwd);
-    if (before === null && oldPath !== null) {
-      throw actionableToolError([
-        `No files were changed: ${relativeToDirectory(cwd, oldPath)} does not exist.`,
-        "Read the affected files and rebuild the patch from their current contents.",
-        "Create a new file with write_file, or with a '--- /dev/null' patch section.",
-      ], { patch });
+
+    let before: string | null = null;
+    let mode: string | null = null;
+    if (oldPath !== null) {
+      const read = await readPatchFile(deps, oldPath, cwd);
+      if (read === null) {
+        throw actionableToolError([
+          `No files were changed: ${relativeToDirectory(cwd, oldPath)} does not exist.`,
+          "Read the affected files and rebuild the patch from their current contents.",
+          "Create a new file with write_file, or with a '--- /dev/null' patch section.",
+        ], { patch });
+      }
+      before = read.content;
+      mode = read.mode;
+    } else {
+      // A creation section must not replace something that is already there.
+      const kind = await pathKind(deps, path);
+      if (kind !== "missing") {
+        throw actionableToolError([
+          `No files were changed: ${relativeToDirectory(cwd, path)} already exists.`,
+          kind === "directory"
+            ? "The path is a directory."
+            : "Remove it first, or patch the existing file instead of creating it.",
+        ], { patch });
+      }
     }
-    // A hunk that matches more than one region can silently edit the wrong
-    // one, so require the patch to identify a unique location.
-    const normalizedSource = (before ?? "").replaceAll("\r\n", "\n");
+
+    // Apply hunks one at a time, checking each against the text produced so
+    // far: a later hunk can be unique only after an earlier hunk changed the
+    // text it matches.
+    let working = before ?? "";
     for (const hunk of file.hunks) {
       const oldLines: string[] = [];
       let trailingNewline = true;
@@ -758,78 +796,87 @@ async function stagePatch(
           if (oldLines.length > 0) trailingNewline = false;
           continue;
         }
-        if (line.startsWith("+")) continue;
-        if (line.startsWith(" ") || line.startsWith("-")) {
-          oldLines.push(line.slice(1));
+        // diff stores a blank context line as "" rather than " ".
+        const operation = line.length > 0 ? line[0] : " ";
+        if (operation === "+") continue;
+        if (operation === " " || operation === "-") {
+          oldLines.push(line.slice(1).replace(/\r$/, ""));
           trailingNewline = true;
         }
       }
       if (oldLines.length === 0) {
         // An insertion with no unchanged line can only be placed by its line
         // number, which is stale as soon as the file changes.
-        if ((before ?? "").length > 0) {
+        if (working.length > 0) {
           throw actionableToolError([
             `No files were changed: the hunk at line ${hunk.oldStart} has no context.`,
             "Include at least one unchanged line so the change has a unique position.",
             "Read the file and copy the line before or after the addition into the hunk.",
           ], { patch });
         }
-        continue;
+      } else {
+        const needle = oldLines.join("\n") + (trailingNewline ? "\n" : "");
+        if (needle !== "") {
+          const normalizedWorking = working.replaceAll("\r\n", "\n");
+          let occurrences = 0;
+          for (
+            let index = normalizedWorking.indexOf(needle);
+            index !== -1;
+            index = normalizedWorking.indexOf(needle, index + needle.length)
+          ) occurrences++;
+          // A hunk may end at a file whose last line has no newline; the
+          // parser still reports that line with one.
+          if (
+            occurrences === 0 && needle.endsWith("\n") &&
+            normalizedWorking.endsWith(needle.slice(0, -1))
+          ) occurrences = 1;
+          if (occurrences === 0) {
+            throw actionableToolError([
+              `No files were changed: the hunk at line ${hunk.oldStart} does not match ${relativeToDirectory(cwd, path)}.`,
+              "Read that file and rebuild the hunk from its current contents.",
+              "Do not resend the same patch unchanged.",
+            ], { patch });
+          }
+          if (occurrences > 1) {
+            throw actionableToolError([
+              `No files were changed: the hunk at line ${hunk.oldStart} matches ${occurrences} places in ${relativeToDirectory(cwd, path)}.`,
+              "Include more surrounding context so the hunk identifies one location.",
+              hunk.lines.some((line) => line.startsWith("-"))
+                ? "Read the file and copy the surrounding lines around the intended change."
+                : "Add the unchanged lines immediately before or after the change.",
+            ], { patch });
+          }
+        }
       }
-      const needle = oldLines.join("\n") + (trailingNewline ? "\n" : "");
-      if (needle.trim() === "") continue;
-      let occurrences = 0;
-      for (
-        let index = normalizedSource.indexOf(needle);
-        index !== -1;
-        index = normalizedSource.indexOf(needle, index + needle.length)
-      ) occurrences++;
-      // A hunk may end at a file whose last line has no newline; the parser
-      // still reports that line with one.
+      const single = { ...file, hunks: [hunk] };
+      let next = applyPatch(working, single, {
+        fuzzFactor: 0,
+        autoConvertLineEndings: true,
+      });
       if (
-        occurrences === 0 && needle.endsWith("\n") &&
-        normalizedSource.endsWith(needle.slice(0, -1))
-      ) occurrences = 1;
-      if (occurrences === 0) {
+        next === false && !working.endsWith("\n") &&
+        hunk.lines.some((line) => line.startsWith("\\"))
+      ) {
+        // diff refuses a no-final-newline hunk against a file that already
+        // lacks the newline; retry against a newline-terminated copy, which
+        // yields the patched text without the newline.
+        next = applyPatch(`${working}\n`, single, {
+          fuzzFactor: 0,
+          autoConvertLineEndings: true,
+        });
+      }
+      if (next === false) {
         throw actionableToolError([
-          `No files were changed: the hunk at line ${hunk.oldStart} does not match ${relativeToDirectory(cwd, path)}.`,
+          `No files were changed: the patch context does not match ${relativeToDirectory(cwd, path)}.`,
           "Read that file and rebuild the hunk from its current contents.",
           "Do not resend the same patch unchanged.",
         ], { patch });
       }
-      if (occurrences > 1) {
-        throw actionableToolError([
-          `No files were changed: the hunk at line ${hunk.oldStart} matches ${occurrences} places in ${relativeToDirectory(cwd, path)}.`,
-          "Include more surrounding context so the hunk identifies one location.",
-          hunk.lines.some((line) => line.startsWith("-"))
-            ? "Read the file and copy the surrounding lines around the intended change."
-            : "Add the unchanged lines immediately before or after the change.",
-        ], { patch });
-      }
+      working = next;
     }
-    let updated: string | false;
-    try {
-      updated = applyPatch(before ?? "", file, {
-        fuzzFactor: 0,
-        autoConvertLineEndings: true,
-      });
-    } catch (error) {
-      throw actionableToolError([
-        `No files were changed: the patch could not be applied to ${relativeToDirectory(cwd, path)}.`,
-        `The patch parser reported: ${error instanceof Error ? error.message : String(error)}`,
-        "Read that file and rebuild the hunk from its current contents.",
-      ], { patch });
-    }
-    if (updated === false) {
-      throw actionableToolError([
-        `No files were changed: the patch context does not match ${relativeToDirectory(cwd, path)}.`,
-        "Read that file and rebuild the hunk from its current contents.",
-        "Do not resend the same patch unchanged.",
-      ], { patch });
-    }
+
+    const updated = working;
     // Deleting the file is only correct when the patch removes every line.
-    // A partial deletion would otherwise remove content the patch did not
-    // mention.
     if (newPath === null && updated !== "") {
       const remaining = updated.replace(/\n$/, "").split("\n").length;
       throw actionableToolError([
@@ -838,9 +885,12 @@ async function stagePatch(
         "Remove every line in the hunk, or patch the file instead of deleting it.",
       ], { patch });
     }
+    // A section that leaves the text identical is not a change.
+    if (before !== null && updated === before) continue;
     staged.set(path, {
       path,
       before,
+      mode,
       after: newPath === null ? null : updated,
       additions: file.hunks.reduce(
         (total, hunk) =>
@@ -869,11 +919,17 @@ async function commitPatch(
       if (file.after === null) continue;
       temps.set(
         file.path,
-        await writeTempFile(deps, file.path, file.after, file.before !== null),
+        await writeTempFile(
+          deps,
+          file.path,
+          file.after,
+          file.before === null ? "mode:644" : "copy",
+        ),
       );
     }
   } catch (error) {
     await removeFiles(deps, [...temps.values()]);
+    if (error instanceof ToolExecutionError) throw error;
     throw actionableToolError([
       "No files were changed: the patched contents could not be staged.",
       "Check available space and permissions in the target directories.",
@@ -886,7 +942,8 @@ async function commitPatch(
       const temp = temps.get(file.path);
       return file.after === null
         ? `rm -f -- ${shellQuote(file.path)}`
-        : `mv -f -- ${shellQuote(temp!)} ${shellQuote(file.path)}`;
+        : `test ! -d ${shellQuote(file.path)} || exit 41\n` +
+          `mv -f -- ${shellQuote(temp!)} ${shellQuote(file.path)}`;
     }),
   ].join("\n");
   const commit = await runPatchCommand(deps, script, "commit_patch", []);
@@ -926,7 +983,12 @@ async function rollbackPatch(
         if (removed.exitCode !== 0) failed.push(file.path);
         continue;
       }
-      const temp = await writeTempFile(deps, file.path, file.before, true);
+      const temp = await writeTempFile(
+        deps,
+        file.path,
+        file.before,
+        `mode:${file.mode ?? "644"}`,
+      );
       const moved = await runPatchCommand(
         deps,
         `mv -f -- ${shellQuote(temp)} ${shellQuote(file.path)}`,
@@ -942,12 +1004,12 @@ async function rollbackPatch(
   return failed;
 }
 
-/** Read a patch target, or null when it does not exist. */
+/** Read a patch target and its permission bits, or null when it is missing. */
 async function readPatchFile(
   deps: AgentRunDeps,
   path: string,
   cwd: string,
-): Promise<string | null> {
+): Promise<{ content: string; mode: string } | null> {
   const raw = await runPatchCommand(
     deps,
     READ_TEXT_SCRIPT,
@@ -971,7 +1033,8 @@ async function readPatchFile(
         : "Check the file permissions and available space before retrying.",
     ], { raw });
   }
-  const bytes = decodeBase64Bytes(raw.stdout.replaceAll(/\s+/g, ""));
+  const [modeLine = "644", encoded = ""] = raw.stdout.split("\n", 2);
+  const bytes = decodeBase64Bytes(encoded.replaceAll(/\s+/g, ""));
   if (bytes.includes(0)) {
     throw actionableToolError([
       `No files were changed: ${relativeToDirectory(cwd, path)} is not a text file.`,
@@ -979,7 +1042,10 @@ async function readPatchFile(
     ], { raw });
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return {
+      content: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      mode: modeLine.trim(),
+    };
   } catch {
     throw actionableToolError([
       `No files were changed: ${relativeToDirectory(cwd, path)} is not valid UTF-8 text.`,
@@ -992,21 +1058,42 @@ async function writeTempFile(
   deps: AgentRunDeps,
   path: string,
   content: string,
-  exists: boolean,
+  action: "copy" | `mode:${string}`,
 ): Promise<string> {
   const raw = await runPatchCommand(
     deps,
     WRITE_TEMP_SCRIPT,
     "write_patch_temp",
-    [path, exists ? "true" : "false"],
+    [path, action],
     encodeBase64(content),
   );
   if (raw.exitCode !== 0 || !raw.stdout.trim()) {
+    if (raw.exitCode === 43) {
+      throw actionableToolError([
+        `No files were changed: the directory for ${path} does not exist.`,
+        "Create the directory first, or choose a path whose directory exists.",
+      ], { raw });
+    }
     throw new ToolExecutionError("The patched contents could not be staged.", {
       raw,
     });
   }
   return raw.stdout.trim();
+}
+
+/** Report whether a path is missing, a file, or a directory. */
+async function pathKind(
+  deps: AgentRunDeps,
+  path: string,
+): Promise<"missing" | "exists" | "directory"> {
+  const raw = await runPatchCommand(
+    deps,
+    PATH_KIND_SCRIPT,
+    "path_kind",
+    [path],
+  );
+  const kind = raw.stdout.trim();
+  return kind === "directory" ? "directory" : kind === "exists" ? "exists" : "missing";
 }
 
 async function removeFiles(
@@ -1042,12 +1129,18 @@ function runPatchCommand(
 
 function patchFilePath(name: string, cwd: string): string | null {
   if (name === "/dev/null") return null;
-  return resolveRuntimeDirectory(cwd, name.replace(/^[ab]\//, ""));
+  try {
+    return resolveRuntimeDirectory(cwd, name.replace(/^[ab]\//, ""));
+  } catch (error) {
+    throw actionableToolError([
+      `No files were changed: the patch path '${name}' leaves the working directory.`,
+      "Use a path inside the working directory.",
+    ], { error });
+  }
 }
 
 function relativeToDirectory(cwd: string, path: string): string {
-  const prefix = cwd.endsWith("/") ? cwd : `${cwd}/`;
-  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+  return relativePath(cwd, path) || ".";
 }
 
 function shellQuote(value: string): string {

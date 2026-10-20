@@ -39,7 +39,7 @@ head_code=$${"{"}statuses[1]}
 set -e
 if test "$head_code" -ne 0; then
   printf 'the response body could not be captured\n'
-  exit 49
+  exit 50
 fi
 if test "$code" -ne 0 && test "$code" -ne 23; then
   head -n 1 "$err_file"
@@ -135,6 +135,12 @@ export class HttpFeature implements Feature<AgentRunDeps> {
         } catch (error) {
           throw new ToolExecutionError("The HTTP request failed.", { error });
         }
+        if (raw.exitCode === 50) {
+          throw actionableToolError([
+            "The response was received but its body could not be captured.",
+            "Retry the request; if it persists, check free space in this computer.",
+          ], { command: raw });
+        }
         if (raw.exitCode !== 0) {
           const detail = raw.stdout.split(/\r?\n/).map((line) => line.trim())
             .find(Boolean);
@@ -216,6 +222,7 @@ function decodeBody(
   bytes: Uint8Array,
   clipped: boolean,
 ): { value: string; encoding: "utf-8" | "base64" } {
+  if (bytes.length === 0) return { value: "", encoding: "utf-8" };
   // Binary payloads are the ones carrying NUL bytes; UTF-8 text never does.
   if (bytes.includes(0)) return { value: toBase64(bytes), encoding: "base64" };
   // A clipped body can end mid-character. Drop up to three trailing bytes and

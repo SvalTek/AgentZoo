@@ -208,7 +208,8 @@ no Git worktree is required. Hunk line counts must be exact, and a hunk may
 begin or end with a changed line, so trailing context is not required. Patch
 lines are matched in the target file's own line endings, so an LF patch edits a
 CRLF file without mixing endings, and file creation and deletion
-(`--- /dev/null`, `+++ /dev/null`) are supported.
+(`--- /dev/null`, `+++ /dev/null`) are supported. A creation section refuses a
+path that already exists, including a directory.
 
 Every affected file is read and patched in memory before anything is written,
 so a parse error, missing file, oversized target (32 MiB), non-text file, or

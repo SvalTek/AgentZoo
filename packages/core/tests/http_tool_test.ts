@@ -61,3 +61,9 @@ Deno.test("HTTP decoding falls back to base64 for a complete non-UTF-8 body", as
     btoa(String.fromCharCode(0x68, 0x69, 0xff)),
   );
 });
+
+Deno.test("HTTP decoding treats an empty body as UTF-8 text", async () => {
+  const result = await request(new Uint8Array(0));
+  assertEquals(result.bodyEncoding, "utf-8");
+  assertEquals(result.body, "");
+});

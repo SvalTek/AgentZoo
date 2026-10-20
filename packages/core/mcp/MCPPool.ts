@@ -270,7 +270,10 @@ export function mcpToolPrefix(serverName: string): string {
  */
 export function isServerResponseError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
-  return typeof code === "number" && code !== -32000 && code !== -32001;
+  // JSON-RPC errors live in the reserved negative range. The SDK also reuses
+  // `code` for HTTP statuses and transport conditions, which must recover.
+  return typeof code === "number" && code <= -32000 && code >= -32768 &&
+    code !== -32000 && code !== -32001;
 }
 
 export function substituteSharedPathTokens(

@@ -344,7 +344,7 @@ Deno.test("list_tools loads one MCP toolset for the next model turn", async () =
   await assertRejects(
     () => listTools.execute(context, { mcp_name: "unassigned" } as never),
     Error,
-    "not available to this agent",
+    "not available here",
   );
 });
 
@@ -635,4 +635,42 @@ Deno.test("MCP transport error codes still trigger reconnection", async () => {
   );
   assertEquals(client.connects, 2);
   assert(client.disconnects >= 1);
+});
+
+Deno.test("MCP HTTP status codes still trigger reconnection", async () => {
+  const client = new FakeMCPClient();
+  client.readResource = () =>
+    Promise.reject(
+      Object.assign(new Error("Streamable HTTP error: upstream is down"), {
+        code: 500,
+      }),
+    );
+  const [server] = new MCPPool(
+    [{
+      name: "chatroom",
+      description: "Talk with other agents.",
+      type: "stdio",
+      command: "chatroom",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["chatroom"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  await server.resources.listResources();
+  const readResource = createMCPResourceTools([server]).find((tool) =>
+    tool.name === "read_resource"
+  )!;
+  await assertRejects(
+    () =>
+      readResource.execute(context, {
+        mcp_name: "chatroom",
+        uri: "agent-chat://inbox",
+      } as never),
+    Error,
+    "currently unavailable",
+  );
+  assertEquals(client.connects, 2);
 });

@@ -53,7 +53,7 @@ const KeysParameters = NamedParameters.extend({
 export class TerminalFeature implements Feature<AgentRunDeps> {
   readonly id = "terminal";
   readonly description =
-    "Create and interact with persistent terminals. Use this when a program needs ongoing keyboard input, a screen, or continuity across turns.";
+    "Create and interact with persistent terminals. Use this when a program needs ongoing keyboard input, a screen, or continuity between separate interactions.";
   readonly systemPrompt = new TextTemplate(`## Interactive terminals
 
 Use \`shell\` for normal one-shot commands. Use \`terminal_create\` when a program needs ongoing keyboard input, a persistent screen, or interaction across turns. Read the terminal before deciding what to send. Use \`terminal_send\` for literal text and \`terminal_keys\` for keys such as Up, Enter, Escape, or C-c. Terminals belong only to this computer and persist until you kill them or this computer stops.`);

@@ -18,7 +18,7 @@ const ShellParameters = z.object({
     "The Bash command to execute. Required for execution. It may contain multiple lines. The result reports the exit code, stdout, stderr, timeout, abort status, and truncation flags. stdout and stderr are each capped at 65536 characters; when truncated, the first 65536 characters are kept. exitCode does not describe a command failure when timedOut or aborted is true.",
   ),
   cwd: z.string().optional().describe(
-    "Optional directory path only, such as '/root' or '/shared/project'. Do not put commands, operators, redirects, or scripts here. Put all shell code in command. Omit cwd to use the current working directory.",
+    "Optional directory path only, such as '/root' or '/shared/project', as an absolute path or a path relative to the current working directory. '..' is not allowed. Do not put commands, operators, redirects, or scripts here. Put all shell code in command. Omit cwd to use the current working directory.",
   ),
   timeoutMs: z.number().int().positive().max(1_800_000).optional().describe(
     "The maximum execution time in milliseconds. Defaults to 120000 and cannot exceed 1800000. Package-manager commands (apt, dpkg, npm, yarn, pnpm, pip, brew) require at least 300000. When reached, the command and processes it started are terminated.",
@@ -249,7 +249,7 @@ Use dedicated command tools when one directly matches the operation. Use the she
     const getBackground = tool<AgentRunDeps, typeof GetBackgroundParams>({
       name: "get_background",
       description:
-        "Retrieve the captured terminal output of a named background session started with start_background, and report whether the process is still running.",
+        "Retrieve the captured terminal output of a named background session started with start_background, and report whether the process is still running and its exit code once it has finished.",
       parameters: GetBackgroundParams,
       execute: async (context, params) => {
         const has = await context.deps.runtime.exec(

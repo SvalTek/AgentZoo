@@ -712,8 +712,183 @@ Deno.test({
         "alpha\nbeta\n",
       );
 
-      // CRLF files accept LF text in both structured edit paths and keep
-      // their own line endings.
+      // Blank context lines arrive from the parser as empty strings and must
+      // still anchor the hunk.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'alpha\\n\\nbeta\\n' > /root/blank-context.txt",
+      ]);
+      const blankContext = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/blank-context.txt",
+          "+++ b/blank-context.txt",
+          "@@ -1,3 +1,4 @@",
+          " alpha",
+          "",
+          "+inserted",
+          " beta",
+        ].join("\n"),
+      });
+      assertEquals(blankContext.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/blank-context.txt"])).stdout,
+        "alpha\n\ninserted\nbeta\n",
+      );
+
+      // Creating a file must not replace one that already exists.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'precious\\n' > /root/exists.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- /dev/null",
+              "+++ b/exists.txt",
+              "@@ -0,0 +1,1 @@",
+              "+replacement",
+            ].join("\n"),
+          }),
+        Error,
+        "already exists",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/exists.txt"])).stdout,
+        "precious\n",
+      );
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "mkdir -p /root/create-target",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- /dev/null",
+              "+++ b/create-target",
+              "@@ -0,0 +1,1 @@",
+              "+x",
+            ].join("\n"),
+          }),
+        Error,
+        "already exists",
+      );
+
+      // A patch whose own lines use CRLF must apply too.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'alpha\\r\\nbeta\\r\\ngamma\\r\\n' > /root/crlf-patch.txt",
+      ]);
+      const crlfPatch = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/crlf-patch.txt",
+          "+++ b/crlf-patch.txt",
+          "@@ -1,3 +1,3 @@",
+          " alpha",
+          "-beta",
+          "+BETA",
+          " gamma",
+        ].join("\r\n"),
+      });
+      assertEquals(crlfPatch.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/crlf-patch.txt"])).stdout,
+        "alpha\r\nBETA\r\ngamma\r\n",
+      );
+
+      // A later hunk may be unique only after an earlier hunk changed the text.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\na\\nb\\ntwo\\na\\nb\\n' > /root/later.txt",
+      ]);
+      const later = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/later.txt",
+          "+++ b/later.txt",
+          "@@ -1,4 +1,4 @@",
+          " one",
+          " a",
+          "-b",
+          "+B",
+          " two",
+          "@@ -5,2 +5,2 @@",
+          " a",
+          "-b",
+          "+B2",
+        ].join("\n"),
+      });
+      assertEquals(later.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/later.txt"])).stdout,
+        "one\na\nB\ntwo\na\nB2\n",
+      );
+
+      // Replacing the final line of a file without a trailing newline.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'a\\nb' > /root/no-eol.txt",
+      ]);
+      const noEol = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/no-eol.txt",
+          "+++ b/no-eol.txt",
+          "@@ -1,2 +1,2 @@",
+          " a",
+          "-b",
+          "+c",
+          "\\ No newline at end of file",
+        ].join("\n"),
+      });
+      assertEquals(noEol.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/no-eol.txt"])).stdout,
+        "a\nc",
+      );
+
+      // A patch path may not leave the working directory.
+      await alpha.exec(["/bin/bash", "-c", "printf 'x\\n' > /root/noop.txt"]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/../escape.txt",
+              "+++ b/../escape.txt",
+              "@@ -1 +1 @@",
+              "-x",
+              "+y",
+            ].join("\n"),
+          }),
+        Error,
+        "leaves the working directory",
+      );
+
+      // A section that changes nothing is not reported as a change.
+      const noop = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/noop.txt",
+          "+++ b/noop.txt",
+          "@@ -1 +1 @@",
+          " x",
+        ].join("\n"),
+      });
+      assertEquals(noop.filesChanged, 0);
+
+
       await alpha.exec([
         "/bin/bash",
         "-c",
