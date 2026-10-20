@@ -156,8 +156,9 @@ base64 -w0 -- "$path" || exit 44
 
 const PATH_KIND_SCRIPT = String.raw`
 path=$1
+if test -L "$path"; then printf "symlink\\n"; exit 0; fi
 if test -d "$path"; then printf "directory\\n"; exit 0; fi
-if test -e "$path" || test -L "$path"; then printf "exists\\n"; exit 0; fi
+if test -e "$path"; then printf "exists\\n"; exit 0; fi
 printf "missing\\n"
 `;
 
@@ -200,9 +201,9 @@ path=$1 pattern=$2 limit=$3 name=$4
 test -e "$path" || exit 40
 test -d "$path" || exit 48
 if test -n "$name"; then
-  find "$path" \( -type f -o -type l \) -name "$name" -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
+  find "$path" -xtype f -name "$name" -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
 else
-  find "$path" \( -type f -o -type l \) -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
+  find "$path" -xtype f -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
 fi | head -n "$((limit + 1))"
 `;
 
@@ -760,6 +761,13 @@ async function stagePatch(
     let before: string | null = null;
     let mode: string | null = null;
     if (oldPath !== null) {
+      const kind = await pathKind(deps, oldPath);
+      if (kind === "symlink") {
+        throw actionableToolError([
+          `No files were changed: ${relativeToDirectory(cwd, oldPath)} is a symbolic link.`,
+          "Patch the file it points to, or replace the link with shell.",
+        ], { patch });
+      }
       const read = await readPatchFile(deps, oldPath, cwd);
       if (read === null) {
         throw actionableToolError([
@@ -776,7 +784,9 @@ async function stagePatch(
       if (kind !== "missing") {
         throw actionableToolError([
           `No files were changed: ${relativeToDirectory(cwd, path)} already exists.`,
-          kind === "directory"
+          kind === "symlink"
+            ? "The path is a symbolic link."
+            : kind === "directory"
             ? "The path is a directory."
             : "Remove it first, or patch the existing file instead of creating it.",
         ], { patch });
@@ -1095,7 +1105,7 @@ async function writeTempFile(
 async function pathKind(
   deps: AgentRunDeps,
   path: string,
-): Promise<"missing" | "exists" | "directory"> {
+): Promise<"missing" | "exists" | "directory" | "symlink"> {
   const raw = await runPatchCommand(
     deps,
     PATH_KIND_SCRIPT,
@@ -1103,7 +1113,13 @@ async function pathKind(
     [path],
   );
   const kind = raw.stdout.trim();
-  return kind === "directory" ? "directory" : kind === "exists" ? "exists" : "missing";
+  return kind === "symlink"
+    ? "symlink"
+    : kind === "directory"
+    ? "directory"
+    : kind === "exists"
+    ? "exists"
+    : "missing";
 }
 
 async function removeFiles(

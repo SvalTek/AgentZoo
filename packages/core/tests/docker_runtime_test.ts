@@ -899,6 +899,46 @@ Deno.test({
         "does not match",
       );
 
+      // A symlink target is rejected rather than replaced by a regular file.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'linked\\n' > /root/link-target.txt; ln -sfn /root/link-target.txt /root/link-path.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/link-path.txt",
+              "+++ b/link-path.txt",
+              "@@ -1 +1 @@",
+              "-linked",
+              "+changed",
+            ].join("\n"),
+          }),
+        Error,
+        "symbolic link",
+      );
+      const linkIntact = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        'test -L /root/link-path.txt && test "$(cat /root/link-target.txt)" = linked',
+      ]);
+      assertEquals(linkIntact.exitCode, 0, JSON.stringify(linkIntact));
+
+      // Text search must not block on a symlink to a FIFO.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "mkdir -p /root/search-tree; printf needle > /root/search-tree/real.txt; mkfifo /root/search-tree/pipe; ln -s pipe /root/search-tree/link-pipe",
+      ]);
+      const fifoSearch = await invoke(alpha, "search_files", {
+        path: "/root/search-tree",
+        text: "needle",
+      });
+      assertEquals((fifoSearch.results as unknown[]).length, 1);
+
       // A section that changes nothing is not reported as a change.
       const noop = await invoke(alpha, "apply_patch", {
         cwd: "/root",
@@ -971,12 +1011,20 @@ Deno.test({
         ),
         ["inner"],
       );
-      const discovered = await invoke(alpha, "search_files", {});
+      const discovered = await invoke(alpha, "search_files", {
+        maxResults: 200,
+      });
       const discoveredPaths = (
         discovered.results as Array<{ path: string }>
       ).map((result) => result.path);
-      assert(discoveredPaths.includes("./tree"));
-      assert(discoveredPaths.includes("./tree/child/deep"));
+      // The agent root also holds files created by earlier assertions, so
+      // match the discovered paths by suffix rather than exact text.
+      assert(discoveredPaths.some((entry) => entry.endsWith("/tree") || entry === "./tree"));
+      assert(
+        discoveredPaths.some((entry) =>
+          entry.endsWith("/tree/child/deep") || entry === "./tree/child/deep"
+        ),
+      );
       const searched = await invoke(alpha, "search_files", {
         path: "/root/tree",
         text: "needle",
