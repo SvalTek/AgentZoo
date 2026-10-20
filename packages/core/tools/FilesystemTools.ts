@@ -764,7 +764,18 @@ async function stagePatch(
           trailingNewline = true;
         }
       }
-      if (oldLines.length === 0) continue;
+      if (oldLines.length === 0) {
+        // An insertion with no unchanged line can only be placed by its line
+        // number, which is stale as soon as the file changes.
+        if ((before ?? "").length > 0) {
+          throw actionableToolError([
+            `No files were changed: the hunk at line ${hunk.oldStart} has no context.`,
+            "Include at least one unchanged line so the change has a unique position.",
+            "Read the file and copy the line before or after the addition into the hunk.",
+          ], { patch });
+        }
+        continue;
+      }
       const needle = oldLines.join("\n") + (trailingNewline ? "\n" : "");
       if (needle.trim() === "") continue;
       let occurrences = 0;
@@ -814,6 +825,17 @@ async function stagePatch(
         `No files were changed: the patch context does not match ${relativeToDirectory(cwd, path)}.`,
         "Read that file and rebuild the hunk from its current contents.",
         "Do not resend the same patch unchanged.",
+      ], { patch });
+    }
+    // Deleting the file is only correct when the patch removes every line.
+    // A partial deletion would otherwise remove content the patch did not
+    // mention.
+    if (newPath === null && updated !== "") {
+      const remaining = updated.replace(/\n$/, "").split("\n").length;
+      throw actionableToolError([
+        `No files were changed: the patch does not delete all of ${relativeToDirectory(cwd, path)}.`,
+        `The patch removes part of the file and would leave ${remaining} line(s).`,
+        "Remove every line in the hunk, or patch the file instead of deleting it.",
       ], { patch });
     }
     staged.set(path, {

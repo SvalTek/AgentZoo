@@ -32,8 +32,10 @@ set +e
 curl --silent --show-error --location --max-redirs 5 --max-time 120 \
   --dump-header "$headers_file" --write-out '%{stderr}\n%{http_code}\n%{url_effective}' \
   "$@" 2> "$err_file" | head -c 1048577 > "$body_file"
-code=$${"{"}PIPESTATUS[0]}
-head_code=$${"{"}PIPESTATUS[1]}
+# Copy PIPESTATUS before any assignment replaces it.
+statuses=("$${"{"}PIPESTATUS[@]}")
+code=$${"{"}statuses[0]}
+head_code=$${"{"}statuses[1]}
 set -e
 if test "$head_code" -ne 0; then
   printf 'the response body could not be captured\n'

@@ -668,6 +668,50 @@ Deno.test({
       });
       assertEquals(disambiguated.filesChanged, 1);
 
+      // A deletion section must remove every line, and an insertion needs an
+      // unchanged line to locate it.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\ntwo\\n' > /root/partial-delete.txt; printf 'alpha\\nbeta\\n' > /root/insert-only.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/partial-delete.txt",
+              "+++ /dev/null",
+              "@@ -1,1 +0,0 @@",
+              "-one",
+            ].join("\n"),
+          }),
+        Error,
+        "does not delete all",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/partial-delete.txt"])).stdout,
+        "one\ntwo\n",
+      );
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/insert-only.txt",
+              "+++ b/insert-only.txt",
+              "@@ -1,0 +2,1 @@",
+              "+inserted",
+            ].join("\n"),
+          }),
+        Error,
+        "has no context",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/insert-only.txt"])).stdout,
+        "alpha\nbeta\n",
+      );
+
       // CRLF files accept LF text in both structured edit paths and keep
       // their own line endings.
       await alpha.exec([
