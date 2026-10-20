@@ -12,6 +12,7 @@ import {
   ToolExecutionError,
   type ToolFeedback,
 } from "../ToolSupport.ts";
+import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
 
 const PathParameter = z.string().optional().describe(
   "The file path for this operation. Required for execution. Use an absolute path or a path relative to the current working directory.",
@@ -89,7 +90,10 @@ test -e "$path" || exit 40
 test -f "$path" || exit 41
 size=$(stat -Lc %s -- "$path") || exit 42
 printf '%s\n' "$size"
-dd if="$path" bs=1 skip="$offset" count="$limit" status=none | base64 -w0
+chunk=$(mktemp) || exit 52
+trap 'rm -f "$chunk"' EXIT
+dd if="$path" bs=1 skip="$offset" count="$limit" status=none > "$chunk" || exit 51
+base64 -w0 "$chunk"
 `;
 
 const WRITE_SCRIPT = String.raw`
@@ -105,6 +109,7 @@ elif test "$mode" = append; then
 else
   cat > "$path"
 fi
+stat -Lc %s -- "$path"
 `;
 
 const EDIT_SCRIPT = String.raw`
@@ -116,6 +121,15 @@ if od -An -v -t u1 -- "$path" | grep -qw 0; then exit 50; fi
 old=$(printf '%s' "$old64" | base64 -d; printf x); old=$${"{"}old%x}
 new=$(printf '%s' "$new64" | base64 -d; printf x); new=$${"{"}new%x}
 content=$(cat -- "$path"; printf x); content=$${"{"}content%x}
+# Match and replace in the file's own line endings: a model that sees CRLF
+# text through read_file may send either form, and the edited region must not
+# end up with mixed endings.
+case "$content" in
+  *$'\r\n'*)
+    old=$${"{"}old//$'\r\n'/$'\n'}; old=$${"{"}old//$'\n'/$'\r\n'}
+    new=$${"{"}new//$'\r\n'/$'\n'}; new=$${"{"}new//$'\n'/$'\r\n'}
+    ;;
+esac
 rest=$content count=0
 while test "$${"{"}rest#*"$old"}" != "$rest"; do
   count=$((count + 1)); rest=$${"{"}rest#*"$old"}
@@ -130,22 +144,83 @@ printf '%s\n' "$replacements"
 
 const PATCH_SCRIPT = String.raw`
 patch_file=$(mktemp) || exit 53
-trap 'rm -f "$patch_file"' EXIT
+normalized=$(mktemp) || exit 53
+trap 'rm -f "$patch_file" "$normalized"' EXIT
 cat > "$patch_file" || exit 53
+# Unified diffs are line-based, but a hunk must match the file's bytes. Rewrite
+# each section's context/added/removed lines to the target file's line ending
+# so an LF patch applies to a CRLF file without relaxing context matching, and
+# a CRLF file never picks up mixed endings. Headers stay LF.
+awk '
+  BEGIN { CR = sprintf("%c", 13); crlf = 0 }
+  {
+    line = $0
+    if (substr(line, length(line)) == CR) sub(CR "$", "", line)
+    if (substr(line, 1, 4) == "+++ ") {
+      path = substr(line, 5)
+      tab = index(path, "\t")
+      if (tab) path = substr(path, 1, tab - 1)
+      if (substr(path, 1, 2) == "b/") path = substr(path, 3)
+      crlf = target_crlf(path)
+      printf "%s\n", line
+      next
+    }
+    if (substr(line, 1, 4) == "--- " || substr(line, 1, 6) == "diff -" ||
+        substr(line, 1, 6) == "index " || substr(line, 1, 5) == "@@ -" ||
+        substr(line, 1, 3) == "new" || substr(line, 1, 3) == "old" ||
+        substr(line, 1, 4) == "renam" || substr(line, 1, 4) == "copy" ||
+        substr(line, 1, 2) == "\\ ") {
+      printf "%s\n", line
+      next
+    }
+    if (substr(line, 1, 1) == " " || substr(line, 1, 1) == "+" ||
+        substr(line, 1, 1) == "-") {
+      if (crlf) printf "%s%s\n", line, CR
+      else printf "%s\n", line
+      next
+    }
+    printf "%s\n", line
+  }
+  function target_crlf(path,   line) {
+    while ((getline line < path) > 0) {
+      if (substr(line, length(line)) == CR) { close(path); return 1 }
+    }
+    close(path)
+    return 0
+  }
+' "$patch_file" > "$normalized" || exit 53
 apply_mode=()
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || apply_mode=(--no-index)
 eof_mode=()
-git apply "$${"{"}apply_mode[@]}" --check --recount --whitespace=nowarn -- "$patch_file" >/dev/null 2>&1 || eof_mode=(--inaccurate-eof)
-git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --check --recount --whitespace=nowarn -- "$patch_file" || exit 51
-git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --numstat -- "$patch_file" || exit 51
-git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --recount --whitespace=nowarn -- "$patch_file" || exit 52
+git apply "$${"{"}apply_mode[@]}" --check --unidiff-zero --whitespace=nowarn -- "$normalized" >/dev/null 2>&1 || eof_mode=(--inaccurate-eof)
+if ! patch_error=$(git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --check --unidiff-zero --whitespace=nowarn -- "$normalized" 2>&1 >/dev/null); then
+  printf '%s\n' "$patch_error" >&2
+  case "$patch_error" in
+    *"corrupt patch"*) exit 60 ;;
+    *"No such file or directory"*) exit 61 ;;
+  esac
+  exit 51
+fi
+git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --check --unidiff-zero --whitespace=nowarn -- "$normalized" || exit 52
+git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --unidiff-zero --whitespace=nowarn -- "$normalized" || exit 52
+stats=$(git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --numstat -- "$normalized") || exit 51
+# --numstat reports work-tree-root-relative paths; report them relative to the
+# directory the patch was applied from, which is what the model supplied.
+prefix=""
+top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
+if [ -n "$top" ] && [ "$top" != "$PWD" ] && [ "$${"{"}PWD#"$top"/}" != "$PWD" ]; then
+  prefix="$${"{"}PWD#"$top"/}/"
+fi
+printf '%s\n' "$stats" | while IFS=$'\t' read -r added removed changed; do
+  printf '%s\t%s\t%s\n' "$added" "$removed" "$${"{"}changed#"$prefix"}"
+done
 `;
 
 const LIST_SCRIPT = String.raw`
 path=$1
 test -e "$path" || exit 40
 test -d "$path" || exit 48
-find "$path" -mindepth 1 -maxdepth 1 -printf '%f\0%y\0%s\0'
+find -H "$path" -mindepth 1 -maxdepth 1 -printf '%f\0%y\0%s\0'
 `;
 
 const SEARCH_NAME_SCRIPT = String.raw`
@@ -160,9 +235,9 @@ path=$1 pattern=$2 limit=$3 name=$4
 test -e "$path" || exit 40
 test -d "$path" || exit 48
 if test -n "$name"; then
-  find "$path" -type f -name "$name" -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
+  find "$path" \( -type f -o -type l \) -name "$name" -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
 else
-  find "$path" -type f -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
+  find "$path" \( -type f -o -type l \) -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
 fi | head -n "$((limit + 1))"
 `;
 
@@ -182,19 +257,34 @@ Use these structured tools for ordinary file and directory work instead of shell
 
   async createTools(): Promise<readonly ToolDefinition<AgentRunDeps>[]> {
     const { tool } = await import("@vibesjs/sdk");
-    const patchFailures: Record<number, ToolFeedback> = {
-      51: [
+    const patchFailures: Record<
+      number,
+      ToolFeedback | ((raw: CommandResult) => ToolFeedback)
+    > = {
+      51: (raw) => [
         "No files were changed: the patch does not match the current files.",
+        ...patchDiagnostic(raw),
         "Read the affected files and rebuild the patch from their current contents.",
         "Do not resend the same patch unchanged.",
       ],
-      52: [
+      52: (raw) => [
         "No files were changed: the checked patch could not be applied.",
+        ...patchDiagnostic(raw),
         "Read the affected files, confirm their current state, and regenerate the patch.",
       ],
       53: [
         "No files were changed: the patch could not be processed.",
         "Provide a complete unified diff with valid file headers and hunk lines.",
+      ],
+      60: (raw) => [
+        "No files were changed: the patch could not be parsed.",
+        ...patchDiagnostic(raw),
+        "Check the '@@' hunk header and line counts, and start every hunk line with a space, '-', or '+'.",
+      ],
+      61: (raw) => [
+        "No files were changed: a file in the patch does not exist.",
+        ...patchDiagnostic(raw),
+        "Check the paths in the '---' and '+++' headers, or create the file with write_file first.",
       ],
     };
     const writeFailures: Record<number, ToolFeedback> = {
@@ -252,6 +342,18 @@ Use these structured tools for ordinary file and directory work instead of shell
         "The path is not a regular file.",
         "Choose a file path; use list_directory when the path is a directory.",
       ],
+      42: [
+        "The file size could not be read.",
+        "Use shell to inspect the path when the file metadata is unavailable.",
+      ],
+      51: [
+        "No bytes were read: the file could not be read.",
+        "Check the file permissions or use shell for files this computer cannot read.",
+      ],
+      52: [
+        "No bytes were read: the read could not be prepared.",
+        "Retry the read, or use shell when the problem persists.",
+      ],
     };
     const directoryFailures: Record<number, ToolFeedback> = {
       40: [
@@ -267,7 +369,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof PatchParameters>({
         name: "apply_patch",
         description:
-          "Apply a unified diff to files. For one small exact replacement, prefer edit_file; prefer apply_patch for changes spanning multiple regions or files. Set cwd to the directory containing the patched paths, use matching relative '--- a/path' and '+++ b/path' headers, and use exact '@@' hunk counts. The complete patch is checked before files are changed. Returns changed paths and addition/deletion counts.",
+          "Apply a unified diff to files. For one small exact replacement, prefer edit_file; prefer apply_patch for changes spanning multiple regions or files. Set cwd to the directory containing the patched paths, use matching relative '--- a/path' and '+++ b/path' headers, and use exact '@@' hunk counts. A hunk may begin or end with a changed line; trailing context is not required. Context matches the file's own line endings, so a LF patch applies to a CRLF file. The complete patch is checked before files are changed. Returns changed paths (relative to cwd) and addition/deletion counts.",
         parameters: PatchParameters,
         argsValidator: (input) => {
           if (!input.patch?.trim()) {
@@ -293,11 +395,12 @@ Use these structured tools for ordinary file and directory work instead of shell
           const patch = input.patch!.endsWith("\n")
             ? input.patch!
             : `${input.patch!}\n`;
+          const cwd = resolveRuntimeDirectory(context.deps.cwd, input.cwd);
           const raw = await execute(
             context.deps,
             ["/bin/bash", "-c", PATCH_SCRIPT, "apply_patch"],
             patch,
-            input.cwd,
+            cwd,
             patchFailures,
           );
           const changes = raw.stdout.split("\n").filter(Boolean).map((line) => {
@@ -322,7 +425,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof WriteParameters>({
         name: "write_file",
         description:
-          "Create a new file without replacing an existing one, append content, or explicitly replace a file's complete contents. Do NOT use this as a general-purpose text editor; prefer edit_file for one small exact replacement or apply_patch for larger or multiple changes. Returns the path, bytesWritten, and mode.",
+          "Create a new file without replacing an existing one, append content, or explicitly replace a file's complete contents. Do NOT use this as a general-purpose text editor; prefer edit_file for one small exact replacement or apply_patch for larger or multiple changes. Returns the path, mode, bytesWritten (bytes sent by this call, not the resulting file size), sizeBytes (the file afterwards), and a message.",
         parameters: WriteParameters,
         argsValidator: validateWriteArguments,
         execute: async (context, input) => {
@@ -346,6 +449,7 @@ Use these structured tools for ordinary file and directory work instead of shell
           const result = {
             path: input.path!,
             bytesWritten: new TextEncoder().encode(content).length,
+            sizeBytes: Number(raw.stdout.trim()),
             mode,
             message: mode === "overwrite"
               ? "Complete file replacement finished. Read or test this file before another write."
@@ -357,7 +461,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof EditParameters>({
         name: "edit_file",
         description:
-          "Make a precise exact-text change to a text file. Prefer edit_file for one small exact replacement; prefer apply_patch for changes spanning multiple regions or files. A missing match fails; multiple matches fail unless replaceAll is true. Returns the path and number of replacements.",
+          "Make a precise exact-text change to a text file. Prefer edit_file for one small exact replacement; prefer apply_patch for changes spanning multiple regions or files. A missing match fails; multiple matches fail unless replaceAll is true. Line endings are matched in the file's own convention, so LF and CRLF forms of oldText both work. Returns the path and number of replacements.",
         parameters: EditParameters,
         argsValidator: validateEditArguments,
         execute: async (context, input) => {
@@ -394,7 +498,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof ReadParameters>({
         name: "read_file",
         description:
-          "Read a bounded section of a UTF-8 text file. Returns content, offset, bytesRead, sizeBytes, truncated, and nextOffset when more data remains.",
+          "Read a bounded section of a UTF-8 text file. offset, limit, and nextOffset are byte positions: offset is the zero-based byte at which reading starts, limit is the maximum number of bytes, and nextOffset is the offset to pass to continue when truncated is true. Returns content, offset, bytesRead, sizeBytes, truncated, and nextOffset while more data remains.",
         parameters: ReadParameters,
         argsValidator: (input) => requirePath(input.path, "read"),
         execute: async (context, input) => {
@@ -478,7 +582,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof ListParameters>({
         name: "list_directory",
         description:
-          "List the immediate contents of a directory without recursive traversal. Returns each entry's name, type, and sizeBytes.",
+          "List the immediate contents of a directory without recursive traversal. Follows a symlinked directory when path itself is a link. Returns each entry's name, type, and sizeBytes (for a symlink, the length of its target path).",
         parameters: ListParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
@@ -513,7 +617,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof SearchParameters>({
         name: "search_files",
         description:
-          "Search recursively beneath a directory by filename glob, literal file text, or both. Returns bounded path results; text matches include line numbers and snippets. The result reports whether more matches were truncated.",
+          "Search recursively beneath a directory by filename glob, literal file text, or both. Text search also reads symlinked files. Results report paths exactly as the search resolved them beneath path, so an absolute path yields absolute results. Returns bounded path results; text matches include line numbers and snippets. The result reports whether more matches were truncated.",
         parameters: SearchParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
@@ -627,7 +731,9 @@ async function execute(
   command: string[],
   stdin?: string,
   cwd = deps.cwd,
-  failures: Readonly<Record<number, ToolFeedback>> = {},
+  failures: Readonly<
+    Record<number, ToolFeedback | ((raw: CommandResult) => ToolFeedback)>
+  > = {},
 ): Promise<CommandResult> {
   let raw: CommandResult;
   try {
@@ -643,9 +749,20 @@ async function execute(
   if (raw.exitCode === 0) return raw;
   const failure = failures[raw.exitCode ?? -1];
   if (failure) {
-    throw actionableToolError(failure, { command: raw });
+    throw actionableToolError(
+      typeof failure === "function" ? failure(raw) : failure,
+      { command: raw },
+    );
   }
   throw new ToolExecutionError("The operation failed.", { command: raw });
+}
+
+/** Forward the tool's own diagnostic line instead of hiding the actual cause. */
+function patchDiagnostic(raw: CommandResult): string[] {
+  const line = raw.stderr.split(/\r?\n/).map((entry) => entry.trim()).find(
+    Boolean,
+  );
+  return line ? [`The patch command reported: ${line}`] : [];
 }
 
 function fileType(code: string): "file" | "directory" | "symlink" | "other" {

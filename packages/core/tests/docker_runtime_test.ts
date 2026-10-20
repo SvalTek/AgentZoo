@@ -488,6 +488,94 @@ Deno.test({
       assert(repositoryDiff.stdout.includes("-before"));
       assert(repositoryDiff.stdout.includes("+after"));
 
+      // A hunk with leading context only, in the shape the parameter
+      // description documents, must apply mid-file.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\ntwo\\nthree\\nfour\\n' > /root/midpatch.txt",
+      ]);
+      const midPatched = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/midpatch.txt",
+          "+++ b/midpatch.txt",
+          "@@ -2,1 +2,2 @@",
+          " two",
+          "+inserted",
+        ].join("\n"),
+      });
+      assertEquals(midPatched.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/midpatch.txt"])).stdout,
+        "one\ntwo\ninserted\nthree\nfour\n",
+      );
+
+      // Multiple files in one patch using only ---/+++ headers.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'aaa\\n' > /root/multi1.txt; printf 'bbb\\n' > /root/multi2.txt",
+      ]);
+      const multiPatched = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/multi1.txt",
+          "+++ b/multi1.txt",
+          "@@ -1 +1 @@",
+          "-aaa",
+          "+AAA",
+          "--- a/multi2.txt",
+          "+++ b/multi2.txt",
+          "@@ -1 +1 @@",
+          "-bbb",
+          "+BBB",
+        ].join("\n"),
+      });
+      assertEquals(multiPatched.filesChanged, 2);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/multi1.txt"])).stdout,
+        "AAA\n",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/multi2.txt"])).stdout,
+        "BBB\n",
+      );
+
+      // CRLF files accept LF text in both structured edit paths and keep
+      // their own line endings.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'alpha\\r\\nbeta\\r\\ngamma\\r\\n' > /root/crlf.txt",
+      ]);
+      await invoke(alpha, "edit_file", {
+        path: "/root/crlf.txt",
+        oldText: "beta",
+        newText: "BETA",
+      });
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/crlf.txt"])).stdout,
+        "alpha\r\nBETA\r\ngamma\r\n",
+      );
+      const crlfPatched = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/crlf.txt",
+          "+++ b/crlf.txt",
+          "@@ -1,3 +1,3 @@",
+          " alpha",
+          "-BETA",
+          "+delta",
+          " gamma",
+        ].join("\n"),
+      });
+      assertEquals(crlfPatched.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/crlf.txt"])).stdout,
+        "alpha\r\ndelta\r\ngamma\r\n",
+      );
+
       await alpha.exec([
         "/bin/bash",
         "-c",
@@ -501,6 +589,20 @@ Deno.test({
       );
       assert(names.includes("child"));
       assert(!names.includes("deep"));
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "mkdir -p /root/real-dir && touch /root/real-dir/inner && ln -sfn /root/real-dir /root/linked-dir",
+      ]);
+      const linkedListing = await invoke(alpha, "list_directory", {
+        path: "/root/linked-dir",
+      });
+      assertEquals(
+        (linkedListing.entries as Array<{ name: string }>).map((entry) =>
+          entry.name
+        ),
+        ["inner"],
+      );
       const discovered = await invoke(alpha, "search_files", {});
       const discoveredPaths = (
         discovered.results as Array<{ path: string }>
@@ -788,17 +890,24 @@ Deno.test({
         "-c",
         "script -q -e -c 'sleep 2' /dev/null",
       ]);
+      // `ptmx` is always present; wait for an actual pty node.
       let alphaListing = "";
       for (let attempt = 0; attempt < 100; attempt++) {
         alphaListing = (await alpha.exec(["/bin/bash", "-c", "ls -A /dev/pts"]))
           .stdout;
-        if (alphaListing.trim() !== "") break;
+        if (
+          alphaListing.split("\n").some((entry) =>
+            /^[0-9]+$/.test(entry.trim())
+          )
+        ) break;
         const { promise, resolve } = Promise.withResolvers<void>();
         setTimeout(resolve, 50);
         await promise;
       }
       assert(
-        alphaListing.split("\n").some((entry) => /^[0-9]+$/.test(entry.trim())),
+        alphaListing.split("\n").some((entry) =>
+          /^[0-9]+$/.test(entry.trim())
+        ),
         `alpha should see its own pty: ${JSON.stringify(alphaListing)}`,
       );
       const betaListing = await beta.exec(["/bin/bash", "-c", "ls -A /dev/pts"]);
