@@ -817,19 +817,29 @@ async function stagePatch(
       } else {
         const needle = oldLines.join("\n") + (trailingNewline ? "\n" : "");
         if (needle !== "") {
+          // Only a match that starts a line counts: a context block may not
+          // match inside a longer line.
           const normalizedWorking = working.replaceAll("\r\n", "\n");
           let occurrences = 0;
           for (
             let index = normalizedWorking.indexOf(needle);
             index !== -1;
-            index = normalizedWorking.indexOf(needle, index + needle.length)
-          ) occurrences++;
+            index = normalizedWorking.indexOf(needle, index + 1)
+          ) {
+            if (index === 0 || normalizedWorking[index - 1] === "\n") {
+              occurrences++;
+            }
+          }
           // A hunk may end at a file whose last line has no newline; the
           // parser still reports that line with one.
-          if (
-            occurrences === 0 && needle.endsWith("\n") &&
-            normalizedWorking.endsWith(needle.slice(0, -1))
-          ) occurrences = 1;
+          if (occurrences === 0 && needle.endsWith("\n")) {
+            const truncated = needle.slice(0, -1);
+            const start = normalizedWorking.length - truncated.length;
+            if (
+              start >= 0 && normalizedWorking.endsWith(truncated) &&
+              (start === 0 || normalizedWorking[start - 1] === "\n")
+            ) occurrences = 1;
+          }
           if (occurrences === 0) {
             throw actionableToolError([
               `No files were changed: the hunk at line ${hunk.oldStart} does not match ${relativeToDirectory(cwd, path)}.`,

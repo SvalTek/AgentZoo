@@ -6,7 +6,7 @@ import type { AgentRunDeps } from "../Agent.ts";
 
 const NoParameters = z.object({});
 const CompletionParameters = z.object({
-  reason: z.string().min(1).optional().describe(
+  reason: z.string().optional().describe(
     "An optional brief explanation of why no further action is needed. It is reported as the outcome.",
   ),
 });

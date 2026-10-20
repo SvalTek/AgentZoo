@@ -26,9 +26,10 @@ export function mcpToolName(serverName: string, toolName: string): string {
     .replace(/^_+|_+$/g, "") || "tool";
   const base = `${prefix}${normalized}`;
   if (normalized === toolName && base.length <= 64) return base;
+  const hashSource = `${serverName}\u0000${toolName}`;
   let hash = 0x811c9dc5;
-  for (let index = 0; index < toolName.length; index++) {
-    hash = Math.imul(hash ^ toolName.charCodeAt(index), 0x01000193) >>> 0;
+  for (let index = 0; index < hashSource.length; index++) {
+    hash = Math.imul(hash ^ hashSource.charCodeAt(index), 0x01000193) >>> 0;
   }
   const suffix = `_${hash.toString(16).padStart(8, "0")}`;
   return `${base.slice(0, 64 - suffix.length)}${suffix}`;

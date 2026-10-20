@@ -876,6 +876,29 @@ Deno.test({
         "leaves the working directory",
       );
 
+      // A context block that only occurs inside a longer line is not a match.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'xa\\nb\\nc\\n' > /root/midline.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/midline.txt",
+              "+++ b/midline.txt",
+              "@@ -1,2 +1,2 @@",
+              " a",
+              "-b",
+              "+B",
+            ].join("\n"),
+          }),
+        Error,
+        "does not match",
+      );
+
       // A section that changes nothing is not reported as a change.
       const noop = await invoke(alpha, "apply_patch", {
         cwd: "/root",

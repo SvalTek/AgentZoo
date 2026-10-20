@@ -78,7 +78,7 @@ Deno.test("actionable tool feedback preserves ordered recovery lines", () => {
 });
 import { modelSettingsToAISDKOptions } from "../../../vendor/vibes/lib/execution/_run_utils.ts";
 
-Deno.test("completion tool uses a project-neutral public name", () => {
+Deno.test("completion tool uses a project-neutral public name", async () => {
   const completion = createCompletionTool();
   assertEquals(completion.name, "complete");
   assertEquals(createYieldTool().description, "Stop for now.");
@@ -92,6 +92,15 @@ Deno.test("completion tool uses a project-neutral public name", () => {
   };
   assertEquals(schema.required, undefined);
   assert("reason" in (schema.properties ?? {}));
+  const controlContext = { deps: { control: {} } } as never;
+  assertEquals(
+    await completion.execute(controlContext, { reason: "" }),
+    "Recorded.",
+  );
+  assertEquals(
+    await completion.execute(controlContext, { reason: "done" }),
+    "done",
+  );
 });
 
 Deno.test("model-facing defaults do not disclose the harness identity or mechanics", async () => {
@@ -2637,7 +2646,7 @@ Deno.test("ShellFeature: get_background honours the n line limit", async () => {
         received = cmd;
         return Promise.resolve({
           exitCode: 0,
-          stdout: "one\ntwo\nthree\n",
+          stdout: "one\ntwo\nthree\n\n\n",
           stderr: "",
           timedOut: false,
           aborted: false,

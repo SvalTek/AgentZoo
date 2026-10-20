@@ -49,7 +49,8 @@ Deno.test("HTTP decoding keeps text when the clip splits a UTF-8 character", asy
   assertEquals(result.bodyEncoding, "utf-8");
   assertEquals(String(result.body).length, 65_535);
   assertEquals(result.truncated, true);
-  assertEquals(result.bodyBytesReturned, 65_536);
+  // The split character is dropped, so one fewer byte is returned.
+  assertEquals(result.bodyBytesReturned, 65_535);
 });
 
 Deno.test("HTTP decoding falls back to base64 for a complete non-UTF-8 body", async () => {
@@ -66,4 +67,13 @@ Deno.test("HTTP decoding treats an empty body as UTF-8 text", async () => {
   const result = await request(new Uint8Array(0));
   assertEquals(result.bodyEncoding, "utf-8");
   assertEquals(result.body, "");
+});
+
+Deno.test("HTTP decoding keeps a clipped body binary when its last byte is invalid", async () => {
+  const body = new Uint8Array(65_536);
+  body.fill(0x61, 0, 65_535);
+  body[65_535] = 0xff;
+  const result = await request(body);
+  assertEquals(result.bodyEncoding, "base64");
+  assertEquals(result.truncated, false);
 });

@@ -193,8 +193,8 @@ export class HttpFeature implements Feature<AgentRunDeps> {
           body: body.value,
           bodyEncoding: body.encoding,
           bodyBytes: Math.min(bodyBytes.length, responseLimit),
-          bodyBytesReturned: available.length,
-          truncated: clipped,
+          bodyBytesReturned: body.bytes,
+          truncated: body.bytes < Math.min(bodyBytes.length, responseLimit),
           captureTruncated,
         };
         return observedToolResult(result, {
@@ -221,27 +221,50 @@ function decodeBase64(value: string): string {
 function decodeBody(
   bytes: Uint8Array,
   clipped: boolean,
-): { value: string; encoding: "utf-8" | "base64" } {
-  if (bytes.length === 0) return { value: "", encoding: "utf-8" };
+): { value: string; encoding: "utf-8" | "base64"; bytes: number } {
+  if (bytes.length === 0) {
+    return { value: "", encoding: "utf-8", bytes: 0 };
+  }
   // Binary payloads are the ones carrying NUL bytes; UTF-8 text never does.
-  if (bytes.includes(0)) return { value: toBase64(bytes), encoding: "base64" };
-  // A clipped body can end mid-character. Drop up to three trailing bytes and
-  // decode the valid prefix instead of declaring a text response binary. A
-  // complete body with invalid bytes stays base64 rather than losing its tail.
-  const attempts = clipped ? 4 : 1;
-  for (let trim = 0; trim < attempts && trim < bytes.length; trim++) {
-    try {
-      return {
-        value: new TextDecoder("utf-8", { fatal: true }).decode(
-          bytes.subarray(0, bytes.length - trim),
-        ),
-        encoding: "utf-8",
-      };
-    } catch {
-      // Try one byte shorter.
+  if (bytes.includes(0)) {
+    return { value: toBase64(bytes), encoding: "base64", bytes: bytes.length };
+  }
+  // A clip can end mid-character. Drop only a suffix that is an incomplete
+  // multi-byte sequence; any other invalid byte stays visible as base64.
+  const trims = [0];
+  if (clipped) {
+    for (let trim = 1; trim <= 3 && trim < bytes.length; trim++) {
+      const start = bytes.length - trim;
+      const lead = bytes[start];
+      const needed = lead >= 0xf0 && lead <= 0xf4
+        ? 4
+        : lead >= 0xe0 && lead <= 0xef
+        ? 3
+        : lead >= 0xc2 && lead <= 0xdf
+        ? 2
+        : 0;
+      if (needed <= trim) continue;
+      let continuation = true;
+      for (let index = start + 1; index < bytes.length; index++) {
+        if (bytes[index] < 0x80 || bytes[index] > 0xbf) {
+          continuation = false;
+          break;
+        }
+      }
+      if (continuation) trims.push(trim);
     }
   }
-  return { value: toBase64(bytes), encoding: "base64" };
+  for (const trim of trims) {
+    try {
+      const value = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(0, bytes.length - trim),
+      );
+      return { value, encoding: "utf-8", bytes: bytes.length - trim };
+    } catch {
+      // Try the next candidate trim.
+    }
+  }
+  return { value: toBase64(bytes), encoding: "base64", bytes: bytes.length };
 }
 
 function toBase64(bytes: Uint8Array): string {

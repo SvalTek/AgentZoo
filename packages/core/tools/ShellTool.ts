@@ -283,6 +283,11 @@ Use dedicated command tools when one directly matches the operation. Use the she
         const retained = capture.stdout.length > 0
           ? capture.stdout.replace(/\n$/, "").split("\n")
           : [];
+        // The capture includes blank rows below the content; they are not
+        // output and would displace real trailing lines.
+        while (retained.length > 0 && retained[retained.length - 1] === "") {
+          retained.pop();
+        }
         const selected = params.last ? retained.slice(-params.last) : retained;
         const output = selected.join("\n");
         return observedToolResult({

@@ -46,7 +46,11 @@ export function createMCPResourceTools(
     return server;
   }
 
-  function reportError(server: MCPServerEntry, error: unknown): never {
+  function reportError(
+    server: MCPServerEntry,
+    error: unknown,
+    operation: "list" | "read",
+  ): never {
     if (error instanceof MCPResourceUnsupportedError) {
       throw actionableToolError([
         `MCP server "${server.name}" does not provide resources.`,
@@ -62,9 +66,13 @@ export function createMCPResourceTools(
     }
     if (isServerResponseError(error)) {
       throw actionableToolError([
-        `MCP server "${server.name}" rejected the resource request.`,
+        operation === "list"
+          ? `MCP server "${server.name}" rejected the resource listing request.`
+          : `MCP server "${server.name}" rejected the resource request.`,
         error instanceof Error ? error.message : String(error),
-        "Call list_resources to see the URIs this server publishes.",
+        operation === "list"
+          ? "Check the server configuration before retrying."
+          : "Call list_resources to see the URIs this server publishes.",
       ], error);
     }
     throw error;
@@ -85,7 +93,7 @@ export function createMCPResourceTools(
           ]);
           return JSON.stringify({ resources, resourceTemplates });
         } catch (error) {
-          return reportError(server, error);
+          return reportError(server, error, "list");
         }
       },
     }),
@@ -99,7 +107,7 @@ export function createMCPResourceTools(
         try {
           return JSON.stringify(await server.resources.readResource(uri));
         } catch (error) {
-          return reportError(server, error);
+          return reportError(server, error, "read");
         }
       },
     }),
