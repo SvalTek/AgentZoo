@@ -24,12 +24,12 @@ function AgentRow({ agent }: { agent: ZooAgentSnapshot }) {
       borderColor={stateColor(agent.state)}
       paddingX={1}
     >
-      <Box width={22} flexShrink={0}>
+      <Box width={22}>
         <Text color={stateColor(agent.state)} bold wrap="truncate">
           {agent.name === agent.id ? agent.id : `${agent.name} (${agent.id})`}
         </Text>
       </Box>
-      <Box width={13} flexShrink={0}>
+      <Box width={13}>
         <Text wrap="truncate">{agent.state}</Text>
       </Box>
       <Box width={28} flexShrink={1}>
