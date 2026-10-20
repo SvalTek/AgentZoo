@@ -10,20 +10,21 @@
 import type { Node as YogaNode, Yoga } from "npm:yoga-wasm-web@0.3.3";
 import stringWidth from "npm:string-width@7.2.0";
 
-// JSR intentionally does not expose its internal modules as typed subpaths.
-// Keep the compatibility boundary runtime-only rather than copying the package.
+// The renderer is vendored so local fixes survive; JSR keeps its internals
+// private, so the compatibility boundary stays runtime-only.
 const { Ink } = await import(
-  "https://jsr.io/@deno-ink/core/0.2.1/src/ink.ts"
+  "../../vendor/deno-ink/src/ink.ts"
 ) as unknown as {
   Ink: { prototype: InkInternals };
 };
-const { wrapText } = await import(
-  "https://jsr.io/@deno-ink/core/0.2.1/src/output.ts"
+const { truncateText, wrapText } = await import(
+  "../../vendor/deno-ink/src/output.ts"
 ) as unknown as {
+  truncateText(text: string, maxWidth: number): string;
   wrapText(text: string, width: number): string;
 };
 const { applyStyles } = await import(
-  "https://jsr.io/@deno-ink/core/0.2.1/src/styles.ts"
+  "../../vendor/deno-ink/src/styles.ts"
 ) as unknown as {
   applyStyles(node: YogaNode, style: Record<string, unknown>, yoga: Yoga): void;
 };
@@ -52,6 +53,12 @@ ink.rebuildYogaTree = function (node, parentYogaNode): void {
 
   if (node.nodeName === "ink-text") {
     const text = textContent(node);
+    // The renderer truncates instead of wrapping for these styles, so a long
+    // source line is one row. Wrapping here would reserve rows that the
+    // renderer leaves blank, which stretches every border below the text.
+    const truncating = node.style.wrap === "truncate" ||
+      node.style.wrap === "truncate-start" ||
+      node.style.wrap === "truncate-middle";
     yogaNode.setMeasureFunc((availableWidth, widthMode) => {
       const naturalWidth = widestLine(text);
       const constrained = widthMode !== this.yoga!.MEASURE_MODE_UNDEFINED &&
@@ -64,7 +71,12 @@ ink.rebuildYogaTree = function (node, parentYogaNode): void {
         width: widthMode === this.yoga!.MEASURE_MODE_EXACTLY
           ? Math.floor(availableWidth)
           : width,
-        height: wrapText(text, renderedWidth).split("\n").length,
+        height: truncating
+          // Measure the string the renderer will actually paint: its
+          // truncation counts the whole text (newlines included) against the
+          // width, so a multi-line value can collapse to one row.
+          ? truncateText(text, renderedWidth).split("\n").length
+          : wrapText(text, renderedWidth).split("\n").length,
       };
     });
     // Nested Text is virtual styling content. A measured Yoga leaf cannot have
@@ -115,4 +127,4 @@ export function wrappedLines(text: string, width: number): readonly string[] {
   return wrapText(text, Math.max(1, Math.floor(width))).split("\n");
 }
 
-export * from "jsr:@deno-ink/core@0.2.1";
+export * from "../../vendor/deno-ink/src/mod.ts";

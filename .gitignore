@@ -14,6 +14,8 @@ vendor/
 vendor/*
 !vendor/vibes/
 !vendor/vibes/**
+!vendor/deno-ink/
+!vendor/deno-ink/**
 
 # Coverage / test output
 coverage/
