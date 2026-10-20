@@ -13,14 +13,25 @@ import type {
  * unusable name rejects the whole request. Servers are free to publish names
  * with dots, spaces, or excessive length, so the exposed name is derived here
  * and used for both the `list_tools` listing and the exposed toolset.
+ *
+ * A name that had to be rewritten, or shortened, carries a hash of its source
+ * name: `get.issue` and `get issue` would otherwise collapse onto one name in
+ * the provider tool map and make one of them unreachable.
  */
 export function mcpToolName(serverName: string, toolName: string): string {
   const prefix = `mcp_${serverName.replaceAll("-", "_")}_`;
   const normalized = toolName
     .replaceAll(/[^A-Za-z0-9_-]/g, "_")
     .replaceAll(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return `${prefix}${normalized || "tool"}`.slice(0, 64);
+    .replace(/^_+|_+$/g, "") || "tool";
+  const base = `${prefix}${normalized}`;
+  if (normalized === toolName && base.length <= 64) return base;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < toolName.length; index++) {
+    hash = Math.imul(hash ^ toolName.charCodeAt(index), 0x01000193) >>> 0;
+  }
+  const suffix = `_${hash.toString(16).padStart(8, "0")}`;
+  return `${base.slice(0, 64 - suffix.length)}${suffix}`;
 }
 
 /** Exposes a server's tools under their provider-safe AgentZoo names. */

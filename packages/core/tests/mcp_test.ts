@@ -516,12 +516,19 @@ Deno.test("Zoo does not pre-connect MCP servers and disconnects on shutdown", as
   assertEquals(disconnects, 1);
 });
 
-Deno.test("MCP tool names are sanitized into provider-safe identifiers", async () => {
-  const client = new FakeMCPClient([{
-    name: "get.issue",
-    description: "Fetch one issue.",
-    inputSchema: { type: "object" },
-  }]);
+Deno.test("MCP tool names are sanitized into unique provider-safe identifiers", async () => {
+  const client = new FakeMCPClient([
+    {
+      name: "get.issue",
+      description: "Fetch one issue.",
+      inputSchema: { type: "object" },
+    },
+    {
+      name: "get issue",
+      description: "Fetch another issue.",
+      inputSchema: { type: "object" },
+    },
+  ]);
   const [server] = new MCPPool(
     [{
       name: "issue-tracker",
@@ -541,13 +548,17 @@ Deno.test("MCP tool names are sanitized into provider-safe identifiers", async (
       mcp_name: "issue-tracker",
     } as never)),
   ) as Array<{ name: string; inputSchema: unknown }>;
-  assertEquals(listing[0].name, "mcp_issue_tracker_get_issue");
+  const listedNames = listing.map((tool) => tool.name);
+  assertEquals(new Set(listedNames).size, 2);
+  for (const name of listedNames) {
+    assert(/^mcp_issue_tracker_get_issue_[0-9a-f]{8}$/.test(name), name);
+  }
   assertEquals(listing[0].inputSchema, { type: "object" });
   assertEquals(
     (await new MCPNamedToolset(server.toolset, "issue-tracker").tools(
       context,
     )).map((tool) => tool.name),
-    ["mcp_issue_tracker_get_issue"],
+    listedNames,
   );
 });
 
@@ -586,4 +597,42 @@ Deno.test("MCP resource rejection surfaces the server error, not an outage", asy
   assert(failure.message.includes("Resource not found"));
   assertEquals(client.connects, 1);
   assertEquals(client.disconnects, 0);
+});
+
+Deno.test("MCP transport error codes still trigger reconnection", async () => {
+  const client = new FakeMCPClient();
+  client.readResource = () =>
+    Promise.reject(
+      Object.assign(new Error("Connection closed"), { code: -32000 }),
+    );
+  const [server] = new MCPPool(
+    [{
+      name: "chatroom",
+      description: "Talk with other agents.",
+      type: "stdio",
+      command: "chatroom",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["chatroom"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  // Reach the ready state so recovery has a connection to reset.
+  await server.resources.listResources();
+  const readResource = createMCPResourceTools([server]).find((tool) =>
+    tool.name === "read_resource"
+  )!;
+  await assertRejects(
+    () =>
+      readResource.execute(context, {
+        mcp_name: "chatroom",
+        uri: "agent-chat://inbox",
+      } as never),
+    Error,
+    "currently unavailable",
+  );
+  assertEquals(client.connects, 2);
+  assert(client.disconnects >= 1);
 });

@@ -264,10 +264,13 @@ export function mcpToolPrefix(serverName: string): string {
 
 /**
  * A JSON-RPC error (numeric `code`) is a server response, not a transport
- * failure: the connection worked and the request itself was rejected.
+ * failure: the connection worked and the request itself was rejected. The MCP
+ * SDK reuses numeric codes for transport conditions, which must still trigger
+ * recovery.
  */
 export function isServerResponseError(error: unknown): boolean {
-  return typeof (error as { code?: unknown } | null)?.code === "number";
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "number" && code !== -32000 && code !== -32001;
 }
 
 export function substituteSharedPathTokens(

@@ -33,7 +33,12 @@ curl --silent --show-error --location --max-redirs 5 --max-time 120 \
   --dump-header "$headers_file" --write-out '%{stderr}\n%{http_code}\n%{url_effective}' \
   "$@" 2> "$err_file" | head -c 1048577 > "$body_file"
 code=$${"{"}PIPESTATUS[0]}
+head_code=$${"{"}PIPESTATUS[1]}
 set -e
+if test "$head_code" -ne 0; then
+  printf 'the response body could not be captured\n'
+  exit 49
+fi
 if test "$code" -ne 0 && test "$code" -ne 23; then
   head -n 1 "$err_file"
   exit 49
@@ -171,7 +176,8 @@ export class HttpFeature implements Feature<AgentRunDeps> {
           0,
           Math.min(responseLimit, modelLimit),
         );
-        const body = decodeBody(available);
+        const clipped = available.length < bodyBytes.length;
+        const body = decodeBody(available, clipped);
         const result = {
           status: Number(statusLine),
           url: effectiveUrl,
@@ -180,7 +186,7 @@ export class HttpFeature implements Feature<AgentRunDeps> {
           bodyEncoding: body.encoding,
           bodyBytes: Math.min(bodyBytes.length, responseLimit),
           bodyBytesReturned: available.length,
-          truncated: available.length < Math.min(bodyBytes.length, responseLimit),
+          truncated: clipped,
           captureTruncated,
         };
         return observedToolResult(result, {
@@ -189,7 +195,7 @@ export class HttpFeature implements Feature<AgentRunDeps> {
             status: result.status,
             url: effectiveUrl,
             headers: headerText,
-            body: decodeBody(bodyBytes.slice(0, responseLimit)),
+            body: decodeBody(bodyBytes.slice(0, responseLimit), captureTruncated),
             truncated: captureTruncated,
           },
         });
@@ -206,12 +212,15 @@ function decodeBase64(value: string): string {
 
 function decodeBody(
   bytes: Uint8Array,
+  clipped: boolean,
 ): { value: string; encoding: "utf-8" | "base64" } {
   // Binary payloads are the ones carrying NUL bytes; UTF-8 text never does.
   if (bytes.includes(0)) return { value: toBase64(bytes), encoding: "base64" };
   // A clipped body can end mid-character. Drop up to three trailing bytes and
-  // decode the valid prefix instead of declaring a text response binary.
-  for (let trim = 0; trim <= 3 && trim < bytes.length; trim++) {
+  // decode the valid prefix instead of declaring a text response binary. A
+  // complete body with invalid bytes stays base64 rather than losing its tail.
+  const attempts = clipped ? 4 : 1;
+  for (let trim = 0; trim < attempts && trim < bytes.length; trim++) {
     try {
       return {
         value: new TextDecoder("utf-8", { fatal: true }).decode(

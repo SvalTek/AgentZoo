@@ -202,16 +202,22 @@ binary files are rejected.
 
 ### `apply_patch`
 
-Applies the multiline `patch` string as a unified diff using `git apply`. Paths
-are resolved from the optional `cwd`, or the agent's configured working
-directory when omitted. Inside a Git worktree it uses normal repository-aware
-`git apply`; elsewhere it falls back to `git apply --no-index`. Hunk line counts
-must be exact; a hunk may begin or end with a changed line, so trailing context
-is not required. Hunk lines are rewritten to the target file's line ending, so
-an LF patch edits a CRLF file without mixing endings. The patch is checked
-before it is applied; parse errors, missing files, and context mismatches are
-reported separately with the patching tool's own diagnostic, and the result
-summarizes changed files relative to `cwd`.
+Applies the multiline `patch` string as a unified diff. Paths are resolved from
+the optional `cwd`, or the agent's configured working directory when omitted;
+no Git worktree is required. Hunk line counts must be exact, and a hunk may
+begin or end with a changed line, so trailing context is not required. Patch
+lines are matched in the target file's own line endings, so an LF patch edits a
+CRLF file without mixing endings, and file creation and deletion
+(`--- /dev/null`, `+++ /dev/null`) are supported.
+
+Every affected file is read and patched in memory before anything is written,
+so a parse error, missing file, oversized target (32 MiB), non-text file, or
+context mismatch leaves the filesystem untouched. A hunk whose context matches
+more than one location is rejected with a request for more surrounding lines. Replacements are then staged
+as temporary files in the target directories and renamed into place; if any
+write fails, the earlier files are restored from the contents read at the start.
+The result summarizes changed files, relative to `cwd`, with addition and
+deletion counts.
 
 ### `list_directory`
 

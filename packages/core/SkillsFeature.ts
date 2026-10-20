@@ -113,37 +113,35 @@ the current task; do not assume an unloaded skill's contents.`);
     const sources = new Map<string, string>();
     const problems: Array<{ path: string; error: string }> = [];
     for (const path of paths.sort()) {
-      const canonical = await Deno.realPath(path);
-      if (!isWithin(root, canonical)) continue;
-      const content = await Deno.readTextFile(canonical);
-      let frontmatter: { name: string; description: string };
       try {
-        frontmatter = parseFrontmatter(content, canonical);
+        const canonical = await Deno.realPath(path);
+        if (!isWithin(root, canonical)) continue;
+        const content = await Deno.readTextFile(canonical);
+        const frontmatter = parseFrontmatter(content, canonical);
+        const name = frontmatter.name || skillName(path);
+        const previous = sources.get(name);
+        if (previous) {
+          problems.push({
+            path: canonical,
+            error:
+              `Duplicate skill "${name}" is also defined by ${previous}; rename one of them.`,
+          });
+          continue;
+        }
+        sources.set(name, canonical);
+        skills.set(name, {
+          name,
+          description: frontmatter.description ||
+            "(no description in frontmatter)",
+          content,
+        });
       } catch (error) {
-        // One broken file must not hide the skills that are valid.
+        // One broken or unreadable file must not hide the valid skills.
         problems.push({
-          path: canonical,
+          path,
           error: error instanceof Error ? error.message : String(error),
         });
-        continue;
       }
-      const name = frontmatter.name || skillName(path);
-      const previous = sources.get(name);
-      if (previous) {
-        problems.push({
-          path: canonical,
-          error:
-            `Duplicate skill "${name}" is also defined by ${previous}; rename one of them.`,
-        });
-        continue;
-      }
-      sources.set(name, canonical);
-      skills.set(name, {
-        name,
-        description: frontmatter.description ||
-          "(no description in frontmatter)",
-        content,
-      });
     }
     return { skills, problems };
   }

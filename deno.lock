@@ -25,6 +25,7 @@
     "npm:ai@6.0.66": "6.0.66_zod@4.4.3",
     "npm:ansi-escapes@7.0.0": "7.0.0",
     "npm:cli-boxes@3.0.0": "3.0.0",
+    "npm:diff@8": "8.0.4",
     "npm:ollama-ai-provider-v2@3.6.0": "3.6.0_ai@6.0.66__zod@4.4.3_zod@4.4.3",
     "npm:react-reconciler@0.29.2": "0.29.2_react@18.3.1",
     "npm:react@18.3.1": "18.3.1",
@@ -353,6 +354,9 @@
     },
     "depd@2.0.0": {
       "integrity": "sha512-g7nH6P6dyDioJogAAGprGpCtVImJhpPk/roCzdb3fIh61/s/nPsfR6onyMwkCAR/OlC3yBC0lESvUoQEAssIrw=="
+    },
+    "diff@8.0.4": {
+      "integrity": "sha512-DPi0FmjiSU5EvQV0++GFDOJ9ASQUVFh5kD+OzOnYdi7n3Wpm9hWWGfB/O2blfHcMVTL5WkQXSnRiK9makhrcnw=="
     },
     "dunder-proto@1.0.1": {
       "integrity": "sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==",

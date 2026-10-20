@@ -347,6 +347,18 @@ Deno.test({
         (await alpha.exec(["/bin/cat", "/root/written"])).stdout,
         "replaced",
       );
+      // A failed write must not be reported as success just because the file
+      // can still be stat-ed afterwards.
+      await assertRejects(
+        () =>
+          invoke(alpha, "write_file", {
+            path: "/proc/self/status",
+            content: "not writable",
+            mode: "append",
+          }),
+        Error,
+        "The write did not complete",
+      );
 
       await invoke(alpha, "write_file", {
         path: "/root/editable",
@@ -535,6 +547,12 @@ Deno.test({
       });
       assertEquals(multiPatched.filesChanged, 2);
       assertEquals(
+        (multiPatched.changes as Array<{ path: string }>).map((change) =>
+          change.path
+        ),
+        ["multi1.txt", "multi2.txt"],
+      );
+      assertEquals(
         (await alpha.exec(["/bin/cat", "/root/multi1.txt"])).stdout,
         "AAA\n",
       );
@@ -542,6 +560,113 @@ Deno.test({
         (await alpha.exec(["/bin/cat", "/root/multi2.txt"])).stdout,
         "BBB\n",
       );
+
+      // Deletions, including a CRLF file patched with LF text.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'gone\\r\\nline\\r\\n' > /root/delete-crlf.txt; printf 'plain\\n' > /root/delete-lf.txt",
+      ]);
+      const deleted = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/delete-crlf.txt",
+          "+++ /dev/null",
+          "@@ -1,2 +0,0 @@",
+          "-gone",
+          "-line",
+          "--- a/delete-lf.txt",
+          "+++ /dev/null",
+          "@@ -1 +0,0 @@",
+          "-plain",
+        ].join("\n"),
+      });
+      assertEquals(deleted.filesChanged, 2);
+      assertEquals(
+        deleted.changes,
+        [
+          { path: "delete-crlf.txt", additions: 0, deletions: 2 },
+          { path: "delete-lf.txt", additions: 0, deletions: 1 },
+        ],
+      );
+      const removed = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "test ! -e /root/delete-crlf.txt && test ! -e /root/delete-lf.txt",
+      ]);
+      assertEquals(removed.exitCode, 0, JSON.stringify(removed));
+
+      // A patch that fails on its second file must leave the first untouched:
+      // everything is validated in memory before any write.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'ok\\n' > /root/atomic-a.txt; printf 'original\\n' > /root/atomic-b.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/atomic-a.txt",
+              "+++ b/atomic-a.txt",
+              "@@ -1 +1 @@",
+              "-ok",
+              "+changed",
+              "--- a/atomic-b.txt",
+              "+++ b/atomic-b.txt",
+              "@@ -1 +1 @@",
+              "-missing",
+              "+other",
+            ].join("\n"),
+          }),
+        Error,
+        "does not match",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/atomic-a.txt"])).stdout,
+        "ok\n",
+      );
+
+      // A hunk that matches two regions is rejected; more context fixes it.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'keep\\nsame\\nkeep\\nsame\\n' > /root/ambiguous.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/ambiguous.txt",
+              "+++ b/ambiguous.txt",
+              "@@ -1,2 +1,2 @@",
+              " keep",
+              "-same",
+              "+CHANGED",
+            ].join("\n"),
+          }),
+        Error,
+        "matches 2 places",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/ambiguous.txt"])).stdout,
+        "keep\nsame\nkeep\nsame\n",
+      );
+      const disambiguated = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/ambiguous.txt",
+          "+++ b/ambiguous.txt",
+          "@@ -1,3 +1,3 @@",
+          " keep",
+          "-same",
+          "+CHANGED",
+          " keep",
+        ].join("\n"),
+      });
+      assertEquals(disambiguated.filesChanged, 1);
 
       // CRLF files accept LF text in both structured edit paths and keep
       // their own line endings.

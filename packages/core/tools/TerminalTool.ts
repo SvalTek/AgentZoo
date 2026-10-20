@@ -96,21 +96,23 @@ Use \`shell\` for normal one-shot commands. Use \`terminal_create\` when a progr
               shellQuote,
             )].join(" ")
             : undefined;
-          // The history limit applies to panes created after it is set, so the
-          // server option goes first. remain-on-exit keeps a program's final
-          // screen readable after it exits.
+          // One tmux invocation starts the server, so the history limit is
+          // applied before the first pane exists. remain-on-exit keeps a
+          // program's final screen readable after it exits.
+          const commands = [
+            `set-option -g history-limit ${historyLimit}`,
+            `new-session -d -s ${shellQuote(target)} -c ${shellQuote(cwd)}`,
+            `set-option -t ${shellQuote(target)} remain-on-exit on`,
+            `respawn-pane -k -t ${shellQuote(target)}${
+              program ? ` ${shellQuote(program)}` : ""
+            }`,
+          ];
           const command = [
-            `tmux set-option -g history-limit ${historyLimit}`,
-            `tmux new-session -d -s ${shellQuote(target)} -c ${shellQuote(cwd)}`,
-            `tmux set-option -t ${shellQuote(target)} remain-on-exit on`,
-            ...(program
-              ? [
-                `tmux respawn-pane -k -t ${
-                  shellQuote(target)
-                } ${shellQuote(program)}`,
-              ]
-              : []),
-          ].join("; ");
+            "tmux",
+            ...commands.flatMap((value, index) =>
+              index === 0 ? [value] : [shellQuote(";"), value]
+            ),
+          ].join(" ");
           const created = await context.deps.runtime.exec(command, { cwd });
           if (created.exitCode !== 0) {
             return terminalFailure(params.name, created.stderr);
