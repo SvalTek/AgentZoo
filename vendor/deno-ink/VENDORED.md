@@ -17,7 +17,8 @@ when bumping the version.
 dashboard frame returns **4096** and the caller must retry. Ignoring the count
 truncated every frame mid-row, which is what left boxes without right/bottom
 edges and hid the activity panel below the agent list. `writeAll` loops until
-every byte is accepted.
+every byte is accepted, and throws when a write reports no progress so a
+stalled stream cannot claim a complete frame.
 
 This was the cause of the "broken from the start on one machine, 80% fine on
 another" behaviour: the loss depends on frame size and console buffering.
