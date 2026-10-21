@@ -1,6 +1,11 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
-import { assertEquals, assertRejects, assertThrows } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "@std/assert";
 import {
   FilteredToolset,
   type MCPClient,
@@ -12,6 +17,7 @@ import {
   type Toolset,
 } from "@vibesjs/sdk";
 import { z } from "zod";
+import { ErrorCode, McpError } from "npm:@modelcontextprotocol/sdk@^1/types.js";
 import {
   type AgentRunDeps,
   AgentZoo,
@@ -25,6 +31,7 @@ import {
   parseConfig,
   substituteSharedPathTokens,
 } from "../mod.ts";
+import { MCPNamedToolset } from "../mcp/NamedToolset.ts";
 import type { ZooActor } from "../Zoo.ts";
 import type { AgentActivationResult, AgentConfig } from "../types.ts";
 
@@ -328,6 +335,7 @@ Deno.test("list_tools loads one MCP toolset for the next model turn", async () =
   assertEquals(JSON.parse(String(result)), [{
     name: "mcp_chatroom_search",
     description: "Search the server.",
+    inputSchema: { type: "object" },
   }]);
   assertEquals(client.connects, 1);
   assertEquals((await gated.tools(context)).map((tool) => tool.name), [
@@ -337,7 +345,7 @@ Deno.test("list_tools loads one MCP toolset for the next model turn", async () =
   await assertRejects(
     () => listTools.execute(context, { mcp_name: "unassigned" } as never),
     Error,
-    "not available to this agent",
+    "not available here",
   );
 });
 
@@ -507,4 +515,161 @@ Deno.test("Zoo does not pre-connect MCP servers and disconnects on shutdown", as
   zoo.registerAgent(new CompletingActor());
   await zoo.run();
   assertEquals(disconnects, 1);
+});
+
+Deno.test("MCP tool names are sanitized into unique provider-safe identifiers", async () => {
+  const client = new FakeMCPClient([
+    {
+      name: "get.issue",
+      description: "Fetch one issue.",
+      inputSchema: { type: "object" },
+    },
+    {
+      name: "get issue",
+      description: "Fetch another issue.",
+      inputSchema: { type: "object" },
+    },
+  ]);
+  const [server] = new MCPPool(
+    [{
+      name: "issue-tracker",
+      description: "Track issues.",
+      type: "stdio",
+      command: "tracker",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["issue-tracker"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  const listing = JSON.parse(
+    String(await createMCPListToolsTool([server]).execute(context, {
+      mcp_name: "issue-tracker",
+    } as never)),
+  ) as Array<{ name: string; inputSchema: unknown }>;
+  const listedNames = listing.map((tool) => tool.name);
+  assertEquals(new Set(listedNames).size, 2);
+  for (const name of listedNames) {
+    assert(/^mcp_issue_tracker_get_issue_[0-9a-f]{8}$/.test(name), name);
+  }
+  assertEquals(listing[0].inputSchema, { type: "object" });
+  assertEquals(
+    (await new MCPNamedToolset(server.toolset, "issue-tracker").tools(
+      context,
+    )).map((tool) => tool.name),
+    listedNames,
+  );
+});
+
+Deno.test("MCP resource rejection surfaces the server error, not an outage", async () => {
+  const client = new FakeMCPClient();
+  client.readResource = () =>
+    Promise.reject(new McpError(-32602, "Resource not found"));
+  const [server] = new MCPPool(
+    [{
+      name: "chatroom",
+      description: "Talk with other agents.",
+      type: "stdio",
+      command: "chatroom",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["chatroom"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  const readResource = createMCPResourceTools([server]).find((tool) =>
+    tool.name === "read_resource"
+  )!;
+  const failure = await assertRejects(
+    () =>
+      readResource.execute(context, {
+        mcp_name: "chatroom",
+        uri: "agent-chat://missing",
+      } as never),
+    Error,
+    "rejected the resource request",
+  );
+  assert(failure.message.includes("Resource not found"));
+  assertEquals(client.connects, 1);
+  assertEquals(client.disconnects, 0);
+});
+
+Deno.test("MCP transport error codes still trigger reconnection", async () => {
+  const client = new FakeMCPClient();
+  client.readResource = () =>
+    Promise.reject(
+      new McpError(ErrorCode.ConnectionClosed, "Connection closed"),
+    );
+  const [server] = new MCPPool(
+    [{
+      name: "chatroom",
+      description: "Talk with other agents.",
+      type: "stdio",
+      command: "chatroom",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["chatroom"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  // Reach the ready state so recovery has a connection to reset.
+  await server.resources.listResources();
+  const readResource = createMCPResourceTools([server]).find((tool) =>
+    tool.name === "read_resource"
+  )!;
+  await assertRejects(
+    () =>
+      readResource.execute(context, {
+        mcp_name: "chatroom",
+        uri: "agent-chat://inbox",
+      } as never),
+    Error,
+    "currently unavailable",
+  );
+  assertEquals(client.connects, 2);
+  assert(client.disconnects >= 1);
+});
+
+Deno.test("MCP HTTP status codes still trigger reconnection", async () => {
+  const client = new FakeMCPClient();
+  client.readResource = () =>
+    Promise.reject(
+      Object.assign(new Error("Streamable HTTP error: upstream is down"), {
+        code: 500,
+      }),
+    );
+  const [server] = new MCPPool(
+    [{
+      name: "chatroom",
+      description: "Talk with other agents.",
+      type: "stdio",
+      command: "chatroom",
+      args: [],
+    }],
+    "E:/shared",
+    { clientFactory: () => client },
+  ).select("agent", ["chatroom"]);
+  const context = {
+    deps: { control: {} },
+  } as import("@vibesjs/sdk").RunContext<AgentRunDeps>;
+  await server.resources.listResources();
+  const readResource = createMCPResourceTools([server]).find((tool) =>
+    tool.name === "read_resource"
+  )!;
+  await assertRejects(
+    () =>
+      readResource.execute(context, {
+        mcp_name: "chatroom",
+        uri: "agent-chat://inbox",
+      } as never),
+    Error,
+    "currently unavailable",
+  );
+  assertEquals(client.connects, 2);
 });

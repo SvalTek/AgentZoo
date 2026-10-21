@@ -78,7 +78,7 @@ Deno.test("actionable tool feedback preserves ordered recovery lines", () => {
 });
 import { modelSettingsToAISDKOptions } from "../../../vendor/vibes/lib/execution/_run_utils.ts";
 
-Deno.test("completion tool uses a project-neutral public name", () => {
+Deno.test("completion tool uses a project-neutral public name", async () => {
   const completion = createCompletionTool();
   assertEquals(completion.name, "complete");
   assertEquals(createYieldTool().description, "Stop for now.");
@@ -92,6 +92,15 @@ Deno.test("completion tool uses a project-neutral public name", () => {
   };
   assertEquals(schema.required, undefined);
   assert("reason" in (schema.properties ?? {}));
+  const controlContext = { deps: { control: {} } } as never;
+  assertEquals(
+    await completion.execute(controlContext, { reason: "" }),
+    "Recorded.",
+  );
+  assertEquals(
+    await completion.execute(controlContext, { reason: "done" }),
+    "done",
+  );
 });
 
 Deno.test("model-facing defaults do not disclose the harness identity or mechanics", async () => {
@@ -294,7 +303,7 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
       "milliseconds",
       "Defaults to 120000",
       "cannot exceed 1800000",
-      "installing software",
+      "Package-manager commands",
       "exit code",
       "truncation flags",
     ]
@@ -631,7 +640,7 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
       "5 redirects",
       "120 seconds",
       "bodyEncoding",
-      "truncation status",
+      "truncated",
     ]
   ) assert(exposed.http_request.includes(term));
 });
@@ -2359,7 +2368,9 @@ Deno.test("ShellFeature: start_background builds a tmux new-session command", as
   assert(received!.startsWith("tmux new-session -d"));
   assert(received!.includes("-s 'server'"));
   assert(received!.includes("-c '/root'"));
-  assert(received!.includes("bash -c 'python3 -m http.server 8000'"));
+  assert(received!.includes("remain-on-exit on"));
+  assert(received!.includes("respawn-pane -k -t 'server'"));
+  assert(received!.includes("python3 -m http.server 8000"));
 });
 
 Deno.test("ShellFeature: start_background shell-escapes the command", async () => {
@@ -2558,7 +2569,7 @@ Deno.test("ShellFeature: get_background returns output and liveness", async () =
   >;
   assertEquals(result.found, true);
   assertEquals(result.alive, true);
-  assertEquals(result.output, "listening on 8000\n");
+  assertEquals(result.output, "listening on 8000");
 });
 
 Deno.test("ShellFeature: get_background reports not found", async () => {
@@ -2635,7 +2646,7 @@ Deno.test("ShellFeature: get_background honours the n line limit", async () => {
         received = cmd;
         return Promise.resolve({
           exitCode: 0,
-          stdout: "tail\n",
+          stdout: "one\ntwo\nthree\n\n\n",
           stderr: "",
           timedOut: false,
           aborted: false,
@@ -2667,15 +2678,16 @@ Deno.test("ShellFeature: get_background honours the n line limit", async () => {
       cwd: "/root",
       control: {},
     },
-  } as never, { name: "server", last: 50 });
+  } as never, { name: "server", last: 2 });
   const result = unwrapObservedToolResult(value).result as Record<
     string,
     unknown
   >;
   assertEquals(result.found, true);
-  assertEquals(result.output, "tail\n");
-  // -S -50 captures the last 50 lines instead of all history.
-  assert(received!.includes("capture-pane -t 'server' -p -S -50"));
+  assertEquals(result.output, "two\nthree");
+  // `last` keeps the final lines of the captured output, and the capture
+  // itself fetches all retained history.
+  assert(received!.includes("capture-pane -t 'server' -p -S -"));
 });
 
 Deno.test("ShellFeature: send_background sends keys with Enter", async () => {

@@ -11,6 +11,7 @@ import {
   type RunContext,
   type Toolset,
 } from "@vibesjs/sdk";
+import { ErrorCode, McpError } from "npm:@modelcontextprotocol/sdk@^1/types.js";
 import type { MCPServerConfig } from "../Config.ts";
 import type { AgentRunDeps } from "../Agent.ts";
 
@@ -200,6 +201,9 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
       if (initialError instanceof MCPResourceUnsupportedError) {
         throw initialError;
       }
+      // A JSON-RPC error means the server answered: the transport is healthy,
+      // and reconnecting would only repeat the same request.
+      if (isServerResponseError(initialError)) throw initialError;
       if (!wasReady) {
         await this.reset().catch(() => undefined);
         throw new MCPServerUnavailableError(this.#name, initialError);
@@ -213,6 +217,7 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
         if (recoveryError instanceof MCPResourceUnsupportedError) {
           throw recoveryError;
         }
+        if (isServerResponseError(recoveryError)) throw recoveryError;
         throw new MCPServerUnavailableError(
           this.#name,
           initialError,
@@ -256,6 +261,22 @@ class ManagedMCPToolset<TDeps> implements Toolset<TDeps> {
 
 export function mcpToolPrefix(serverName: string): string {
   return `mcp_${serverName.replaceAll("-", "_")}_`;
+}
+
+/**
+ * A JSON-RPC error (numeric `code`) is a server response, not a transport
+ * failure: the connection worked and the request itself was rejected. The MCP
+ * SDK reuses numeric codes for transport conditions, which must still trigger
+ * recovery.
+ */
+export function isServerResponseError(error: unknown): boolean {
+  // The SDK raises McpError for a JSON-RPC response from the server, whatever
+  // the application-defined code is. HTTP, SSE, and stream failures are other
+  // error classes that must still trigger recovery. The two connection codes
+  // are McpError instances but describe transport conditions.
+  if (!(error instanceof McpError)) return false;
+  const code = (error as { code?: number }).code;
+  return code !== ErrorCode.ConnectionClosed && code !== ErrorCode.RequestTimeout;
 }
 
 export function substituteSharedPathTokens(

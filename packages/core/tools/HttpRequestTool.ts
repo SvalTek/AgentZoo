@@ -26,16 +26,26 @@ const HttpParameters = z.object({
 });
 
 const HTTP_SCRIPT = String.raw`
-headers_file=$(mktemp) body_file=$(mktemp) meta_file=$(mktemp)
-trap 'rm -f "$headers_file" "$body_file" "$meta_file"' EXIT
+headers_file=$(mktemp) body_file=$(mktemp) err_file=$(mktemp)
+trap 'rm -f "$headers_file" "$body_file" "$err_file"' EXIT
 set +e
 curl --silent --show-error --location --max-redirs 5 --max-time 120 \
   --dump-header "$headers_file" --write-out '%{stderr}\n%{http_code}\n%{url_effective}' \
-  "$@" 2> "$meta_file" | head -c 1048577 > "$body_file"
-code=$${"{"}PIPESTATUS[0]}
+  "$@" 2> "$err_file" | head -c 1048577 > "$body_file"
+# Copy PIPESTATUS before any assignment replaces it.
+statuses=("$${"{"}PIPESTATUS[@]}")
+code=$${"{"}statuses[0]}
+head_code=$${"{"}statuses[1]}
 set -e
-if test "$code" -ne 0 && test "$code" -ne 23; then exit 49; fi
-tail -n 2 "$meta_file"; printf '\n'
+if test "$head_code" -ne 0; then
+  printf 'the response body could not be captured\n'
+  exit 50
+fi
+if test "$code" -ne 0 && test "$code" -ne 23; then
+  head -n 1 "$err_file"
+  exit 49
+fi
+tail -n 2 "$err_file"; printf '\n'
 base64 -w0 "$headers_file"; printf '\n'
 base64 -w0 "$body_file"; printf '\n'
 `;
@@ -50,7 +60,7 @@ export class HttpFeature implements Feature<AgentRunDeps> {
     return [tool<AgentRunDeps, typeof HttpParameters>({
       name: "http_request",
       description:
-        "Make an HTTP request. Follows up to 5 redirects and waits up to 120 seconds. Returns status, final URL, selected response headers, a bounded body, bodyEncoding, bodyBytes, and truncation status. A base64 bodyEncoding means the returned body is base64-encoded binary data.",
+        "Make an HTTP request. Follows up to 5 redirects and waits up to 120 seconds. Returns status, final URL, selected response headers, a bounded body, bodyEncoding, bodyBytes, bodyBytesReturned, truncated, and captureTruncated. The response body is captured up to 1048576 bytes and at most 65536 bytes are returned; bodyBytes counts captured bytes, bodyBytesReturned counts the bytes included, and truncated reports that the returned body is incomplete. A base64 bodyEncoding means the included bytes are not UTF-8 text.",
       parameters: HttpParameters,
       argsValidator: (input) => {
         if (!input.url?.trim()) {
@@ -125,10 +135,22 @@ export class HttpFeature implements Feature<AgentRunDeps> {
         } catch (error) {
           throw new ToolExecutionError("The HTTP request failed.", { error });
         }
+        if (raw.exitCode === 50) {
+          throw actionableToolError([
+            "The response was received but its body could not be captured.",
+            "Retry the request; if it persists, check free space in this computer.",
+          ], { command: raw });
+        }
         if (raw.exitCode !== 0) {
+          const detail = raw.stdout.split(/\r?\n/).map((line) => line.trim())
+            .find(Boolean);
           throw actionableToolError(
             [
               "No HTTP response was received.",
+              ...(detail ? [`The request failed: ${detail}`] : []),
+              ...(detail ? [] : [
+                "If the request timed out, the 120-second limit was reached.",
+              ]),
               "Check the URL, method, headers, and network availability before retrying.",
             ],
             { command: raw },
@@ -157,12 +179,13 @@ export class HttpFeature implements Feature<AgentRunDeps> {
         }
         const responseLimit = 1_048_576;
         const modelLimit = 65_536;
-        const responseTruncated = bodyBytes.length > responseLimit;
+        const captureTruncated = bodyBytes.length > responseLimit;
         const available = bodyBytes.slice(
           0,
           Math.min(responseLimit, modelLimit),
         );
-        const body = decodeBody(available);
+        const clipped = available.length < bodyBytes.length;
+        const body = decodeBody(available, clipped);
         const result = {
           status: Number(statusLine),
           url: effectiveUrl,
@@ -170,7 +193,9 @@ export class HttpFeature implements Feature<AgentRunDeps> {
           body: body.value,
           bodyEncoding: body.encoding,
           bodyBytes: Math.min(bodyBytes.length, responseLimit),
-          truncated: responseTruncated || bodyBytes.length > modelLimit,
+          bodyBytesReturned: body.bytes,
+          truncated: body.bytes < Math.min(bodyBytes.length, responseLimit),
+          captureTruncated,
         };
         return observedToolResult(result, {
           command: raw,
@@ -178,8 +203,8 @@ export class HttpFeature implements Feature<AgentRunDeps> {
             status: result.status,
             url: effectiveUrl,
             headers: headerText,
-            body: decodeBody(bodyBytes.slice(0, responseLimit)),
-            truncated: responseTruncated,
+            body: decodeBody(bodyBytes.slice(0, responseLimit), captureTruncated),
+            truncated: captureTruncated,
           },
         });
       },
@@ -195,19 +220,59 @@ function decodeBase64(value: string): string {
 
 function decodeBody(
   bytes: Uint8Array,
-): { value: string; encoding: "utf-8" | "base64" } {
-  try {
-    return {
-      value: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-      encoding: "utf-8",
-    };
-  } catch {
-    let binary = "";
-    for (let offset = 0; offset < bytes.length; offset += 8_192) {
-      binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
-    }
-    return { value: btoa(binary), encoding: "base64" };
+  clipped: boolean,
+): { value: string; encoding: "utf-8" | "base64"; bytes: number } {
+  if (bytes.length === 0) {
+    return { value: "", encoding: "utf-8", bytes: 0 };
   }
+  // Binary payloads are the ones carrying NUL bytes; UTF-8 text never does.
+  if (bytes.includes(0)) {
+    return { value: toBase64(bytes), encoding: "base64", bytes: bytes.length };
+  }
+  // A clip can end mid-character. Drop only a suffix that is an incomplete
+  // multi-byte sequence; any other invalid byte stays visible as base64.
+  const trims = [0];
+  if (clipped) {
+    for (let trim = 1; trim <= 3 && trim < bytes.length; trim++) {
+      const start = bytes.length - trim;
+      const lead = bytes[start];
+      const needed = lead >= 0xf0 && lead <= 0xf4
+        ? 4
+        : lead >= 0xe0 && lead <= 0xef
+        ? 3
+        : lead >= 0xc2 && lead <= 0xdf
+        ? 2
+        : 0;
+      if (needed <= trim) continue;
+      let continuation = true;
+      for (let index = start + 1; index < bytes.length; index++) {
+        if (bytes[index] < 0x80 || bytes[index] > 0xbf) {
+          continuation = false;
+          break;
+        }
+      }
+      if (continuation) trims.push(trim);
+    }
+  }
+  for (const trim of trims) {
+    try {
+      const value = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(0, bytes.length - trim),
+      );
+      return { value, encoding: "utf-8", bytes: bytes.length - trim };
+    } catch {
+      // Try the next candidate trim.
+    }
+  }
+  return { value: toBase64(bytes), encoding: "base64", bytes: bytes.length };
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8_192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
+  }
+  return btoa(binary);
 }
 
 function relevantHeaders(source: string): Record<string, string> {

@@ -9,6 +9,7 @@
     "check": "deno check main.ts mod.ts",
     "lint": "deno lint",
     "test": "deno test -A",
+    "tools:failures": "deno run -A scripts/tool_failures.ts",
     "docker:build": "docker build --file packages/core/runtime/Containerfile --tag agent-runtime:dev --label agent-zoo.managed=true --label agent-zoo.resource=image packages/core/runtime/"
   },
   "compilerOptions": {

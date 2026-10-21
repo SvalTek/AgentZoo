@@ -11,16 +11,17 @@ import {
   observedToolResult,
   ToolExecutionError,
 } from "../ToolSupport.ts";
+import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
 
 const ShellParameters = z.object({
   command: z.string().optional().describe(
-    "The Bash command to execute. Required for execution. It may contain multiple lines. The result reports the exit code, stdout, stderr, timeout, abort status, and truncation flags.",
+    "The Bash command to execute. Required for execution. It may contain multiple lines. The result reports the exit code, stdout, stderr, timeout, abort status, and truncation flags. stdout and stderr are each capped at 65536 characters; when truncated, the first 65536 characters are kept. exitCode does not describe a command failure when timedOut or aborted is true.",
   ),
   cwd: z.string().optional().describe(
-    "Optional directory path only, such as '/root' or '/shared/project'. Do not put commands, operators, redirects, or scripts here. Put all shell code in command. Omit cwd to use the current working directory.",
+    "Optional directory path only, such as '/root' or '/shared/project', as an absolute path or a path relative to the current working directory. '..' is not allowed. Do not put commands, operators, redirects, or scripts here. Put all shell code in command. Omit cwd to use the current working directory.",
   ),
   timeoutMs: z.number().int().positive().max(1_800_000).optional().describe(
-    "The maximum execution time in milliseconds. Defaults to 120000 and cannot exceed 1800000. Use a longer timeout for operations such as installing software. When reached, the command and processes it started are terminated.",
+    "The maximum execution time in milliseconds. Defaults to 120000 and cannot exceed 1800000. Package-manager commands (apt, dpkg, npm, yarn, pnpm, pip, brew) require at least 300000. When reached, the command and processes it started are terminated.",
   ),
 });
 
@@ -37,7 +38,7 @@ const StartBackgroundParams = z.object({
     "The shell command to run inside the background session.",
   ),
   cwd: z.string().optional().describe(
-    "Optional working directory for the session. Omit to use the current working directory.",
+    "Optional working directory for the session, as an absolute path or a path relative to the current working directory. Omit to use the current working directory.",
   ),
 });
 
@@ -52,7 +53,7 @@ const GetBackgroundParams = z.object({
     "The name of the background session to inspect.",
   ),
   last: z.number().int().positive().max(100_000).optional().describe(
-    "Optional maximum number of trailing lines to return. Omit to capture all available history.",
+    "Optional maximum number of trailing lines to return. Omit to return the retained output, which is bounded to 65536 characters.",
   ),
 });
 
@@ -115,7 +116,7 @@ Use dedicated command tools when one directly matches the operation. Use the she
         return executeCommand(
           context.deps,
           command,
-          parameters.cwd ?? context.deps.cwd,
+          resolveRuntimeDirectory(context.deps.cwd, parameters.cwd),
           parameters.timeoutMs ?? 120_000,
           { command, cwd: parameters.cwd ?? context.deps.cwd },
         );
@@ -165,7 +166,14 @@ Use dedicated command tools when one directly matches the operation. Use the she
         "Start a named background process in its own tmux session. The process keeps running after the tool returns and can be inspected with get_background, sent input with send_background, and stopped with stop_background. Returns the session name.",
       parameters: StartBackgroundParams,
       execute: async (context, params) => {
-        const effectiveCwd = params.cwd ?? context.deps.cwd;
+        const effectiveCwd = resolveRuntimeDirectory(
+          context.deps.cwd,
+          params.cwd,
+        );
+        // remain-on-exit keeps the pane (and its output) after the command
+        // finishes, so get_background can still report the result. tmux runs
+        // its argument through `sh -c`, so pass the whole bash invocation as
+        // one quoted argument to preserve multiword commands.
         const tmuxArgs = [
           "new-session",
           "-d",
@@ -173,9 +181,18 @@ Use dedicated command tools when one directly matches the operation. Use the she
           shellQuote(params.name),
           "-c",
           shellQuote(effectiveCwd),
-          "bash",
-          "-c",
-          shellQuote(params.command),
+          shellQuote(";"),
+          "set-option",
+          "-t",
+          shellQuote(params.name),
+          "remain-on-exit",
+          "on",
+          shellQuote(";"),
+          "respawn-pane",
+          "-k",
+          "-t",
+          shellQuote(params.name),
+          shellQuote(`bash -c ${shellQuote(params.command)}`),
         ].join(" ");
         const result = await context.deps.runtime.exec(`tmux ${tmuxArgs}`, {
           cwd: context.deps.cwd,
@@ -210,7 +227,7 @@ Use dedicated command tools when one directly matches the operation. Use the she
         );
         if (result.exitCode !== 0) {
           const message = result.stderr.trim();
-          if (/session not found/i.test(message)) {
+          if (/can't find (session|pane)|no such (session|pane)|not found/i.test(message)) {
             return observedToolResult({
               name: params.name,
               status: "not_found",
@@ -232,7 +249,7 @@ Use dedicated command tools when one directly matches the operation. Use the she
     const getBackground = tool<AgentRunDeps, typeof GetBackgroundParams>({
       name: "get_background",
       description:
-        "Retrieve the captured terminal output of a named background session started with start_background, and report whether the process is still running.",
+        "Retrieve the captured terminal output of a named background session started with start_background, and report whether the process is still running and its exit code once it has finished.",
       parameters: GetBackgroundParams,
       execute: async (context, params) => {
         const has = await context.deps.runtime.exec(
@@ -244,26 +261,43 @@ Use dedicated command tools when one directly matches the operation. Use the she
             name: params.name,
             found: false,
             alive: false,
+            status: "not_found",
             output: "",
           }, { telemetry: { name: params.name } });
         }
         const capture = await context.deps.runtime.exec(
-          `tmux capture-pane -t ${shellQuote(params.name)} -p -S ${
-            params.last ? `-${params.last}` : "-"
-          }`,
+          `tmux capture-pane -t ${shellQuote(params.name)} -p -S -`,
           { cwd: context.deps.cwd },
         );
-        const dead = await context.deps.runtime.exec(
-          `tmux list-panes -t ${shellQuote(params.name)} -F '#{pane_dead}'`,
+        const panes = await context.deps.runtime.exec(
+          `tmux list-panes -t ${shellQuote(params.name)} -F '#{pane_dead} #{pane_dead_status}'`,
           { cwd: context.deps.cwd },
         );
-        const alive = dead.exitCode === 0 && dead.stdout.trim() !== "1";
+        const [deadFlag = "0", deadStatus = ""] = panes.stdout.trim().split(
+          " ",
+        );
+        const alive = deadFlag !== "1";
+        const exitCode = !alive && /^\d+$/.test(deadStatus)
+          ? Number(deadStatus)
+          : undefined;
+        const retained = capture.stdout.length > 0
+          ? capture.stdout.replace(/\n$/, "").split("\n")
+          : [];
+        // The capture includes blank rows below the content; they are not
+        // output and would displace real trailing lines.
+        while (retained.length > 0 && retained[retained.length - 1] === "") {
+          retained.pop();
+        }
+        const selected = params.last ? retained.slice(-params.last) : retained;
+        const output = selected.join("\n");
         return observedToolResult({
           name: params.name,
           found: true,
           alive,
-          output: capture.stdout,
-        }, { telemetry: { name: params.name } });
+          ...(exitCode === undefined ? {} : { exitCode }),
+          output: output.length > 65_536 ? output.slice(-65_536) : output,
+          outputTruncated: output.length > 65_536,
+        }, { telemetry: { name: params.name, capture } });
       },
     });
 
@@ -282,7 +316,7 @@ Use dedicated command tools when one directly matches the operation. Use the she
         );
         if (result.exitCode !== 0) {
           const message = result.stderr.trim();
-          if (/session not found/i.test(message)) {
+          if (/can't find (session|pane)|no such (session|pane)|not found/i.test(message)) {
             return observedToolResult({
               name: params.name,
               status: "not_found",
@@ -341,6 +375,12 @@ async function executeCommand(
     stderrTruncated: stderr.truncated,
     ...(result.timedOut
       ? { message: shellTimeoutMessage(command, timeoutMs) }
+      : {}),
+    ...(result.aborted
+      ? {
+        message:
+          "The command was cancelled before it finished. exitCode does not describe a command failure in that case.",
+      }
       : {}),
   };
   return observedToolResult(modelResult, { telemetry, result });

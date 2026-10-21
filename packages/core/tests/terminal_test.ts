@@ -107,13 +107,19 @@ Deno.test("terminal_create starts a direct program with agent-local tmux state",
   assertEquals(output.status, "created");
   assert(
     runtime.commands.some((command) =>
-      command.includes(
-        "tmux new-session -d -s 'agent-zoo-terminal-game' -c '/shared/game' 'python3' 'pong.py'",
-      )
+      command.startsWith("tmux set-option -g history-limit 2000")
     ),
   );
   assert(
-    runtime.commands.some((command) => command.includes("history-limit 2000")),
+    runtime.commands.some((command) =>
+      command.includes(
+        "new-session -d -s 'agent-zoo-terminal-game' -c '/shared/game'",
+      ) &&
+      command.includes("remain-on-exit on") &&
+      command.includes("respawn-pane -k -t 'agent-zoo-terminal-game'") &&
+      command.includes("pong.py") &&
+      command.indexOf("history-limit") < command.indexOf("new-session")
+    ),
   );
 });
 

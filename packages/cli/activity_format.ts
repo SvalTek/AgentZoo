@@ -326,9 +326,13 @@ function toolInputLines(toolName: string, value: unknown): string[] {
 
 function toolResultLines(toolName: string, value: unknown): string[] {
   if (toolName === "skills_list") {
-    const skills = parseArray(value);
+    const record = asRecord(value);
+    const skills = Array.isArray(record?.skills)
+      ? record.skills
+      : parseArray(value);
     if (!skills) return labelledLines("result", value);
-    return skills.length
+    const problems = Array.isArray(record?.problems) ? record.problems : [];
+    return skills.length || problems.length
       ? [
         `result: ${skills.length} skill${skills.length === 1 ? "" : "s"}`,
         ...skills.map((skill) => {
@@ -340,6 +344,14 @@ function toolResultLines(toolName: string, value: unknown): string[] {
           return description
             ? `skill: ${name} — ${description}`
             : `skill: ${name}`;
+        }),
+        ...problems.map((problem) => {
+          const item = asRecord(problem);
+          const path = typeof item?.path === "string"
+            ? item.path
+            : "(unknown file)";
+          const error = typeof item?.error === "string" ? item.error : "";
+          return error ? `problem: ${path} — ${error}` : `problem: ${path}`;
         }),
       ]
       : ["skills: (none)"];

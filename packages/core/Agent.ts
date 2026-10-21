@@ -6,7 +6,7 @@ import type {
   ToolDefinition,
 } from "@vibesjs/sdk";
 import { tokenTrimHistoryProcessor } from "@vibesjs/sdk";
-import { FilteredToolset, PrefixedToolset, type Toolset } from "@vibesjs/sdk";
+import { FilteredToolset, type Toolset } from "@vibesjs/sdk";
 import type { LanguageModel, ModelMessage } from "npm:ai@^6";
 import { TextTemplate } from "@agent-zoo/shared";
 import type {
@@ -24,7 +24,8 @@ import {
   type ObserveToolCall,
   OptionalMCPToolset,
 } from "./mcp/ObservedToolset.ts";
-import { type MCPServerEntry, mcpToolPrefix } from "./mcp/MCPPool.ts";
+import { type MCPServerEntry } from "./mcp/MCPPool.ts";
+import { MCPNamedToolset } from "./mcp/NamedToolset.ts";
 import { createMCPListToolsTool } from "./mcp/ListToolsTool.ts";
 import { createMCPResourceTools } from "./mcp/ResourceTools.ts";
 
@@ -473,7 +474,7 @@ export class ZooAgent extends EventTarget {
   private mcpToolset(): Toolset<AgentRunDeps> {
     const prefixed = this.#mcpServers.map((server) => ({
       name: server.name,
-      toolset: new PrefixedToolset(
+      toolset: new MCPNamedToolset(
         new FilteredToolset(
           server.toolset,
           (context) =>
@@ -481,7 +482,7 @@ export class ZooAgent extends EventTarget {
               server.name,
             ) ?? false,
         ),
-        mcpToolPrefix(server.name),
+        server.name,
       ),
     }));
     return new ObservedToolset(

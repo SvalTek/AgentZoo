@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { resolve } from "@std/path";
 import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
 import { FilesystemFeature } from "../tools/FilesystemTools.ts";
+import { ShellFeature } from "../tools/ShellTool.ts";
 import { VisionFeature } from "../tools/ViewImageTool.ts";
 import { HttpFeature } from "../tools/HttpRequestTool.ts";
 import { unwrapObservedToolResult } from "../ToolSupport.ts";
@@ -346,6 +347,18 @@ Deno.test({
         (await alpha.exec(["/bin/cat", "/root/written"])).stdout,
         "replaced",
       );
+      // A failed write must not be reported as success just because the file
+      // can still be stat-ed afterwards.
+      await assertRejects(
+        () =>
+          invoke(alpha, "write_file", {
+            path: "/proc/self/status",
+            content: "not writable",
+            mode: "append",
+          }),
+        Error,
+        "The write did not complete",
+      );
 
       await invoke(alpha, "write_file", {
         path: "/root/editable",
@@ -488,6 +501,544 @@ Deno.test({
       assert(repositoryDiff.stdout.includes("-before"));
       assert(repositoryDiff.stdout.includes("+after"));
 
+      // A hunk with leading context only, in the shape the parameter
+      // description documents, must apply mid-file.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\ntwo\\nthree\\nfour\\n' > /root/midpatch.txt",
+      ]);
+      const midPatched = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/midpatch.txt",
+          "+++ b/midpatch.txt",
+          "@@ -2,1 +2,2 @@",
+          " two",
+          "+inserted",
+        ].join("\n"),
+      });
+      assertEquals(midPatched.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/midpatch.txt"])).stdout,
+        "one\ntwo\ninserted\nthree\nfour\n",
+      );
+
+      // Multiple files in one patch using only ---/+++ headers.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'aaa\\n' > /root/multi1.txt; printf 'bbb\\n' > /root/multi2.txt",
+      ]);
+      const multiPatched = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/multi1.txt",
+          "+++ b/multi1.txt",
+          "@@ -1 +1 @@",
+          "-aaa",
+          "+AAA",
+          "--- a/multi2.txt",
+          "+++ b/multi2.txt",
+          "@@ -1 +1 @@",
+          "-bbb",
+          "+BBB",
+        ].join("\n"),
+      });
+      assertEquals(multiPatched.filesChanged, 2);
+      assertEquals(
+        (multiPatched.changes as Array<{ path: string }>).map((change) =>
+          change.path
+        ),
+        ["multi1.txt", "multi2.txt"],
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/multi1.txt"])).stdout,
+        "AAA\n",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/multi2.txt"])).stdout,
+        "BBB\n",
+      );
+
+      // Deletions, including a CRLF file patched with LF text.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'gone\\r\\nline\\r\\n' > /root/delete-crlf.txt; printf 'plain\\n' > /root/delete-lf.txt",
+      ]);
+      const deleted = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/delete-crlf.txt",
+          "+++ /dev/null",
+          "@@ -1,2 +0,0 @@",
+          "-gone",
+          "-line",
+          "--- a/delete-lf.txt",
+          "+++ /dev/null",
+          "@@ -1 +0,0 @@",
+          "-plain",
+        ].join("\n"),
+      });
+      assertEquals(deleted.filesChanged, 2);
+      assertEquals(
+        deleted.changes,
+        [
+          { path: "delete-crlf.txt", additions: 0, deletions: 2 },
+          { path: "delete-lf.txt", additions: 0, deletions: 1 },
+        ],
+      );
+      const removed = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "test ! -e /root/delete-crlf.txt && test ! -e /root/delete-lf.txt",
+      ]);
+      assertEquals(removed.exitCode, 0, JSON.stringify(removed));
+
+      // A patch that fails on its second file must leave the first untouched:
+      // everything is validated in memory before any write.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'ok\\n' > /root/atomic-a.txt; printf 'original\\n' > /root/atomic-b.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/atomic-a.txt",
+              "+++ b/atomic-a.txt",
+              "@@ -1 +1 @@",
+              "-ok",
+              "+changed",
+              "--- a/atomic-b.txt",
+              "+++ b/atomic-b.txt",
+              "@@ -1 +1 @@",
+              "-missing",
+              "+other",
+            ].join("\n"),
+          }),
+        Error,
+        "does not match",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/atomic-a.txt"])).stdout,
+        "ok\n",
+      );
+
+      // A hunk that matches two regions is rejected; more context fixes it.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'keep\\nsame\\nkeep\\nsame\\n' > /root/ambiguous.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/ambiguous.txt",
+              "+++ b/ambiguous.txt",
+              "@@ -1,2 +1,2 @@",
+              " keep",
+              "-same",
+              "+CHANGED",
+            ].join("\n"),
+          }),
+        Error,
+        "matches 2 places",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/ambiguous.txt"])).stdout,
+        "keep\nsame\nkeep\nsame\n",
+      );
+      const disambiguated = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/ambiguous.txt",
+          "+++ b/ambiguous.txt",
+          "@@ -1,3 +1,3 @@",
+          " keep",
+          "-same",
+          "+CHANGED",
+          " keep",
+        ].join("\n"),
+      });
+      assertEquals(disambiguated.filesChanged, 1);
+
+      // A deletion section must remove every line, and an insertion needs an
+      // unchanged line to locate it.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\ntwo\\n' > /root/partial-delete.txt; printf 'alpha\\nbeta\\n' > /root/insert-only.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/partial-delete.txt",
+              "+++ /dev/null",
+              "@@ -1,1 +0,0 @@",
+              "-one",
+            ].join("\n"),
+          }),
+        Error,
+        "does not delete all",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/partial-delete.txt"])).stdout,
+        "one\ntwo\n",
+      );
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/insert-only.txt",
+              "+++ b/insert-only.txt",
+              "@@ -1,0 +2,1 @@",
+              "+inserted",
+            ].join("\n"),
+          }),
+        Error,
+        "has no context",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/insert-only.txt"])).stdout,
+        "alpha\nbeta\n",
+      );
+
+      // Blank context lines arrive from the parser as empty strings and must
+      // still anchor the hunk.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'alpha\\n\\nbeta\\n' > /root/blank-context.txt",
+      ]);
+      const blankContext = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/blank-context.txt",
+          "+++ b/blank-context.txt",
+          "@@ -1,3 +1,4 @@",
+          " alpha",
+          "",
+          "+inserted",
+          " beta",
+        ].join("\n"),
+      });
+      assertEquals(blankContext.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/blank-context.txt"])).stdout,
+        "alpha\n\ninserted\nbeta\n",
+      );
+
+      // Creating a file must not replace one that already exists.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'precious\\n' > /root/exists.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- /dev/null",
+              "+++ b/exists.txt",
+              "@@ -0,0 +1,1 @@",
+              "+replacement",
+            ].join("\n"),
+          }),
+        Error,
+        "already exists",
+      );
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/exists.txt"])).stdout,
+        "precious\n",
+      );
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "mkdir -p /root/create-target",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- /dev/null",
+              "+++ b/create-target",
+              "@@ -0,0 +1,1 @@",
+              "+x",
+            ].join("\n"),
+          }),
+        Error,
+        "already exists",
+      );
+
+      // A patch whose own lines use CRLF must apply too.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'alpha\\r\\nbeta\\r\\ngamma\\r\\n' > /root/crlf-patch.txt",
+      ]);
+      const crlfPatch = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/crlf-patch.txt",
+          "+++ b/crlf-patch.txt",
+          "@@ -1,3 +1,3 @@",
+          " alpha",
+          "-beta",
+          "+BETA",
+          " gamma",
+        ].join("\r\n"),
+      });
+      assertEquals(crlfPatch.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/crlf-patch.txt"])).stdout,
+        "alpha\r\nBETA\r\ngamma\r\n",
+      );
+
+      // A later hunk may be unique only after an earlier hunk changed the text.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\na\\nb\\ntwo\\na\\nb\\n' > /root/later.txt",
+      ]);
+      const later = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/later.txt",
+          "+++ b/later.txt",
+          "@@ -1,4 +1,4 @@",
+          " one",
+          " a",
+          "-b",
+          "+B",
+          " two",
+          "@@ -5,2 +5,2 @@",
+          " a",
+          "-b",
+          "+B2",
+        ].join("\n"),
+      });
+      assertEquals(later.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/later.txt"])).stdout,
+        "one\na\nB\ntwo\na\nB2\n",
+      );
+
+      // Replacing the final line of a file without a trailing newline.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'a\\nb' > /root/no-eol.txt",
+      ]);
+      const noEol = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/no-eol.txt",
+          "+++ b/no-eol.txt",
+          "@@ -1,2 +1,2 @@",
+          " a",
+          "-b",
+          "+c",
+          "\\ No newline at end of file",
+        ].join("\n"),
+      });
+      assertEquals(noEol.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/no-eol.txt"])).stdout,
+        "a\nc",
+      );
+
+      // A patch path may not leave the working directory.
+      await alpha.exec(["/bin/bash", "-c", "printf 'x\\n' > /root/noop.txt"]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/../escape.txt",
+              "+++ b/../escape.txt",
+              "@@ -1 +1 @@",
+              "-x",
+              "+y",
+            ].join("\n"),
+          }),
+        Error,
+        "leaves the working directory",
+      );
+
+      // A context block that only occurs inside a longer line is not a match.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'xa\\nb\\nc\\n' > /root/midline.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/midline.txt",
+              "+++ b/midline.txt",
+              "@@ -1,2 +1,2 @@",
+              " a",
+              "-b",
+              "+B",
+            ].join("\n"),
+          }),
+        Error,
+        "does not match",
+      );
+
+      // Deleting an empty file is still a change.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        ": > /root/empty-delete.txt",
+      ]);
+      const emptyDelete = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/empty-delete.txt",
+          "+++ /dev/null",
+          "@@ -0,0 +0,0 @@",
+        ].join("\n"),
+      });
+      assertEquals(emptyDelete.filesChanged, 1);
+      const emptyGone = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "test ! -e /root/empty-delete.txt",
+      ]);
+      assertEquals(emptyGone.exitCode, 0, JSON.stringify(emptyGone));
+
+      // Absolute patch paths are not applied outside the working directory.
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- \\etc\\hosts",
+              "+++ \\etc\\hosts",
+              "@@ -1 +1 @@",
+              "-x",
+              "+y",
+            ].join("\n"),
+          }),
+        Error,
+        "is absolute",
+      );
+
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- /etc/hosts",
+              "+++ /etc/hosts",
+              "@@ -1 +1 @@",
+              "-x",
+              "+y",
+            ].join("\n"),
+          }),
+        Error,
+        "is absolute",
+      );
+
+      // A symlink target is rejected rather than replaced by a regular file.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'linked\\n' > /root/link-target.txt; ln -sfn /root/link-target.txt /root/link-path.txt",
+      ]);
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
+              "--- a/link-path.txt",
+              "+++ b/link-path.txt",
+              "@@ -1 +1 @@",
+              "-linked",
+              "+changed",
+            ].join("\n"),
+          }),
+        Error,
+        "symbolic link",
+      );
+      const linkIntact = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        'test -L /root/link-path.txt && test "$(cat /root/link-target.txt)" = linked',
+      ]);
+      assertEquals(linkIntact.exitCode, 0, JSON.stringify(linkIntact));
+
+      // Text search must not block on a symlink to a FIFO.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "mkdir -p /root/search-tree; printf needle > /root/search-tree/real.txt; mkfifo /root/search-tree/pipe; ln -s pipe /root/search-tree/link-pipe",
+      ]);
+      const fifoSearch = await invoke(alpha, "search_files", {
+        path: "/root/search-tree",
+        text: "needle",
+      });
+      assertEquals((fifoSearch.results as unknown[]).length, 1);
+
+      // A section that changes nothing is not reported as a change.
+      const noop = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/noop.txt",
+          "+++ b/noop.txt",
+          "@@ -1 +1 @@",
+          " x",
+        ].join("\n"),
+      });
+      assertEquals(noop.filesChanged, 0);
+
+
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'alpha\\r\\nbeta\\r\\ngamma\\r\\n' > /root/crlf.txt",
+      ]);
+      await invoke(alpha, "edit_file", {
+        path: "/root/crlf.txt",
+        oldText: "beta",
+        newText: "BETA",
+      });
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/crlf.txt"])).stdout,
+        "alpha\r\nBETA\r\ngamma\r\n",
+      );
+      const crlfPatched = await invoke(alpha, "apply_patch", {
+        cwd: "/root",
+        patch: [
+          "--- a/crlf.txt",
+          "+++ b/crlf.txt",
+          "@@ -1,3 +1,3 @@",
+          " alpha",
+          "-BETA",
+          "+delta",
+          " gamma",
+        ].join("\n"),
+      });
+      assertEquals(crlfPatched.filesChanged, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/crlf.txt"])).stdout,
+        "alpha\r\ndelta\r\ngamma\r\n",
+      );
+
       await alpha.exec([
         "/bin/bash",
         "-c",
@@ -501,12 +1052,34 @@ Deno.test({
       );
       assert(names.includes("child"));
       assert(!names.includes("deep"));
-      const discovered = await invoke(alpha, "search_files", {});
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "mkdir -p /root/real-dir && touch /root/real-dir/inner && ln -sfn /root/real-dir /root/linked-dir",
+      ]);
+      const linkedListing = await invoke(alpha, "list_directory", {
+        path: "/root/linked-dir",
+      });
+      assertEquals(
+        (linkedListing.entries as Array<{ name: string }>).map((entry) =>
+          entry.name
+        ),
+        ["inner"],
+      );
+      const discovered = await invoke(alpha, "search_files", {
+        maxResults: 200,
+      });
       const discoveredPaths = (
         discovered.results as Array<{ path: string }>
       ).map((result) => result.path);
-      assert(discoveredPaths.includes("./tree"));
-      assert(discoveredPaths.includes("./tree/child/deep"));
+      // The agent root also holds files created by earlier assertions, so
+      // match the discovered paths by suffix rather than exact text.
+      assert(discoveredPaths.some((entry) => entry.endsWith("/tree") || entry === "./tree"));
+      assert(
+        discoveredPaths.some((entry) =>
+          entry.endsWith("/tree/child/deep") || entry === "./tree/child/deep"
+        ),
+      );
       const searched = await invoke(alpha, "search_files", {
         path: "/root/tree",
         text: "needle",
@@ -514,6 +1087,67 @@ Deno.test({
       });
       assertEquals((searched.results as unknown[]).length, 1);
       assertEquals(searched.truncated, true);
+
+      const shellTools = new Map(
+        (await new ShellFeature().createTools()).map((tool) => [
+          tool.name,
+          tool,
+        ]),
+      );
+      const invokeShell = async (
+        env: RuntimeEnv,
+        name: string,
+        args: unknown,
+      ) => {
+        const tool = shellTools.get(name) as ToolDefinition<AgentRunDeps>;
+        const value = await tool.execute({
+          deps: {
+            agentId: env.agentId,
+            provider: "openai-compatible",
+            model: "test-model",
+            runtime: env,
+            cwd: "/root",
+            control: {},
+          },
+        } as never, args);
+        return unwrapObservedToolResult(value).result as Record<
+          string,
+          unknown
+        >;
+      };
+      await invokeShell(alpha, "start_background", {
+        name: "bg-finished",
+        command: "echo bg-output-line",
+      });
+      let background: Record<string, unknown> = {};
+      for (let attempt = 0; attempt < 100; attempt++) {
+        background = await invokeShell(alpha, "get_background", {
+          name: "bg-finished",
+        });
+        if (background.found === true && background.alive === false) break;
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 50);
+        await promise;
+      }
+      // A finished background process keeps its pane, so the output and exit
+      // status stay available instead of reading as an unknown session.
+      assertEquals(background.found, true, JSON.stringify(background));
+      assertEquals(background.alive, false, JSON.stringify(background));
+      assertEquals(background.exitCode, 0, JSON.stringify(background));
+      assert(
+        String(background.output).includes("bg-output-line"),
+        JSON.stringify(background),
+      );
+      assertEquals(
+        (await invokeShell(alpha, "stop_background", { name: "bg-finished" }))
+          .status,
+        "stopped",
+      );
+      assertEquals(
+        (await invokeShell(alpha, "get_background", { name: "bg-finished" }))
+          .found,
+        false,
+      );
 
       const visionTools = new Map(
         (await new VisionFeature().createTools()).map((tool) => [
@@ -788,17 +1422,24 @@ Deno.test({
         "-c",
         "script -q -e -c 'sleep 2' /dev/null",
       ]);
+      // `ptmx` is always present; wait for an actual pty node.
       let alphaListing = "";
       for (let attempt = 0; attempt < 100; attempt++) {
         alphaListing = (await alpha.exec(["/bin/bash", "-c", "ls -A /dev/pts"]))
           .stdout;
-        if (alphaListing.trim() !== "") break;
+        if (
+          alphaListing.split("\n").some((entry) =>
+            /^[0-9]+$/.test(entry.trim())
+          )
+        ) break;
         const { promise, resolve } = Promise.withResolvers<void>();
         setTimeout(resolve, 50);
         await promise;
       }
       assert(
-        alphaListing.split("\n").some((entry) => /^[0-9]+$/.test(entry.trim())),
+        alphaListing.split("\n").some((entry) =>
+          /^[0-9]+$/.test(entry.trim())
+        ),
         `alpha should see its own pty: ${JSON.stringify(alphaListing)}`,
       );
       const betaListing = await beta.exec(["/bin/bash", "-c", "ls -A /dev/pts"]);

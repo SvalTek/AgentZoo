@@ -7,12 +7,12 @@ import { actionableToolError } from "../ToolSupport.ts";
 import {
   type MCPServerEntry,
   MCPServerUnavailableError,
-  mcpToolPrefix,
 } from "./MCPPool.ts";
+import { mcpToolName } from "./NamedToolset.ts";
 
 const ListToolsParameters = z.object({
   mcp_name: z.string().min(1).describe(
-    "Name of an MCP server available to this agent",
+    "Name of an MCP server available here",
   ),
 });
 
@@ -36,10 +36,10 @@ export function createMCPListToolsTool(
       const server = byName.get(mcp_name);
       if (!server) {
         throw actionableToolError([
-          `MCP server "${mcp_name}" is not available to this agent.`,
+          `MCP server "${mcp_name}" is not available here.`,
           availableNames
             ? `Call list_tools with one of: ${availableNames}.`
-            : "No MCP servers are available to this agent.",
+            : "No MCP servers are available here.",
         ]);
       }
 
@@ -61,8 +61,9 @@ export function createMCPListToolsTool(
       context.deps.control.enabledMcpServers.add(server.name);
 
       return JSON.stringify(tools.map((definition) => ({
-        name: `${mcpToolPrefix(server.name)}${definition.name}`,
+        name: mcpToolName(server.name, definition.name),
         description: definition.description,
+        inputSchema: definition.inputSchema ?? z.toJSONSchema(definition.parameters),
       })));
     },
   });

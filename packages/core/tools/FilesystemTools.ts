@@ -1,6 +1,7 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
 import type { ToolDefinition } from "@vibesjs/sdk";
+import { applyPatch, parsePatch } from "npm:diff@8";
 import { TextTemplate } from "@agent-zoo/shared";
 import { z } from "zod";
 import type { AgentRunDeps } from "../Agent.ts";
@@ -12,6 +13,8 @@ import {
   ToolExecutionError,
   type ToolFeedback,
 } from "../ToolSupport.ts";
+import { relative as relativePath } from "@std/path/posix";
+import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
 
 const PathParameter = z.string().optional().describe(
   "The file path for this operation. Required for execution. Use an absolute path or a path relative to the current working directory.",
@@ -89,7 +92,10 @@ test -e "$path" || exit 40
 test -f "$path" || exit 41
 size=$(stat -Lc %s -- "$path") || exit 42
 printf '%s\n' "$size"
-dd if="$path" bs=1 skip="$offset" count="$limit" status=none | base64 -w0
+chunk=$(mktemp) || exit 52
+trap 'rm -f "$chunk"' EXIT
+dd if="$path" bs=1 skip="$offset" count="$limit" status=none > "$chunk" || exit 51
+base64 -w0 "$chunk"
 `;
 
 const WRITE_SCRIPT = String.raw`
@@ -101,10 +107,11 @@ if test "$mode" = create; then
   test ! -e "$path" || exit 54
   (set -o noclobber; cat > "$path") || exit 54
 elif test "$mode" = append; then
-  cat >> "$path"
+  cat >> "$path" || exit 55
 else
-  cat > "$path"
+  cat > "$path" || exit 55
 fi
+stat -Lc %s -- "$path"
 `;
 
 const EDIT_SCRIPT = String.raw`
@@ -116,6 +123,15 @@ if od -An -v -t u1 -- "$path" | grep -qw 0; then exit 50; fi
 old=$(printf '%s' "$old64" | base64 -d; printf x); old=$${"{"}old%x}
 new=$(printf '%s' "$new64" | base64 -d; printf x); new=$${"{"}new%x}
 content=$(cat -- "$path"; printf x); content=$${"{"}content%x}
+# Match and replace in the file's own line endings: a model that sees CRLF
+# text through read_file may send either form, and the edited region must not
+# end up with mixed endings.
+case "$content" in
+  *$'\r\n'*)
+    old=$${"{"}old//$'\r\n'/$'\n'}; old=$${"{"}old//$'\n'/$'\r\n'}
+    new=$${"{"}new//$'\r\n'/$'\n'}; new=$${"{"}new//$'\n'/$'\r\n'}
+    ;;
+esac
 rest=$content count=0
 while test "$${"{"}rest#*"$old"}" != "$rest"; do
   count=$((count + 1)); rest=$${"{"}rest#*"$old"}
@@ -128,24 +144,49 @@ printf '%s' "$output" > "$path" || exit 46
 printf '%s\n' "$replacements"
 `;
 
-const PATCH_SCRIPT = String.raw`
-patch_file=$(mktemp) || exit 53
-trap 'rm -f "$patch_file"' EXIT
-cat > "$patch_file" || exit 53
-apply_mode=()
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || apply_mode=(--no-index)
-eof_mode=()
-git apply "$${"{"}apply_mode[@]}" --check --recount --whitespace=nowarn -- "$patch_file" >/dev/null 2>&1 || eof_mode=(--inaccurate-eof)
-git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --check --recount --whitespace=nowarn -- "$patch_file" || exit 51
-git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --numstat -- "$patch_file" || exit 51
-git apply "$${"{"}apply_mode[@]}" "$${"{"}eof_mode[@]}" --recount --whitespace=nowarn -- "$patch_file" || exit 52
+const READ_TEXT_SCRIPT = String.raw`
+path=$1 limit=$2
+test -e "$path" || exit 40
+test -f "$path" || exit 41
+size=$(stat -Lc %s -- "$path") || exit 42
+test "$size" -le "$limit" || exit 43
+stat -Lc %a -- "$path" || exit 42
+base64 -w0 -- "$path" || exit 44
+`;
+
+const PATH_KIND_SCRIPT = String.raw`
+path=$1
+if test -L "$path"; then printf "symlink\\n"; exit 0; fi
+if test -d "$path"; then printf "directory\\n"; exit 0; fi
+if test -e "$path"; then printf "exists\\n"; exit 0; fi
+printf "missing\\n"
+`;
+
+/**
+ * Write content to a temporary file in the target directory.
+ *
+ * `action` is either `copy` (preserve an existing target's mode and owner) or
+ * `mode:<perm>` (a new file or a restore, which must not rely on the current
+ * on-disk target).
+ */
+const WRITE_TEMP_SCRIPT = String.raw`
+target=$1 action=$2
+dir=$(dirname -- "$target")
+test -d "$dir" || exit 43
+tmp=$(mktemp "$dir/.agentzoo-patch.XXXXXX") || exit 55
+case "$action" in
+  copy) cp -p -- "$target" "$tmp" || { rm -f "$tmp"; exit 55; } ;;
+  mode:*) chmod "$${"{"}action#mode:}" "$tmp" || { rm -f "$tmp"; exit 55; } ;;
+esac
+base64 -d > "$tmp" || { rm -f "$tmp"; exit 55; }
+printf '%s\n' "$tmp"
 `;
 
 const LIST_SCRIPT = String.raw`
 path=$1
 test -e "$path" || exit 40
 test -d "$path" || exit 48
-find "$path" -mindepth 1 -maxdepth 1 -printf '%f\0%y\0%s\0'
+find -H "$path" -mindepth 1 -maxdepth 1 -printf '%f\0%y\0%s\0'
 `;
 
 const SEARCH_NAME_SCRIPT = String.raw`
@@ -160,9 +201,9 @@ path=$1 pattern=$2 limit=$3 name=$4
 test -e "$path" || exit 40
 test -d "$path" || exit 48
 if test -n "$name"; then
-  find "$path" -type f -name "$name" -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
+  find "$path" -xtype f -name "$name" -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
 else
-  find "$path" -type f -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
+  find "$path" -xtype f -exec grep -nIH -F -- "$pattern" {} + 2>/dev/null
 fi | head -n "$((limit + 1))"
 `;
 
@@ -182,21 +223,6 @@ Use these structured tools for ordinary file and directory work instead of shell
 
   async createTools(): Promise<readonly ToolDefinition<AgentRunDeps>[]> {
     const { tool } = await import("@vibesjs/sdk");
-    const patchFailures: Record<number, ToolFeedback> = {
-      51: [
-        "No files were changed: the patch does not match the current files.",
-        "Read the affected files and rebuild the patch from their current contents.",
-        "Do not resend the same patch unchanged.",
-      ],
-      52: [
-        "No files were changed: the checked patch could not be applied.",
-        "Read the affected files, confirm their current state, and regenerate the patch.",
-      ],
-      53: [
-        "No files were changed: the patch could not be processed.",
-        "Provide a complete unified diff with valid file headers and hunk lines.",
-      ],
-    };
     const writeFailures: Record<number, ToolFeedback> = {
       41: [
         "No bytes were written: the path is not a regular file.",
@@ -211,6 +237,11 @@ Use these structured tools for ordinary file and directory work instead of shell
         "create is only for a new file.",
         "For a local change, read the file and use edit_file; for related changes, use apply_patch.",
         "Use overwrite only for an intended complete replacement.",
+      ],
+      55: [
+        "The write did not complete: the file could not be written.",
+        "The disk may be full or the path may be read-only.",
+        "A complete replacement may have truncated or partially written the file; read it before retrying.",
       ],
     };
     const editFailures: Record<number, ToolFeedback> = {
@@ -252,6 +283,18 @@ Use these structured tools for ordinary file and directory work instead of shell
         "The path is not a regular file.",
         "Choose a file path; use list_directory when the path is a directory.",
       ],
+      42: [
+        "The file size could not be read.",
+        "Use shell to inspect the path when the file metadata is unavailable.",
+      ],
+      51: [
+        "No bytes were read: the file could not be read.",
+        "Check the file permissions or use shell for files this computer cannot read.",
+      ],
+      52: [
+        "No bytes were read: the read could not be prepared.",
+        "Retry the read, or use shell when the problem persists.",
+      ],
     };
     const directoryFailures: Record<number, ToolFeedback> = {
       40: [
@@ -267,7 +310,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof PatchParameters>({
         name: "apply_patch",
         description:
-          "Apply a unified diff to files. For one small exact replacement, prefer edit_file; prefer apply_patch for changes spanning multiple regions or files. Set cwd to the directory containing the patched paths, use matching relative '--- a/path' and '+++ b/path' headers, and use exact '@@' hunk counts. The complete patch is checked before files are changed. Returns changed paths and addition/deletion counts.",
+          "Apply a unified diff to files. For one small exact replacement, prefer edit_file; prefer apply_patch for changes spanning multiple regions or files. Set cwd to the directory containing the patched paths, and use matching relative '--- a/path' and '+++ b/path' headers. Hunk line counts must match. A hunk may begin or end with a changed line; trailing context is not required, but a hunk's context must identify one unique location. Patch lines are matched in the file's own line endings, so a LF patch edits a CRLF file without mixing endings. Every affected file is read and patched in memory first; if any hunk or write fails, earlier writes are rolled back. Returns changed paths (relative to cwd) and addition/deletion counts.",
         parameters: PatchParameters,
         argsValidator: (input) => {
           if (!input.patch?.trim()) {
@@ -290,39 +333,27 @@ Use these structured tools for ordinary file and directory work instead of shell
           }
         },
         execute: async (context, input) => {
-          const patch = input.patch!.endsWith("\n")
-            ? input.patch!
-            : `${input.patch!}\n`;
-          const raw = await execute(
-            context.deps,
-            ["/bin/bash", "-c", PATCH_SCRIPT, "apply_patch"],
-            patch,
-            input.cwd,
-            patchFailures,
-          );
-          const changes = raw.stdout.split("\n").filter(Boolean).map((line) => {
-            const [additions = "0", deletions = "0", ...path] = line.split(
-              "\t",
-            );
-            return {
-              path: path.join("\t"),
-              additions: additions === "-" ? undefined : Number(additions),
-              deletions: deletions === "-" ? undefined : Number(deletions),
-            };
-          });
+          const cwd = resolveRuntimeDirectory(context.deps.cwd, input.cwd);
+          const staged = await stagePatch(context.deps, input.patch!, cwd);
+          const written = await commitPatch(context.deps, staged);
+          const changes = [...staged.values()].map((file) => ({
+            path: relativeToDirectory(cwd, file.path),
+            additions: file.additions,
+            deletions: file.deletions,
+          }));
           const result = {
             filesChanged: changes.length,
             changes,
             message:
               "Patch applied. Its previous file context is now stale; read or test before another related edit.",
           };
-          return observedToolResult(result, { command: raw, result });
+          return observedToolResult(result, { ...written, result });
         },
       }),
       tool<AgentRunDeps, typeof WriteParameters>({
         name: "write_file",
         description:
-          "Create a new file without replacing an existing one, append content, or explicitly replace a file's complete contents. Do NOT use this as a general-purpose text editor; prefer edit_file for one small exact replacement or apply_patch for larger or multiple changes. Returns the path, bytesWritten, and mode.",
+          "Create a new file without replacing an existing one, append content, or explicitly replace a file's complete contents. Do NOT use this as a general-purpose text editor; prefer edit_file for one small exact replacement or apply_patch for larger or multiple changes. Returns the path, mode, bytesWritten (bytes sent by this call, not the resulting file size), sizeBytes (the file afterwards), and a message.",
         parameters: WriteParameters,
         argsValidator: validateWriteArguments,
         execute: async (context, input) => {
@@ -346,6 +377,7 @@ Use these structured tools for ordinary file and directory work instead of shell
           const result = {
             path: input.path!,
             bytesWritten: new TextEncoder().encode(content).length,
+            sizeBytes: Number(raw.stdout.trim()),
             mode,
             message: mode === "overwrite"
               ? "Complete file replacement finished. Read or test this file before another write."
@@ -357,7 +389,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof EditParameters>({
         name: "edit_file",
         description:
-          "Make a precise exact-text change to a text file. Prefer edit_file for one small exact replacement; prefer apply_patch for changes spanning multiple regions or files. A missing match fails; multiple matches fail unless replaceAll is true. Returns the path and number of replacements.",
+          "Make a precise exact-text change to a text file. Prefer edit_file for one small exact replacement; prefer apply_patch for changes spanning multiple regions or files. A missing match fails; multiple matches fail unless replaceAll is true. Line endings are matched in the file's own convention, so LF and CRLF forms of oldText both work. Returns the path and number of replacements.",
         parameters: EditParameters,
         argsValidator: validateEditArguments,
         execute: async (context, input) => {
@@ -394,7 +426,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof ReadParameters>({
         name: "read_file",
         description:
-          "Read a bounded section of a UTF-8 text file. Returns content, offset, bytesRead, sizeBytes, truncated, and nextOffset when more data remains.",
+          "Read a bounded section of a UTF-8 text file. offset, limit, and nextOffset are byte positions: offset is the zero-based byte at which reading starts, limit is the maximum number of bytes, and nextOffset is the offset to pass to continue when truncated is true. Returns content, offset, bytesRead, sizeBytes, truncated, and nextOffset while more data remains.",
         parameters: ReadParameters,
         argsValidator: (input) => requirePath(input.path, "read"),
         execute: async (context, input) => {
@@ -478,7 +510,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof ListParameters>({
         name: "list_directory",
         description:
-          "List the immediate contents of a directory without recursive traversal. Returns each entry's name, type, and sizeBytes.",
+          "List the immediate contents of a directory without recursive traversal. Follows a symlinked directory when path itself is a link. Returns each entry's name, type, and sizeBytes (for a symlink, the length of its target path).",
         parameters: ListParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
@@ -513,7 +545,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof SearchParameters>({
         name: "search_files",
         description:
-          "Search recursively beneath a directory by filename glob, literal file text, or both. Returns bounded path results; text matches include line numbers and snippets. The result reports whether more matches were truncated.",
+          "Search recursively beneath a directory by filename glob, literal file text, or both. Text search also reads symlinked files. Results report paths exactly as the search resolved them beneath path, so an absolute path yields absolute results. Returns bounded path results; text matches include line numbers and snippets. The result reports whether more matches were truncated.",
         parameters: SearchParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
@@ -627,7 +659,9 @@ async function execute(
   command: string[],
   stdin?: string,
   cwd = deps.cwd,
-  failures: Readonly<Record<number, ToolFeedback>> = {},
+  failures: Readonly<
+    Record<number, ToolFeedback | ((raw: CommandResult) => ToolFeedback)>
+  > = {},
 ): Promise<CommandResult> {
   let raw: CommandResult;
   try {
@@ -643,9 +677,525 @@ async function execute(
   if (raw.exitCode === 0) return raw;
   const failure = failures[raw.exitCode ?? -1];
   if (failure) {
-    throw actionableToolError(failure, { command: raw });
+    throw actionableToolError(
+      typeof failure === "function" ? failure(raw) : failure,
+      { command: raw },
+    );
   }
   throw new ToolExecutionError("The operation failed.", { command: raw });
+}
+
+const PATCH_FILE_LIMIT = 33_554_432;
+
+interface StagedPatchFile {
+  readonly path: string;
+  /** Original text, or null when the patch creates the file. */
+  readonly before: string | null;
+  /** Original permission bits, used when a rollback must recreate the file. */
+  readonly mode: string | null;
+  /** Patched text, or null when the patch deletes the file. */
+  readonly after: string | null;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+/**
+ * Read, patch, and validate every file in memory before anything is written.
+ *
+ * The patch is a standard unified diff, so the application needs file contents
+ * and must not depend on a Git worktree. Applying here means a context mismatch
+ * or an unreadable target fails before the first byte reaches the filesystem.
+ */
+async function stagePatch(
+  deps: AgentRunDeps,
+  patch: string,
+  cwd: string,
+): Promise<Map<string, StagedPatchFile>> {
+  // diff requires one consistent line ending, including the final line, and
+  // autoConvertLineEndings adapts the result to each file. Mixed or
+  // unterminated patches are normalised to LF before parsing.
+  const normalizedPatch = (patch.endsWith("\n") ? patch : `${patch}\n`)
+    .replaceAll("\r\n", "\n");
+  let files;
+  try {
+    files = parsePatch(normalizedPatch);
+  } catch (error) {
+    throw actionableToolError([
+      "No files were changed: the patch could not be parsed.",
+      `The patch parser reported: ${error instanceof Error ? error.message : String(error)}`,
+      "Check the '@@' hunk header and line counts, and start every hunk line with a space, '-', or '+'.",
+    ], { patch });
+  }
+  if (files.length === 0) {
+    throw actionableToolError([
+      "No files were changed: the patch contains no file sections.",
+      "Provide a unified diff with matching '---' and '+++' headers.",
+    ], { patch });
+  }
+
+  const staged = new Map<string, StagedPatchFile>();
+  for (const file of files) {
+    const oldPath = patchFilePath(file.oldFileName, cwd);
+    const newPath = patchFilePath(file.newFileName, cwd);
+    if (oldPath !== null && newPath !== null && oldPath !== newPath) {
+      throw actionableToolError([
+        "No files were changed: apply_patch does not move or rename files.",
+        `The patch changes ${relativeToDirectory(cwd, oldPath)} to ${relativeToDirectory(cwd, newPath)}.`,
+        "Create the new file with write_file and remove the old one, or use shell.",
+      ], { patch });
+    }
+    const path = newPath ?? oldPath;
+    if (path === null) {
+      throw actionableToolError([
+        "No files were changed: a file section names neither a source nor a destination.",
+        "Provide '--- a/path' and '+++ b/path' headers.",
+      ], { patch });
+    }
+    if (staged.has(path)) {
+      throw actionableToolError([
+        `No files were changed: the patch modifies ${relativeToDirectory(cwd, path)} more than once.`,
+        "Combine the changes for that file into one section.",
+      ], { patch });
+    }
+
+    let before: string | null = null;
+    let mode: string | null = null;
+    if (oldPath !== null) {
+      const kind = await pathKind(deps, oldPath);
+      if (kind === "symlink") {
+        throw actionableToolError([
+          `No files were changed: ${relativeToDirectory(cwd, oldPath)} is a symbolic link.`,
+          "Patch the file it points to, or replace the link with shell.",
+        ], { patch });
+      }
+      const read = await readPatchFile(deps, oldPath, cwd);
+      if (read === null) {
+        throw actionableToolError([
+          `No files were changed: ${relativeToDirectory(cwd, oldPath)} does not exist.`,
+          "Read the affected files and rebuild the patch from their current contents.",
+          "Create a new file with write_file, or with a '--- /dev/null' patch section.",
+        ], { patch });
+      }
+      before = read.content;
+      mode = read.mode;
+    } else {
+      // A creation section must not replace something that is already there.
+      const kind = await pathKind(deps, path);
+      if (kind !== "missing") {
+        throw actionableToolError([
+          `No files were changed: ${relativeToDirectory(cwd, path)} already exists.`,
+          kind === "symlink"
+            ? "The path is a symbolic link."
+            : kind === "directory"
+            ? "The path is a directory."
+            : "Remove it first, or patch the existing file instead of creating it.",
+        ], { patch });
+      }
+    }
+
+    // Apply hunks one at a time, checking each against the text produced so
+    // far: a later hunk can be unique only after an earlier hunk changed the
+    // text it matches.
+    let working = before ?? "";
+    for (const hunk of file.hunks) {
+      const oldLines: string[] = [];
+      let trailingNewline = true;
+      for (const line of hunk.lines) {
+        if (line.startsWith("\\")) {
+          // "\ No newline at end of file" applies to the previous old line.
+          if (oldLines.length > 0) trailingNewline = false;
+          continue;
+        }
+        // diff stores a blank context line as "" rather than " ".
+        const operation = line.length > 0 ? line[0] : " ";
+        if (operation === "+") continue;
+        if (operation === " " || operation === "-") {
+          oldLines.push(line.slice(1).replace(/\r$/, ""));
+          trailingNewline = true;
+        }
+      }
+      if (oldLines.length === 0) {
+        // An insertion with no unchanged line can only be placed by its line
+        // number, which is stale as soon as the file changes.
+        if (working.length > 0) {
+          throw actionableToolError([
+            `No files were changed: the hunk at line ${hunk.oldStart} has no context.`,
+            "Include at least one unchanged line so the change has a unique position.",
+            "Read the file and copy the line before or after the addition into the hunk.",
+          ], { patch });
+        }
+      } else {
+        const needle = oldLines.join("\n") + (trailingNewline ? "\n" : "");
+        if (needle !== "") {
+          // Only a match that starts a line counts: a context block may not
+          // match inside a longer line.
+          const normalizedWorking = working.replaceAll("\r\n", "\n");
+          let occurrences = 0;
+          for (
+            let index = normalizedWorking.indexOf(needle);
+            index !== -1;
+            index = normalizedWorking.indexOf(needle, index + 1)
+          ) {
+            if (index === 0 || normalizedWorking[index - 1] === "\n") {
+              occurrences++;
+            }
+          }
+          // A hunk may end at a file whose last line has no newline; the
+          // parser still reports that line with one.
+          if (occurrences === 0 && needle.endsWith("\n")) {
+            const truncated = needle.slice(0, -1);
+            const start = normalizedWorking.length - truncated.length;
+            if (
+              start >= 0 && normalizedWorking.endsWith(truncated) &&
+              (start === 0 || normalizedWorking[start - 1] === "\n")
+            ) occurrences = 1;
+          }
+          if (occurrences === 0) {
+            throw actionableToolError([
+              `No files were changed: the hunk at line ${hunk.oldStart} does not match ${relativeToDirectory(cwd, path)}.`,
+              "Read that file and rebuild the hunk from its current contents.",
+              "Do not resend the same patch unchanged.",
+            ], { patch });
+          }
+          if (occurrences > 1) {
+            throw actionableToolError([
+              `No files were changed: the hunk at line ${hunk.oldStart} matches ${occurrences} places in ${relativeToDirectory(cwd, path)}.`,
+              "Include more surrounding context so the hunk identifies one location.",
+              hunk.lines.some((line) => line.startsWith("-"))
+                ? "Read the file and copy the surrounding lines around the intended change."
+                : "Add the unchanged lines immediately before or after the change.",
+            ], { patch });
+          }
+        }
+      }
+      const single = { ...file, hunks: [hunk] };
+      let next = applyPatch(working, single, {
+        fuzzFactor: 0,
+        autoConvertLineEndings: true,
+      });
+      if (
+        next === false && !working.endsWith("\n") &&
+        hunk.lines.some((line) => line.startsWith("\\"))
+      ) {
+        // diff refuses a no-final-newline hunk against a file that already
+        // lacks the newline; retry against a newline-terminated copy, which
+        // yields the patched text without the newline.
+        next = applyPatch(`${working}\n`, single, {
+          fuzzFactor: 0,
+          autoConvertLineEndings: true,
+        });
+      }
+      if (next === false) {
+        throw actionableToolError([
+          `No files were changed: the patch context does not match ${relativeToDirectory(cwd, path)}.`,
+          "Read that file and rebuild the hunk from its current contents.",
+          "Do not resend the same patch unchanged.",
+        ], { patch });
+      }
+      working = next;
+    }
+
+    const updated = working;
+    // Deleting the file is only correct when the patch removes every line.
+    if (newPath === null && updated !== "") {
+      const remaining = updated.replace(/\n$/, "").split("\n").length;
+      throw actionableToolError([
+        `No files were changed: the patch does not delete all of ${relativeToDirectory(cwd, path)}.`,
+        `The patch removes part of the file and would leave ${remaining} line(s).`,
+        "Remove every line in the hunk, or patch the file instead of deleting it.",
+      ], { patch });
+    }
+    // A section that keeps the file is not a change; a deletion always is.
+    if (newPath !== null && before !== null && updated === before) continue;
+    staged.set(path, {
+      path,
+      before,
+      mode,
+      after: newPath === null ? null : updated,
+      additions: file.hunks.reduce(
+        (total, hunk) =>
+          total + hunk.lines.filter((line) => line.startsWith("+")).length,
+        0,
+      ),
+      deletions: file.hunks.reduce(
+        (total, hunk) =>
+          total + hunk.lines.filter((line) => line.startsWith("-")).length,
+        0,
+      ),
+    });
+  }
+  return staged;
+}
+
+/** Stage every replacement, then rename them in one step; roll back on failure. */
+async function commitPatch(
+  deps: AgentRunDeps,
+  staged: ReadonlyMap<string, StagedPatchFile>,
+): Promise<{ commit: unknown; staged: readonly StagedPatchFile[] }> {
+  const files = [...staged.values()];
+  const temps = new Map<string, string>();
+  try {
+    for (const file of files) {
+      if (file.after === null) continue;
+      temps.set(
+        file.path,
+        await writeTempFile(
+          deps,
+          file.path,
+          file.after,
+          file.before === null ? "mode:644" : "copy",
+        ),
+      );
+    }
+  } catch (error) {
+    await removeFiles(deps, [...temps.values()]);
+    if (error instanceof ToolExecutionError) throw error;
+    throw actionableToolError([
+      "No files were changed: the patched contents could not be staged.",
+      "Check available space and permissions in the target directories.",
+    ], { error });
+  }
+
+  const script = [
+    "set -e",
+    ...files.map((file) => {
+      const temp = temps.get(file.path);
+      return file.after === null
+        ? `rm -f -- ${shellQuote(file.path)}`
+        : `test ! -d ${shellQuote(file.path)} || exit 41\n` +
+          `mv -f -- ${shellQuote(temp!)} ${shellQuote(file.path)}`;
+    }),
+  ].join("\n");
+  const commit = await runPatchCommand(deps, script, "commit_patch", []);
+  if (commit.exitCode !== 0) {
+    const failed = await rollbackPatch(deps, files, temps);
+    if (failed.length > 0) {
+      throw actionableToolError([
+        "The patch could not be committed, and the previous contents could not be fully restored.",
+        `Files that may be inconsistent: ${failed.join(", ")}.`,
+        "Read those files and repair them before continuing.",
+      ], { commit, failed });
+    }
+    throw actionableToolError([
+      "No files were changed: the patched files could not be written.",
+      "The previous contents were restored.",
+      "Check available space and permissions in the target directories.",
+    ], { commit });
+  }
+  return { commit, staged: files };
+}
+
+async function rollbackPatch(
+  deps: AgentRunDeps,
+  files: readonly StagedPatchFile[],
+  temps: ReadonlyMap<string, string>,
+): Promise<string[]> {
+  const failed: string[] = [];
+  for (const file of files) {
+    try {
+      if (file.before === null) {
+        const removed = await runPatchCommand(
+          deps,
+          `rm -f -- ${shellQuote(file.path)}`,
+          "rollback_remove",
+          [],
+        );
+        if (removed.exitCode !== 0) failed.push(file.path);
+        continue;
+      }
+      const temp = await writeTempFile(
+        deps,
+        file.path,
+        file.before,
+        `mode:${file.mode ?? "644"}`,
+      );
+      const moved = await runPatchCommand(
+        deps,
+        `mv -f -- ${shellQuote(temp)} ${shellQuote(file.path)}`,
+        "rollback_move",
+        [],
+      );
+      if (moved.exitCode !== 0) failed.push(file.path);
+    } catch {
+      failed.push(file.path);
+    }
+  }
+  await removeFiles(deps, [...temps.values()]);
+  return failed;
+}
+
+/** Read a patch target and its permission bits, or null when it is missing. */
+async function readPatchFile(
+  deps: AgentRunDeps,
+  path: string,
+  cwd: string,
+): Promise<{ content: string; mode: string } | null> {
+  const raw = await runPatchCommand(
+    deps,
+    READ_TEXT_SCRIPT,
+    "read_patch_target",
+    [path, String(PATCH_FILE_LIMIT)],
+  );
+  if (raw.exitCode === 40) return null;
+  if (raw.exitCode !== 0) {
+    const target = relativeToDirectory(cwd, path);
+    if (raw.exitCode === 43) {
+      throw actionableToolError([
+        `No files were changed: ${target} is too large for apply_patch.`,
+        `The limit is ${PATCH_FILE_LIMIT} bytes.`,
+        "Use shell for an appropriate large-file operation.",
+      ], { raw });
+    }
+    throw actionableToolError([
+      `No files were changed: ${target} could not be read.`,
+      raw.exitCode === 41
+        ? "The path is not a regular file."
+        : "Check the file permissions and available space before retrying.",
+    ], { raw });
+  }
+  const [modeLine = "644", encoded = ""] = raw.stdout.split("\n", 2);
+  const bytes = decodeBase64Bytes(encoded.replaceAll(/\s+/g, ""));
+  if (bytes.includes(0)) {
+    throw actionableToolError([
+      `No files were changed: ${relativeToDirectory(cwd, path)} is not a text file.`,
+      "Use shell for binary data.",
+    ], { raw });
+  }
+  try {
+    return {
+      content: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      mode: modeLine.trim(),
+    };
+  } catch {
+    throw actionableToolError([
+      `No files were changed: ${relativeToDirectory(cwd, path)} is not valid UTF-8 text.`,
+      "Use shell for binary data.",
+    ], { raw });
+  }
+}
+
+async function writeTempFile(
+  deps: AgentRunDeps,
+  path: string,
+  content: string,
+  action: "copy" | `mode:${string}`,
+): Promise<string> {
+  const raw = await runPatchCommand(
+    deps,
+    WRITE_TEMP_SCRIPT,
+    "write_patch_temp",
+    [path, action],
+    encodeBase64(content),
+  );
+  if (raw.exitCode !== 0 || !raw.stdout.trim()) {
+    if (raw.exitCode === 43) {
+      throw actionableToolError([
+        `No files were changed: the directory for ${path} does not exist.`,
+        "Create the directory first, or choose a path whose directory exists.",
+      ], { raw });
+    }
+    throw new ToolExecutionError("The patched contents could not be staged.", {
+      raw,
+    });
+  }
+  return raw.stdout.trim();
+}
+
+/** Report whether a path is missing, a file, or a directory. */
+async function pathKind(
+  deps: AgentRunDeps,
+  path: string,
+): Promise<"missing" | "exists" | "directory" | "symlink"> {
+  const raw = await runPatchCommand(
+    deps,
+    PATH_KIND_SCRIPT,
+    "path_kind",
+    [path],
+  );
+  const kind = raw.stdout.trim();
+  return kind === "symlink"
+    ? "symlink"
+    : kind === "directory"
+    ? "directory"
+    : kind === "exists"
+    ? "exists"
+    : "missing";
+}
+
+async function removeFiles(
+  deps: AgentRunDeps,
+  paths: readonly string[],
+): Promise<void> {
+  if (paths.length === 0) return;
+  await runPatchCommand(
+    deps,
+    `rm -f -- ${paths.map(shellQuote).join(" ")}`,
+    "remove_patch_temps",
+    [],
+  ).catch(() => undefined);
+}
+
+function runPatchCommand(
+  deps: AgentRunDeps,
+  script: string,
+  name: string,
+  args: readonly string[],
+  stdin?: string,
+): Promise<CommandResult> {
+  return deps.runtime.exec(
+    ["/bin/bash", "-c", script, name, ...args],
+    {
+      cwd: deps.cwd,
+      signal: deps.signal,
+      timeoutMs: 120_000,
+      stdin,
+    },
+  );
+}
+
+function patchFilePath(name: string, cwd: string): string | null {
+  if (name === "/dev/null") return null;
+  const stripped = name.replace(/^[ab]\//, "").replaceAll("\\", "/");
+  if (stripped.startsWith("/")) {
+    throw actionableToolError([
+      `No files were changed: the patch path '${name}' is absolute.`,
+      "Patch paths must be relative to the directory of the applied patch.",
+    ]);
+  }
+  try {
+    return resolveRuntimeDirectory(cwd, stripped);
+  } catch (error) {
+    throw actionableToolError([
+      `No files were changed: the patch path '${name}' leaves the working directory.`,
+      "Use a path inside the working directory.",
+    ], { error });
+  }
+}
+
+function relativeToDirectory(cwd: string, path: string): string {
+  return relativePath(cwd, path) || ".";
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function encodeBase64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8_192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
+  }
+  return btoa(binary);
+}
+
+function decodeBase64Bytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function fileType(code: string): "file" | "directory" | "symlink" | "other" {

@@ -5,7 +5,8 @@ import { TextTemplate } from "@agent-zoo/shared";
 import { z } from "zod";
 import type { AgentRunDeps } from "../Agent.ts";
 import type { Feature } from "../Feature.ts";
-import { observedToolResult } from "../ToolSupport.ts";
+import { actionableToolError, observedToolResult } from "../ToolSupport.ts";
+import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
 
 const SessionName = z.string().regex(
   /^[a-zA-Z0-9_-]{1,64}$/,
@@ -20,10 +21,10 @@ const CreateParameters = z.object({
     "Arguments passed directly to command. Only use when command is provided.",
   ),
   cwd: z.string().min(1).optional().describe(
-    "Working directory inside this computer. Omit to use the current directory.",
+    "Working directory inside this computer, as an absolute path or a path relative to the current working directory. Omit to use the current directory.",
   ),
   historyLimit: z.number().int().positive().max(100_000).optional().describe(
-    "Maximum scrollback lines retained. Defaults to 50000.",
+    "Maximum scrollback lines retained for this terminal's panes. Defaults to 50000.",
   ),
 });
 const NamedParameters = z.object({ name: SessionName });
@@ -52,7 +53,7 @@ const KeysParameters = NamedParameters.extend({
 export class TerminalFeature implements Feature<AgentRunDeps> {
   readonly id = "terminal";
   readonly description =
-    "Create and interact with persistent terminals. Use this when a program needs ongoing keyboard input, a screen, or continuity across turns.";
+    "Create and interact with persistent terminals. Use this when a program needs ongoing keyboard input, a screen, or continuity between separate interactions.";
   readonly systemPrompt = new TextTemplate(`## Interactive terminals
 
 Use \`shell\` for normal one-shot commands. Use \`terminal_create\` when a program needs ongoing keyboard input, a persistent screen, or interaction across turns. Read the terminal before deciding what to send. Use \`terminal_send\` for literal text and \`terminal_keys\` for keys such as Up, Enter, Escape, or C-c. Terminals belong only to this computer and persist until you kill them or this computer stops.`);
@@ -67,46 +68,54 @@ Use \`shell\` for normal one-shot commands. Use \`terminal_create\` when a progr
         parameters: CreateParameters,
         argsValidator: ({ command, args }) => {
           if (!command && args?.length) {
-            throw new Error(
-              "args requires command; omit args when starting the default shell.",
-            );
+            throw actionableToolError([
+              "args requires command.",
+              "No terminal was created.",
+              "Omit args when starting the default shell.",
+            ]);
           }
         },
         execute: async (context, params) => {
           const target = terminalTarget(params.name);
           const exists = await hasTerminal(context.deps, target);
           if (exists) {
-            return observedToolResult({ name: params.name, status: "exists" });
+            const state = await context.deps.runtime.exec(
+              `tmux list-panes -t ${shellQuote(target)} -F '#{pane_dead}'`,
+              { cwd: context.deps.cwd },
+            );
+            return observedToolResult({
+              name: params.name,
+              status: "exists",
+              alive: state.exitCode !== 0 || state.stdout.trim() !== "1",
+            });
           }
-          const cwd = params.cwd ?? context.deps.cwd;
+          const cwd = resolveRuntimeDirectory(context.deps.cwd, params.cwd);
+          const historyLimit = params.historyLimit ?? 50_000;
+          const program = params.command
+            ? [`exec`, shellQuote(params.command), ...(params.args ?? []).map(
+              shellQuote,
+            )].join(" ")
+            : undefined;
+          // One tmux invocation starts the server, so the history limit is
+          // applied before the first pane exists. remain-on-exit keeps a
+          // program's final screen readable after it exits.
+          const commands = [
+            `set-option -g history-limit ${historyLimit}`,
+            `new-session -d -s ${shellQuote(target)} -c ${shellQuote(cwd)}`,
+            `set-option -t ${shellQuote(target)} remain-on-exit on`,
+            `respawn-pane -k -t ${shellQuote(target)}${
+              program ? ` ${shellQuote(program)}` : ""
+            }`,
+          ];
           const command = [
-            "tmux new-session -d",
-            `-s ${shellQuote(target)}`,
-            `-c ${shellQuote(cwd)}`,
-            ...(params.command
-              ? [
-                shellQuote(params.command),
-                ...(params.args ?? []).map(shellQuote),
-              ]
-              : []),
+            "tmux",
+            ...commands.flatMap((value, index) =>
+              index === 0 ? [value] : [shellQuote(";"), value]
+            ),
           ].join(" ");
           const created = await context.deps.runtime.exec(command, { cwd });
           if (created.exitCode !== 0) {
             return terminalFailure(params.name, created.stderr);
-          }
-          const historyLimit = params.historyLimit ?? 50_000;
-          const configured = await context.deps.runtime.exec(
-            `tmux set-option -t ${
-              shellQuote(target)
-            } history-limit ${historyLimit}`,
-            { cwd },
-          );
-          if (configured.exitCode !== 0) {
-            await context.deps.runtime.exec(
-              `tmux kill-session -t ${shellQuote(target)}`,
-              { cwd },
-            );
-            return terminalFailure(params.name, configured.stderr);
           }
           return observedToolResult({
             name: params.name,
@@ -141,7 +150,7 @@ Use \`shell\` for normal one-shot commands. Use \`terminal_create\` when a progr
       tool<AgentRunDeps, typeof ReadParameters>({
         name: "terminal_read",
         description:
-          "Read the current screen and retained scrollback as plain text.",
+          "Read the current screen and retained scrollback as plain text. Output is capped at 65536 characters, keeping the most recent content. Reports whether the terminal's program is still alive and its exit code once it has finished.",
         parameters: ReadParameters,
         execute: async (context, params) => {
           const target = terminalTarget(params.name);
@@ -160,12 +169,27 @@ Use \`shell\` for normal one-shot commands. Use \`terminal_create\` when a progr
           if (result.exitCode !== 0) {
             return terminalFailure(params.name, result.stderr);
           }
-          const output = boundText(result.stdout);
+          const panes = await context.deps.runtime.exec(
+            `tmux list-panes -t ${shellQuote(target)} -F '#{pane_dead} #{pane_dead_status}'`,
+            { cwd: context.deps.cwd },
+          );
+          const [deadFlag = "0", deadStatus = ""] = panes.stdout.trim().split(
+            " ",
+          );
+          const alive = deadFlag !== "1";
+          const exitCode = !alive && /^\d+$/.test(deadStatus)
+            ? Number(deadStatus)
+            : undefined;
+          const retained = result.stdout.length > 65_536
+            ? result.stdout.slice(-65_536)
+            : result.stdout;
           return observedToolResult({
             name: params.name,
             found: true,
-            output: output.text,
-            truncated: output.truncated,
+            alive,
+            ...(exitCode === undefined ? {} : { exitCode }),
+            output: retained,
+            truncated: retained.length !== result.stdout.length,
           });
         },
       }),
@@ -280,7 +304,13 @@ async function hasTerminal(
 }
 
 function terminalNotFound(name: string) {
-  return observedToolResult({ name, found: false, status: "not_found" });
+  return observedToolResult({
+    name,
+    found: false,
+    status: "not_found",
+    message:
+      `No terminal named "${name}". Use terminal_list to see this computer's terminals, or terminal_create to start it.`,
+  });
 }
 
 function terminalFailure(name: string, stderr: string) {
@@ -302,10 +332,4 @@ function terminalName(target: string): string | undefined {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function boundText(value: string, limit = 65_536) {
-  return value.length > limit
-    ? { text: value.slice(0, limit), truncated: true }
-    : { text: value, truncated: false };
 }
