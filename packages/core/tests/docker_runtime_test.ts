@@ -927,6 +927,22 @@ Deno.test({
           invoke(alpha, "apply_patch", {
             cwd: "/root",
             patch: [
+              "--- \\etc\\hosts",
+              "+++ \\etc\\hosts",
+              "@@ -1 +1 @@",
+              "-x",
+              "+y",
+            ].join("\n"),
+          }),
+        Error,
+        "is absolute",
+      );
+
+      await assertRejects(
+        () =>
+          invoke(alpha, "apply_patch", {
+            cwd: "/root",
+            patch: [
               "--- /etc/hosts",
               "+++ /etc/hosts",
               "@@ -1 +1 @@",

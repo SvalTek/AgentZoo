@@ -1155,7 +1155,7 @@ function runPatchCommand(
 
 function patchFilePath(name: string, cwd: string): string | null {
   if (name === "/dev/null") return null;
-  const stripped = name.replace(/^[ab]\//, "");
+  const stripped = name.replace(/^[ab]\//, "").replaceAll("\\", "/");
   if (stripped.startsWith("/")) {
     throw actionableToolError([
       `No files were changed: the patch path '${name}' is absolute.`,
