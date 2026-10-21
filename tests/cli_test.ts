@@ -725,16 +725,45 @@ Deno.test("skills activity displays the available skill names and descriptions",
     message: "alpha finished skills_list",
     detail: {
       status: "success",
-      result: JSON.stringify([
-        { name: "editing-files", description: "Edit existing files safely." },
-        { name: "interactive-work", description: "Work with live programs." },
-      ]),
+      result: JSON.stringify({
+        skills: [
+          { name: "editing-files", description: "Edit existing files safely." },
+          { name: "interactive-work", description: "Work with live programs." },
+        ],
+        problems: [],
+      }),
     },
   });
   assertEquals(display.details, [
     "result: 2 skills",
     "skill: editing-files — Edit existing files safely.",
     "skill: interactive-work — Work with live programs.",
+  ]);
+});
+
+Deno.test("skills activity reports files that could not be listed", () => {
+  const display = formatActivity({
+    sequence: 1,
+    at: 0,
+    kind: "agent:tool:end",
+    agentId: "alpha",
+    toolName: "skills_list",
+    message: "alpha finished skills_list",
+    detail: {
+      status: "success",
+      result: JSON.stringify({
+        skills: [{ name: "good", description: "Works." }],
+        problems: [{
+          path: "/project/.agentzoo_skills/broken.md",
+          error: "Project skill frontmatter is not valid YAML",
+        }],
+      }),
+    },
+  });
+  assertEquals(display.details, [
+    "result: 1 skill",
+    "skill: good — Works.",
+    "problem: /project/.agentzoo_skills/broken.md — Project skill frontmatter is not valid YAML",
   ]);
 });
 
