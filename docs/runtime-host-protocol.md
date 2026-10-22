@@ -179,10 +179,17 @@ absolute when `path` is absolute.
 ### `fs.write`
 
 The target's parent is opened through the contained open; the final component is
-never followed through a symlink. Content is written to a temporary file in the
-same directory and committed with `link(2)` (create, failing if the target
-exists) or `rename(2)` (overwrite/append), so a failed write never leaves a
-truncated file. Overwrites and appends preserve the existing mode and owner.
+never followed through a symlink.
+
+Create and overwrite stage content in a temporary file in the same directory and
+commit with `link(2)` (create, failing if the target exists) or `rename(2)`, so
+a failure leaves the target unchanged. Append opens the existing file with
+`O_APPEND` and writes in place (see below). Existing mode and owner are
+preserved on overwrite and append.
+
+Payloads larger than one chunk use multipart uploads (`fs.writeStart`,
+`fs.writeChunk`, `fs.writeCommit`, `fs.writeAbort`); chunks stream to disk and
+are never buffered whole. The one-shot `fs.write` remains for small payloads.
 
 ```jsonc
 {
@@ -202,6 +209,24 @@ place with `O_APPEND` to keep the inode for processes that already hold the file
 open; a failure partway through an append can leave a partial suffix (the
 transport also reports an unknown outcome when the request was sent), and it is
 not covered by the all-or-nothing guarantee.
+
+### Multipart uploads
+
+```jsonc
+{"op":"fs.writeStart","agent":"alice","params":{"path":"/root/big.bin","mode":"create","sizeBytes":7340032}}
+// -> {"upload":"7f...","chunkSize":1048576}
+{"op":"fs.writeChunk","agent":"alice","params":{"upload":"7f..."},"payloadSeq":12}
+// binary frame: up to chunkSize bytes; -> {"received":1048576}
+{"op":"fs.writeCommit","agent":"alice","params":{"upload":"7f..."}}
+{"op":"fs.writeAbort","agent":"alice","params":{"upload":"7f..."}}
+```
+
+Sessions are per connection, hold the contained parent and temp/append handle,
+and stream chunks straight to disk. At most 8 are open per connection; an idle
+session is aborted after 60 seconds; a disconnect aborts all of them. A chunk
+larger than 1 MiB is rejected, and a session's total is capped at 1 GiB (or its
+declared `sizeBytes`, when given). Committing a large upload may take longer
+than a normal request; the client allows 120 seconds for it.
 
 The optional `expectedSizeBytes`/`expectedMtimeMs` pair is a best-effort stale
 snapshot check: the host compares it immediately before the rename. It narrows

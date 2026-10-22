@@ -87,7 +87,11 @@ async function searchTextFile(
     throw error;
   }
   try {
-    if (target.info.size > MAX_TEXT_FILE_BYTES) return;
+    if (target.info.size > MAX_TEXT_FILE_BYTES) {
+      // The file was not searched; never report complete coverage.
+      state.truncated = true;
+      return;
+    }
     const file = target.file;
     if (!file) return;
     const bytes = new Uint8Array(target.info.size);
@@ -159,7 +163,10 @@ async function walk(
           return;
         }
       }
-      if (depth >= MAX_DEPTH) continue;
+      if (depth >= MAX_DEPTH) {
+        state.truncated = true;
+        continue;
+      }
       let child;
       try {
         child = await openTarget(options.root, agentPath, {

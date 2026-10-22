@@ -485,6 +485,40 @@ Deno.test({
         "prefix $&-bar $1 suffix\n",
       );
 
+      const largeContent = "x".repeat(1_500_000);
+      const largeWrite = await invoke(alpha, "write_file", {
+        path: "/root/large.txt",
+        content: largeContent,
+      });
+      assertEquals(largeWrite.sizeBytes, largeContent.length);
+      assertEquals(
+        (await alpha.exec(["/bin/stat", "-c", "%s", "/root/large.txt"])).stdout
+          .trim(),
+        String(largeContent.length),
+      );
+
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf '\\357\\273\\277hello world\\n' > /root/bom.txt",
+      ]);
+      await invoke(alpha, "edit_file", {
+        path: "/root/bom.txt",
+        oldText: "world",
+        newText: "there",
+      });
+      assertEquals(
+        (await alpha.exec([
+          "/usr/bin/od",
+          "-An",
+          "-tx1",
+          "-N3",
+          "/root/bom.txt",
+        ]))
+          .stdout.replaceAll(/\s+/g, ""),
+        "efbbbf",
+      );
+
       await invoke(alpha, "write_file", {
         path: "/root/mode-file",
         content: "before",

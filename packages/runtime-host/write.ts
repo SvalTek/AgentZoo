@@ -59,7 +59,7 @@ function lockKey(
   return `${root}\u0000${parent}\u0000${name}`;
 }
 
-function splitAgentPath(
+export function splitAgentPath(
   path: string,
 ): { parent: string; name: string } {
   const trimmed = path.replace(/\/+$/, "");
@@ -78,7 +78,7 @@ function splitAgentPath(
  * have swapped for a symlink. readlink() reports the canonical dentry path,
  * not the /proc path we opened, so match by device/inode instead.
  */
-async function descriptorPathFor(
+export async function descriptorPathFor(
   tempPath: string,
   info: Deno.FileInfo,
 ): Promise<string> {
@@ -110,7 +110,7 @@ async function descriptorPathFor(
   return tempPath;
 }
 
-async function writeAll(
+export async function writeAll(
   file: Deno.FsFile,
   bytes: Uint8Array,
 ): Promise<void> {
@@ -120,7 +120,7 @@ async function writeAll(
   }
 }
 
-function changedSince(
+export function changedSince(
   current: Deno.FileInfo | undefined,
   expected: WriteExpectation,
 ): boolean {

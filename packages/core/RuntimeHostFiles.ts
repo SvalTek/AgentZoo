@@ -9,6 +9,8 @@
 import {
   HostError,
   HostErrorCodeSchema,
+  MAX_REQUEST_BYTES,
+  UPLOAD_CHUNK_BYTES,
 } from "@agent-zoo/runtime-host/protocol";
 import type {
   RuntimeFiles,
@@ -113,25 +115,34 @@ export class RuntimeHostFiles implements RuntimeFiles {
         `"${path}" is larger than ${maxBytes} bytes`,
       );
     }
-    const parts: string[] = [];
-    const decoder = new TextDecoder();
-    let startLine = 1;
-    while (true) {
-      const { result, payload } = await this.#request("fs.read", {
+    const bytes = new Uint8Array(stat.sizeBytes);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { payload } = await this.#request("fs.read", {
         path,
-        unit: "lines",
-        startLine,
-        lineLimit: 20_000,
+        unit: "bytes",
+        offset,
+        limit: Math.min(bytes.length - offset, 1_048_576),
+        raw: true,
       });
-      parts.push(decoder.decode(payload));
-      const next = result.nextLine;
-      if (typeof next !== "number") break;
-      if (next <= startLine) {
-        throw new Error("runtime host did not advance the line cursor");
+      if (!payload || payload.length === 0) {
+        throw new RuntimeFilesError(
+          "conflict",
+          `"${path}" changed while it was being read`,
+        );
       }
-      startLine = next;
+      bytes.set(payload, offset);
+      offset += payload.length;
     }
-    return parts.join("");
+    if (bytes.includes(0)) {
+      throw new RuntimeFilesError("binary", `"${path}" is not a text file`);
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+        .decode(bytes);
+    } catch {
+      throw new RuntimeFilesError("invalid_utf8", `"${path}" is not UTF-8`);
+    }
   }
 
   async readLines(
@@ -153,7 +164,7 @@ export class RuntimeHostFiles implements RuntimeFiles {
       lineLimit,
     });
     return {
-      text: new TextDecoder().decode(payload),
+      text: new TextDecoder("utf-8", { ignoreBOM: true }).decode(payload),
       startLine: numberField(result, "startLine"),
       linesReturned: numberField(result, "linesReturned"),
       totalLines: numberField(result, "totalLines"),
@@ -176,27 +187,58 @@ export class RuntimeHostFiles implements RuntimeFiles {
       };
     } = {},
   ): Promise<{ readonly created: boolean; readonly sizeBytes: number }> {
-    const { result } = await this.#request(
-      "fs.write",
-      {
-        path,
-        mode,
-        ...(options.permission === undefined
-          ? {}
-          : { permission: options.permission }),
-        ...(options.expected?.sizeBytes === undefined
-          ? {}
-          : { expectedSizeBytes: options.expected.sizeBytes }),
-        ...(options.expected?.mtimeMs === undefined
-          ? {}
-          : { expectedMtimeMs: options.expected.mtimeMs }),
-      },
-      bytes,
-    );
-    return {
-      created: result.created === true,
-      sizeBytes: numberField(result, "sizeBytes"),
+    const params = {
+      path,
+      mode,
+      ...(options.permission === undefined
+        ? {}
+        : { permission: options.permission }),
+      ...(options.expected?.sizeBytes === undefined
+        ? {}
+        : { expectedSizeBytes: options.expected.sizeBytes }),
+      ...(options.expected?.mtimeMs === undefined
+        ? {}
+        : { expectedMtimeMs: options.expected.mtimeMs }),
     };
+    if (bytes.length <= MAX_REQUEST_BYTES) {
+      const { result } = await this.#request("fs.write", params, bytes);
+      return {
+        created: result.created === true,
+        sizeBytes: numberField(result, "sizeBytes"),
+      };
+    }
+
+    const start = await this.#request("fs.writeStart", {
+      ...params,
+      sizeBytes: bytes.length,
+    });
+    const upload = String(start.result.upload);
+    try {
+      for (
+        let offset = 0;
+        offset < bytes.length;
+        offset += UPLOAD_CHUNK_BYTES
+      ) {
+        await this.#request(
+          "fs.writeChunk",
+          { upload },
+          bytes.subarray(offset, offset + UPLOAD_CHUNK_BYTES),
+        );
+      }
+      const { result } = await this.#request(
+        "fs.writeCommit",
+        { upload },
+        undefined,
+        { timeoutMs: 120_000 },
+      );
+      return {
+        created: result.created === true,
+        sizeBytes: numberField(result, "sizeBytes"),
+      };
+    } catch (error) {
+      await this.#request("fs.writeAbort", { upload }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async search(options: RuntimeSearchOptions): Promise<{
@@ -221,12 +263,19 @@ export class RuntimeHostFiles implements RuntimeFiles {
     op: string,
     params: unknown,
     payload?: Uint8Array,
+    options: { readonly timeoutMs?: number } = {},
   ): Promise<{ result: Record<string, unknown>; payload?: Uint8Array }> {
     const client = await this.#connection();
     try {
       return payload === undefined
-        ? await client.request(op, this.agentId, params)
-        : await client.requestWithPayload(op, this.agentId, params, payload);
+        ? await client.request(op, this.agentId, params, options)
+        : await client.requestWithPayload(
+          op,
+          this.agentId,
+          params,
+          payload,
+          options,
+        );
     } catch (error) {
       if (error instanceof HostError) {
         throw new RuntimeFilesError(error.code, error.message);

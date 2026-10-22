@@ -19,7 +19,7 @@ export interface ReadResult {
   readonly payload: Uint8Array;
 }
 
-const decoder = new TextDecoder("utf-8", { fatal: true });
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
 
 function decodeText(bytes: Uint8Array, label: string): string {
@@ -50,6 +50,7 @@ export async function readBytes(
   label: string,
   requestedOffset: number,
   requestedLimit: number,
+  validate = true,
 ): Promise<ReadResult> {
   const size = info.size;
   if (requestedOffset > size) {
@@ -69,11 +70,13 @@ export async function readBytes(
     read += chunk;
   }
   const bytes = buffer.subarray(0, read);
-  if (bytes.includes(0)) {
-    throw new HostError("binary", `${label} is not a text file`);
+  if (validate) {
+    if (bytes.includes(0)) {
+      throw new HostError("binary", `${label} is not a text file`);
+    }
+    // A byte window is explicit: a split character is reported, not dropped.
+    decodeText(bytes, `${label} at offset ${requestedOffset}`);
   }
-  // A byte window is explicit: a split character is reported, not dropped.
-  decodeText(bytes, `${label} at offset ${requestedOffset}`);
   const truncated = requestedOffset + read < size;
   return {
     result: {

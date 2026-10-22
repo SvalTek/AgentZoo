@@ -270,3 +270,27 @@ Deno.test("fs.search truncates only after finding an extra match", async () => {
     await Deno.remove(base, { recursive: true });
   }
 });
+
+Deno.test("fs.search reports skipped oversized text files as truncated", async () => {
+  const { base, context } = await fixture();
+  const root = `${base}/alpha/merged`;
+  try {
+    await Deno.writeTextFile(
+      `${root}/big.txt`,
+      `needle\n${"x".repeat(8_388_608)}`,
+    );
+    const found = await executeOperation(context, "fs.search", "alpha", {
+      path: "/",
+      kind: "text",
+      text: "needle",
+      maxResults: 50,
+    });
+    const paths = (found.result.results as Array<{ path: string }>).map((
+      result,
+    ) => result.path);
+    assertEquals(paths.includes("/big.txt"), false);
+    assertEquals(found.result.truncated, true);
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});

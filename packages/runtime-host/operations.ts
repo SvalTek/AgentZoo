@@ -69,6 +69,7 @@ const WriteParams = z.object({
 const ReadParams = z.object({
   path: z.string().min(1),
   unit: z.enum(["bytes", "lines"]),
+  raw: z.boolean().optional(),
   offset: z.number().int().nonnegative().optional(),
   limit: z.number().int().positive().optional(),
   startLine: z.number().int().positive().optional(),
@@ -236,6 +237,7 @@ export async function executeOperation(
           input.path,
           input.offset ?? 0,
           input.limit ?? DEFAULT_BYTE_LIMIT,
+          input.raw !== true,
         );
       }
       if (input.offset !== undefined || input.limit !== undefined) {

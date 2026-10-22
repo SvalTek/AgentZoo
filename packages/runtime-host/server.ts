@@ -24,11 +24,12 @@ import {
   UnsubscribeSchema,
 } from "./protocol.ts";
 import { executeOperation, startAgentWatch } from "./operations.ts";
+import { UploadManager } from "./uploads.ts";
 import type { WatchHandle } from "./watch.ts";
 
 const MAX_SUBSCRIPTIONS = 64;
-/** Bytes of request payload one connection may buffer before authentication. */
-const MAX_BUFFERED_PAYLOAD_BYTES = 16 * 1_048_576;
+/** Bytes of request payload one connection may buffer at once. */
+const MAX_BUFFERED_PAYLOAD_BYTES = 4 * 1_048_576;
 
 export interface RuntimeHostServerOptions {
   readonly agentsRoot: string;
@@ -94,6 +95,7 @@ export function createRuntimeHostServer(
     }
     const { socket, response } = Deno.upgradeWebSocket(request);
     const context = { agentsRoot: options.agentsRoot };
+    const uploads = new UploadManager(options.agentsRoot);
     const subscriptions = new Map<string, WatchHandle>();
     let subscriptionCount = 0;
     let bufferedPayloadBytes = 0;
@@ -279,16 +281,19 @@ export function createRuntimeHostServer(
       }
       sequence = (sequence + 1) >>> 0 || 1;
       try {
-        const result = await executeOperation(
-          context,
-          op,
-          agent,
-          params,
-          payload,
-        );
-        const hasPayload = (result.payload?.length ?? 0) > 0;
+        const result = op === "fs.writeStart"
+          ? await uploads.start(agent, params)
+          : op === "fs.writeChunk"
+          ? await uploads.chunk(agent, params, payload)
+          : op === "fs.writeCommit"
+          ? await uploads.commit(agent, params)
+          : op === "fs.writeAbort"
+          ? uploads.abort(agent, params)
+          : await executeOperation(context, op, agent, params, payload);
+        const resultPayload = "payload" in result ? result.payload : undefined;
+        const hasPayload = (resultPayload?.length ?? 0) > 0;
         if (hasPayload) {
-          socket.send(encodeBinaryFrame(sequence, result.payload!));
+          socket.send(encodeBinaryFrame(sequence, resultPayload!));
         }
         send({
           ok: true,
@@ -336,10 +341,12 @@ export function createRuntimeHostServer(
     socket.onclose = () => {
       closeSubscriptions();
       clearPayloads();
+      void uploads.close();
     };
     socket.onerror = () => {
       closeSubscriptions();
       clearPayloads();
+      void uploads.close();
     };
     return response;
   });

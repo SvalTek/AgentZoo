@@ -743,7 +743,8 @@ Use these structured tools for ordinary file and directory work instead of shell
               const result = {
                 path: input.path!,
                 unit: "bytes" as const,
-                content: new TextDecoder().decode(read.bytes),
+                content: new TextDecoder("utf-8", { ignoreBOM: true })
+                  .decode(read.bytes),
                 offset: read.offset,
                 bytesRead: read.bytes.length,
                 sizeBytes: read.sizeBytes,
@@ -819,7 +820,10 @@ Use these structured tools for ordinary file and directory work instead of shell
           }
           let content: string;
           try {
-            content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            content = new TextDecoder("utf-8", {
+              fatal: true,
+              ignoreBOM: true,
+            }).decode(bytes);
           } catch {
             throw actionableToolError([
               "The requested byte range is not valid UTF-8.",
@@ -912,7 +916,7 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof SearchParameters>({
         name: "search_files",
         description:
-          "Search recursively beneath a directory by filename glob, literal file text, or both. Text search also reads symlinked files. Results report paths exactly as the search resolved them beneath path, so an absolute path yields absolute results. Returns bounded path results; text matches include line numbers and snippets. The result reports whether more matches were truncated.",
+          "Search recursively beneath a directory by filename glob, literal file text, or both. Text search also reads symlinked files. Results report paths exactly as the search resolved them beneath path, so an absolute path yields absolute results. Returns bounded path results; text matches include line numbers and snippets. truncated is true when more matches exist or when files/directories were skipped (oversized text files, depth limit).",
         parameters: SearchParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
@@ -1666,9 +1670,11 @@ async function commitPatch(
 }
 
 /**
- * Apply every file through atomic host writes. Applied files are rolled back
- * in reverse order on a protocol failure; a transport failure falls through to
- * the exec commit, which writes the same final contents and is idempotent.
+ * Apply every file through atomic host writes. Any failure, including a
+ * transport failure whose outcome is unknown, restores the whole batch through
+ * the exec rollback: file contents are held in memory, so a partial host commit
+ * is always recoverable. There is deliberately no fallback to the exec commit
+ * after a mutation was attempted.
  */
 async function commitPatchHost(
   deps: AgentRunDeps,
@@ -1676,8 +1682,10 @@ async function commitPatchHost(
   files: readonly StagedPatchFile[],
 ): Promise<{ commit: unknown; staged: readonly StagedPatchFile[] }> {
   const applied: StagedPatchFile[] = [];
+  let current: StagedPatchFile | undefined;
   try {
     for (const file of files) {
+      current = file;
       if (file.after === null) {
         await host.remove(file.path);
       } else {
@@ -1688,12 +1696,13 @@ async function commitPatchHost(
         );
       }
       applied.push(file);
+      current = undefined;
     }
   } catch (error) {
-    if (!(error instanceof RuntimeFilesError)) {
-      return await commitPatchExec(deps, files);
-    }
-    const failed = await rollbackPatchHost(host, applied);
+    // The in-flight file may have been committed even when the response was
+    // lost, so include it in the rollback candidates.
+    const candidates = current === undefined ? applied : [...applied, current];
+    const failed = await rollbackPatch(deps, candidates, new Map());
     if (failed.length > 0) {
       throw actionableToolError([
         "The patch could not be committed, and the previous contents could not be fully restored.",
@@ -1708,33 +1717,6 @@ async function commitPatchHost(
     ], { error });
   }
   return { commit: { host: true }, staged: files };
-}
-
-async function rollbackPatchHost(
-  host: RuntimeFiles,
-  files: readonly StagedPatchFile[],
-): Promise<string[]> {
-  const failed: string[] = [];
-  for (const file of [...files].reverse()) {
-    try {
-      if (file.before === null) {
-        await host.remove(file.path);
-      } else {
-        const permission = file.mode === null
-          ? undefined
-          : Number.parseInt(file.mode, 8);
-        await host.write(
-          file.path,
-          "overwrite",
-          new TextEncoder().encode(file.before),
-          permission === undefined ? undefined : { permission },
-        );
-      }
-    } catch {
-      failed.push(file.path);
-    }
-  }
-  return failed;
 }
 
 async function commitPatchExec(
@@ -1873,7 +1855,10 @@ async function readPatchFile(
   }
   try {
     return {
-      content: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      content: new TextDecoder("utf-8", {
+        fatal: true,
+        ignoreBOM: true,
+      }).decode(bytes),
       mode: modeLine.trim(),
     };
   } catch {
@@ -2023,7 +2008,8 @@ function decodeTextFile(encoded: string, raw: CommandResult): string {
     ], { command: raw });
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(bytes);
   } catch {
     throw actionableToolError([
       "The file is not valid UTF-8 text.",

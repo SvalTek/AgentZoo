@@ -14,8 +14,16 @@ export const DEFAULT_PORT = 8787;
 
 /** Largest payload sent in one response. */
 export const MAX_RESPONSE_BYTES = 1_048_576;
-/** Largest request payload accepted by a write operation. */
-export const MAX_REQUEST_BYTES = 8_388_608;
+/** Largest single request payload; larger writes are chunked. */
+export const MAX_REQUEST_BYTES = 1_048_576;
+/** Chunk size for multipart uploads. */
+export const UPLOAD_CHUNK_BYTES = MAX_REQUEST_BYTES;
+/** Largest total multipart upload. */
+export const MAX_UPLOAD_BYTES = 1_073_741_824;
+/** Concurrent upload sessions allowed per connection. */
+export const MAX_UPLOADS_PER_CONNECTION = 8;
+/** Idle upload sessions are aborted after this long. */
+export const UPLOAD_IDLE_MS = 60_000;
 /** Default and maximum byte window for a byte read. */
 export const DEFAULT_BYTE_LIMIT = 65_536;
 /** Default line window for a line read. */

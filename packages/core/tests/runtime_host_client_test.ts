@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { createRuntimeHostServer } from "@agent-zoo/runtime-host/server";
 import { HostError } from "@agent-zoo/runtime-host/protocol";
 import { RuntimeHostClient } from "../RuntimeHostClient.ts";
+import { RuntimeHostFiles } from "../RuntimeHostFiles.ts";
 
 const token = "test-token";
 
@@ -247,6 +248,60 @@ Deno.test({
         "token rejected",
       );
     } finally {
+      await server.close();
+      await Deno.remove(base, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "runtime host streams multipart writes and aborts cleanly",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { base, root, server } = await fixture();
+    const endpoint = { url: `ws://127.0.0.1:${server.port}`, token };
+    const client = await RuntimeHostClient.connect(endpoint);
+    const files = new RuntimeHostFiles("alpha", () => endpoint);
+    try {
+      const payload = new Uint8Array(3 * 1_048_576 + 7);
+      payload.fill(0x41);
+      payload[payload.length - 1] = 0x5a;
+      const written = await files.write("/root/big.bin", "create", payload);
+      assertEquals(written.sizeBytes, payload.length);
+
+      const actual = await Deno.readFile(`${root}/root/big.bin`);
+      assertEquals(actual.length, payload.length);
+      assertEquals(actual[0], 0x41);
+      assertEquals(actual[actual.length - 1], 0x5a);
+      assertEquals(actual[2 * 1_048_576], 0x41);
+
+      const start = await client.request("fs.writeStart", "alpha", {
+        path: "/root/aborted.bin",
+        mode: "create",
+        sizeBytes: 10,
+      });
+      const upload = String(start.result.upload);
+      await client.requestWithPayload(
+        "fs.writeChunk",
+        "alpha",
+        { upload },
+        new Uint8Array([1, 2, 3]),
+      );
+      await client.request("fs.writeAbort", "alpha", { upload });
+
+      const names: string[] = [];
+      for await (const entry of Deno.readDir(`${root}/root`)) {
+        names.push(entry.name);
+      }
+      assertEquals(names.includes("aborted.bin"), false);
+      assertEquals(
+        names.some((name) => name.startsWith(".agentzoo-write-")),
+        false,
+      );
+    } finally {
+      files.close();
+      client.close();
       await server.close();
       await Deno.remove(base, { recursive: true });
     }
