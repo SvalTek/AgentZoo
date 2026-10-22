@@ -82,6 +82,22 @@ export class RuntimeHostFiles implements RuntimeFiles {
     return { entries, truncated: result.truncated === true };
   }
 
+  async write(
+    path: string,
+    mode: "create" | "overwrite" | "append",
+    bytes: Uint8Array,
+  ): Promise<{ readonly created: boolean; readonly sizeBytes: number }> {
+    const { result } = await this.#request(
+      "fs.write",
+      { path, mode },
+      bytes,
+    );
+    return {
+      created: result.created === true,
+      sizeBytes: numberField(result, "sizeBytes"),
+    };
+  }
+
   async search(options: RuntimeSearchOptions): Promise<{
     readonly results: readonly RuntimeSearchMatch[];
     readonly truncated: boolean;
@@ -103,12 +119,15 @@ export class RuntimeHostFiles implements RuntimeFiles {
   async #request(
     op: string,
     params: unknown,
+    payload?: Uint8Array,
   ): Promise<{ result: Record<string, unknown>; payload?: Uint8Array }> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       const client = await this.#connection();
       try {
-        return await client.request(op, this.agentId, params);
+        return payload === undefined
+          ? await client.request(op, this.agentId, params)
+          : await client.requestWithPayload(op, this.agentId, params, payload);
       } catch (error) {
         if (error instanceof HostError) {
           throw new RuntimeFilesError(error.code, error.message);

@@ -14,6 +14,8 @@ export const DEFAULT_PORT = 8787;
 
 /** Largest payload sent in one response. */
 export const MAX_RESPONSE_BYTES = 1_048_576;
+/** Largest request payload accepted by a write operation. */
+export const MAX_REQUEST_BYTES = 8_388_608;
 /** Default and maximum byte window for a byte read. */
 export const DEFAULT_BYTE_LIMIT = 65_536;
 /** Default line window for a line read. */
@@ -32,6 +34,7 @@ export const HostErrorCodeSchema = z.enum([
   "not_a_file",
   "not_a_directory",
   "permission_denied",
+  "symlink",
   "binary",
   "invalid_utf8",
   "too_large",
@@ -62,6 +65,8 @@ export const RequestSchema = z.object({
   op: z.string().min(1),
   agent: z.string().optional(),
   params: z.unknown().optional(),
+  /** Sequence of the binary frame carrying this request's payload. */
+  payloadSeq: z.number().int().nonnegative().optional(),
 });
 
 export const SubscribeSchema = z.object({

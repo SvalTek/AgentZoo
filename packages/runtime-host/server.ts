@@ -8,12 +8,14 @@
  */
 
 import {
+  decodeBinaryFrame,
   DEFAULT_PORT,
   encodeBinaryFrame,
   HelloSchema,
   HELPER_VERSION,
   HostError,
   type HostErrorCode,
+  MAX_REQUEST_BYTES,
   PROTOCOL_VERSION,
   RequestSchema,
   type ServerMessage,
@@ -91,6 +93,10 @@ export function createRuntimeHostServer(
     const { socket, response } = Deno.upgradeWebSocket(request);
     const context = { agentsRoot: options.agentsRoot };
     const subscriptions = new Map<string, WatchHandle>();
+    // Request payloads arrive as binary frames before the JSON request that
+    // names their sequence. Bound the map so an abandoned payload cannot grow
+    // memory without limit.
+    const payloads = new Map<number, Uint8Array>();
     let authorized = false;
 
     const send = (message: ServerMessage) =>
@@ -235,10 +241,20 @@ export function createRuntimeHostServer(
         ));
         return;
       }
-      const { id, op, agent, params } = request.data;
+      const { id, op, agent, params, payloadSeq } = request.data;
+      const payload = payloadSeq === undefined
+        ? undefined
+        : payloads.get(payloadSeq);
+      if (payloadSeq !== undefined) payloads.delete(payloadSeq);
       sequence = (sequence + 1) >>> 0 || 1;
       try {
-        const result = await executeOperation(context, op, agent, params);
+        const result = await executeOperation(
+          context,
+          op,
+          agent,
+          params,
+          payload,
+        );
         const hasPayload = (result.payload?.length ?? 0) > 0;
         if (hasPayload) {
           socket.send(encodeBinaryFrame(sequence, result.payload!));
@@ -256,12 +272,31 @@ export function createRuntimeHostServer(
 
     socket.onmessage = (event) => {
       if (typeof event.data !== "string") {
-        socket.close(1003, "text frames only");
+        if (!(event.data instanceof ArrayBuffer)) return;
+        let frame;
+        try {
+          frame = decodeBinaryFrame(new Uint8Array(event.data));
+        } catch {
+          socket.close(1003, "invalid binary frame");
+          return;
+        }
+        if (frame.payload.length > MAX_REQUEST_BYTES) {
+          socket.close(1009, "payload too large");
+          return;
+        }
+        if (payloads.size >= 64) {
+          const oldest = payloads.keys().next().value;
+          if (oldest !== undefined) payloads.delete(oldest);
+        }
+        payloads.set(frame.sequence, frame.payload);
         return;
       }
       void handleRequest(event.data);
     };
-    socket.onclose = closeSubscriptions;
+    socket.onclose = () => {
+      closeSubscriptions();
+      payloads.clear();
+    };
     socket.onerror = closeSubscriptions;
     return response;
   });

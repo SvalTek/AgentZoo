@@ -361,6 +361,47 @@ Use these structured tools for ordinary file and directory work instead of shell
           validateWriteArguments(input);
           const mode = input.mode ?? "create";
           const content = input.content!;
+          const files = context.deps.runtime.files;
+          const target = resolveRuntimeDirectory(
+            context.deps.cwd,
+            input.path!,
+          );
+          if (files && useHostFiles(target)) {
+            const bytes = new TextEncoder().encode(content);
+            try {
+              const written = await files.write(target, mode, bytes);
+              const result = {
+                path: input.path!,
+                bytesWritten: bytes.length,
+                sizeBytes: written.sizeBytes,
+                mode,
+                message: mode === "overwrite"
+                  ? "Complete file replacement finished. Read or test this file before another write."
+                  : "Write finished.",
+              };
+              return observedToolResult(result, { host: "fs.write", result });
+            } catch (error) {
+              throwHostFailure(error, {
+                not_found: writeFailures[43],
+                not_a_file: writeFailures[41],
+                symlink: [
+                  "No bytes were written: the path is a symbolic link.",
+                  "Replace the link itself with shell, or write to the file it points to.",
+                ],
+                conflict: writeFailures[54],
+                too_large: [
+                  "No bytes were written: the content is too large for one write.",
+                  "Write the file in sections with shell or reduce its size.",
+                ],
+                permission_denied: writeFailures[55],
+                path_escape: [
+                  "The path resolves outside the agent environment.",
+                  "Use a path inside the environment.",
+                ],
+              });
+              // Transport failure: fall back to the exec path below.
+            }
+          }
           const raw = await execute(
             context.deps,
             [
@@ -434,11 +475,11 @@ Use these structured tools for ordinary file and directory work instead of shell
           const offset = input.offset ?? 0;
           const limit = input.limit ?? 65_536;
           const files = context.deps.runtime.files;
-          if (files) {
-            const target = resolveRuntimeDirectory(
-              context.deps.cwd,
-              input.path!,
-            );
+          const target = resolveRuntimeDirectory(
+            context.deps.cwd,
+            input.path!,
+          );
+          if (files && useHostFiles(target)) {
             try {
               const read = await files.readBytes(target, offset, limit);
               const result = {
@@ -570,8 +611,8 @@ Use these structured tools for ordinary file and directory work instead of shell
         execute: async (context, input) => {
           const path = input.path ?? ".";
           const files = context.deps.runtime.files;
-          if (files) {
-            const target = resolveRuntimeDirectory(context.deps.cwd, path);
+          const target = resolveRuntimeDirectory(context.deps.cwd, path);
+          if (files && useHostFiles(target)) {
             try {
               const listing = await files.list(target, 500);
               const entries = listing.entries.map((entry) => ({
@@ -638,8 +679,8 @@ Use these structured tools for ordinary file and directory work instead of shell
           const path = input.path ?? ".";
           const maxResults = input.maxResults ?? 50;
           const files = context.deps.runtime.files;
-          if (files) {
-            const target = resolveRuntimeDirectory(context.deps.cwd, path);
+          const target = resolveRuntimeDirectory(context.deps.cwd, path);
+          if (files && useHostFiles(target)) {
             const name = input.name ?? (input.text ? undefined : "*");
             try {
               const search = await files.search({
@@ -726,6 +767,18 @@ Use these structured tools for ordinary file and directory work instead of shell
       }),
     ];
   }
+}
+
+/**
+ * Mounts that exist only inside an agent's namespace. The runtime host sees the
+ * merged root, not those mounts, so those paths keep using exec.
+ */
+const AGENT_NAMESPACE_MOUNTS = ["/proc", "/sys", "/dev"];
+
+function useHostFiles(path: string): boolean {
+  return !AGENT_NAMESPACE_MOUNTS.some((mount) =>
+    path === mount || path.startsWith(`${mount}/`)
+  );
 }
 
 /**

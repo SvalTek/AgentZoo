@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "exports": {
     ".": "./mod.ts",
-    "./protocol": "./protocol.ts"
+    "./protocol": "./protocol.ts",
+    "./server": "./server.ts"
   }
 }

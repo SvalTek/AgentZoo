@@ -20,6 +20,7 @@ import { listDirectory } from "./list.ts";
 import { readBytes, readLines } from "./read.ts";
 import { searchFiles } from "./search.ts";
 import { startWatch, type WatchHandle } from "./watch.ts";
+import { writeAgentFile, type WriteMode } from "./write.ts";
 
 export interface OperationContext {
   readonly agentsRoot: string;
@@ -51,6 +52,11 @@ const SearchParams = z.object({
   name: z.string().min(1).optional(),
   text: z.string().min(1).optional(),
   maxResults: z.number().int().positive().max(200).optional(),
+});
+
+const WriteParams = z.object({
+  path: z.string().min(1),
+  mode: z.enum(["create", "overwrite", "append"]),
 });
 
 const ReadParams = z.object({
@@ -137,6 +143,7 @@ export async function executeOperation(
   op: string,
   agent: string | undefined,
   params: unknown,
+  payload?: Uint8Array,
 ): Promise<OperationResult> {
   if (op === "ping") {
     return {
@@ -165,6 +172,17 @@ export async function executeOperation(
     } finally {
       target.close();
     }
+  }
+
+  if (op === "fs.write") {
+    const input = parseParams(WriteParams, params);
+    const root = await existingAgentRoot(context, agent);
+    return await writeAgentFile(
+      root,
+      input.path,
+      input.mode as WriteMode,
+      payload ?? new Uint8Array(),
+    );
   }
 
   if (op === "fs.read") {

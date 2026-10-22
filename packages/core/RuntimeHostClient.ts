@@ -9,8 +9,10 @@
 
 import {
   decodeBinaryFrame,
+  encodeBinaryFrame,
   HostError,
   HostErrorCodeSchema,
+  MAX_REQUEST_BYTES,
   PROTOCOL_VERSION,
 } from "@agent-zoo/runtime-host/protocol";
 
@@ -53,6 +55,7 @@ export class RuntimeHostClient {
   >();
   readonly #pendingSubscriptions = new Map<string, PendingRequest>();
   #sequence = 0;
+  #payloadSequence = 0;
   #closed = false;
 
   private constructor(socket: WebSocket) {
@@ -122,6 +125,38 @@ export class RuntimeHostClient {
     params?: unknown,
     options: RuntimeHostRequestOptions = {},
   ): Promise<RuntimeHostResult> {
+    return await this.#sendRequest(op, agent, params, options);
+  }
+
+  /**
+   * Send a request whose payload travels as a binary frame. The frame is sent
+   * first so the server can attach it to the JSON request that names its
+   * sequence.
+   */
+  async requestWithPayload(
+    op: string,
+    agent: string | undefined,
+    params: unknown,
+    payload: Uint8Array,
+    options: RuntimeHostRequestOptions = {},
+  ): Promise<RuntimeHostResult> {
+    if (this.#closed) throw new Error("runtime host client is closed");
+    if (payload.length > MAX_REQUEST_BYTES) {
+      throw new Error("runtime host payload is too large");
+    }
+    const payloadSeq = (this.#payloadSequence + 1) >>> 0 || 1;
+    this.#payloadSequence = payloadSeq;
+    this.#socket.send(encodeBinaryFrame(payloadSeq, payload));
+    return await this.#sendRequest(op, agent, params, options, payloadSeq);
+  }
+
+  async #sendRequest(
+    op: string,
+    agent: string | undefined,
+    params: unknown,
+    options: RuntimeHostRequestOptions,
+    payloadSeq?: number,
+  ): Promise<RuntimeHostResult> {
     if (this.#closed) throw new Error("runtime host client is closed");
     const id = `${++this.#sequence}`;
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -139,6 +174,7 @@ export class RuntimeHostClient {
         op,
         ...(agent === undefined ? {} : { agent }),
         ...(params === undefined ? {} : { params }),
+        ...(payloadSeq === undefined ? {} : { payloadSeq }),
       }));
     } catch (error) {
       this.#pending.delete(id);

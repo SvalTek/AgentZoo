@@ -225,3 +225,89 @@ Deno.test({
     }
   },
 });
+
+Deno.test("fs.write creates, appends, and replaces a file atomically", async () => {
+  const { base, context } = await fixture({});
+  const root = `${base}/alpha/merged`;
+  const encode = (value: string) => new TextEncoder().encode(value);
+  try {
+    const created = await executeOperation(
+      context,
+      "fs.write",
+      "alpha",
+      { path: "/notes.txt", mode: "create" },
+      encode("one"),
+    );
+    assertEquals(created.result, {
+      path: "/notes.txt",
+      mode: "create",
+      created: true,
+      sizeBytes: 3,
+    });
+
+    const appended = await executeOperation(
+      context,
+      "fs.write",
+      "alpha",
+      { path: "/notes.txt", mode: "append" },
+      encode("-two"),
+    );
+    assertEquals(appended.result.created, false);
+    assertEquals(await Deno.readTextFile(`${root}/notes.txt`), "one-two");
+
+    await Deno.chmod(`${root}/notes.txt`, 0o640);
+    const replaced = await executeOperation(
+      context,
+      "fs.write",
+      "alpha",
+      { path: "/notes.txt", mode: "overwrite" },
+      encode("three"),
+    );
+    assertEquals(replaced.result.sizeBytes, 5);
+    assertEquals(await Deno.readTextFile(`${root}/notes.txt`), "three");
+    if (Deno.build.os === "linux") {
+      assertEquals((await Deno.stat(`${root}/notes.txt`)).mode! & 0o777, 0o640);
+    }
+
+    await assertRejects(
+      () =>
+        executeOperation(
+          context,
+          "fs.write",
+          "alpha",
+          { path: "/notes.txt", mode: "create" },
+          encode("again"),
+        ),
+      HostError,
+      "already exists",
+    );
+
+    await Deno.symlink("/notes.txt", `${root}/link.txt`, { type: "file" });
+    await assertRejects(
+      () =>
+        executeOperation(
+          context,
+          "fs.write",
+          "alpha",
+          { path: "/link.txt", mode: "overwrite" },
+          encode("through"),
+        ),
+      HostError,
+      "symbolic link",
+    );
+
+    await assertRejects(
+      () =>
+        executeOperation(
+          context,
+          "fs.write",
+          "alpha",
+          { path: "/missing/notes.txt", mode: "create" },
+          encode("x"),
+        ),
+      HostError,
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});

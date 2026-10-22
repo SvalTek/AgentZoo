@@ -222,6 +222,11 @@ export interface RuntimeFiles {
     readonly results: readonly RuntimeSearchMatch[];
     readonly truncated: boolean;
   }>;
+  write(
+    path: string,
+    mode: "create" | "overwrite" | "append",
+    bytes: Uint8Array,
+  ): Promise<{ readonly created: boolean; readonly sizeBytes: number }>;
   /** Release the transport; the next call may reconnect. */
   close?(): void;
 }

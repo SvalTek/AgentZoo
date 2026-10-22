@@ -6,10 +6,11 @@ description: Proposed design for the resident runtime-host service that tools ca
 # Runtime host protocol (proposed)
 
 Status: phase 1 is implemented and wired into the runtime image: handshake,
-ping, stat, read, list, search, and `fs.watch` subscriptions. `read_file`,
-`list_directory`, and `search_files` use the host when the backend provides it
-(`RuntimeEnv.files`) and keep the `exec` path as the fallback. Everything else
-still runs through `exec`.
+ping, stat, read, list, search, `fs.write`, and `fs.watch` subscriptions.
+`read_file`, `list_directory`, `search_files`, and `write_file` use the host
+when the backend provides it (`RuntimeEnv.files`) and keep the `exec` path as
+the fallback. `edit_file`, `apply_patch`, shell, and terminals still run through
+`exec`.
 
 The runtime container currently carries most tool logic as shell strings passed
 to `bash -c`. Quoting, exit-code tables, `PIPESTATUS`, `sed`/`awk` behaviour,
@@ -73,8 +74,10 @@ flowchart LR
 
 - WebSocket over the published loopback port.
 - Text frames carry JSON control messages.
-- Binary frames carry payloads: `[uint32 request sequence, big-endian][bytes]`,
-  so concurrent responses are correlated without base64.
+- Binary frames carry payloads: `[uint32 sequence, big-endian][bytes]`.
+  Responses use the server's sequence in `seq`; requests name theirs with
+  `payloadSeq` and send the binary frame first, so concurrent transfers are
+  correlated without base64.
 - One connection per active agent environment, multiplexed by request id. (A
   per-container connection is possible later.)
 
@@ -169,7 +172,29 @@ skipped. Directory links are skipped as well, so the walk cannot cycle. Results
 are bounded and report `truncated`. Paths in results are relative to `path`, or
 absolute when `path` is absolute.
 
-## Write operations (phase 2)
+### `fs.write`
+
+The target's parent is opened through the contained open; the final component is
+never followed through a symlink. Content is written to a temporary file in the
+same directory and committed with `link(2)` (create, failing if the target
+exists) or `rename(2)` (overwrite/append), so a failed write never leaves a
+truncated file. Overwrites and appends preserve the existing mode and owner.
+
+```jsonc
+{
+  "agent": "alice",
+  "op": "fs.write",
+  "params": { "path": "/root/x.py", "mode": "create" }
+}
+// binary payload: file bytes
+// -> {"path":"/root/x.py","mode":"create","created":true,"sizeBytes":4210}
+```
+
+`mode` is `create`, `overwrite`, or `append`. A symlink target, a non-regular
+file, a missing parent, and an existing create target are refused with
+`symlink`, `not_a_file`, `not_found`, and `conflict` respectively.
+
+## Write transactions (planned)
 
 The transaction stays in AgentZoo; the service provides exact primitives.
 
@@ -294,6 +319,7 @@ must be explicit.
    `list_directory`, and `search_files` via `RuntimeEnv.files`; the shell
    scripts remain the fallback.
 4. Add write ops and move `edit_file`/`write_file`; keep `apply_patch` in TS.
+   `write_file` is migrated; `edit_file` and the patch transaction are next.
 5. Decide command execution and PTYs separately; they need namespace entry, not
    just file IO.
 
