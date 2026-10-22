@@ -6,7 +6,7 @@ import { TextTemplate } from "@agent-zoo/shared";
 import { z } from "zod";
 import type { AgentRunDeps } from "../Agent.ts";
 import type { Feature } from "../Feature.ts";
-import type { CommandResult } from "../types.ts";
+import type { CommandResult, RuntimeFiles } from "../types.ts";
 import {
   actionableToolError,
   observedToolResult,
@@ -1262,6 +1262,85 @@ async function commitPatch(
   staged: ReadonlyMap<string, StagedPatchFile>,
 ): Promise<{ commit: unknown; staged: readonly StagedPatchFile[] }> {
   const files = [...staged.values()];
+  const host = deps.runtime.files;
+  if (host && files.every((file) => useHostFiles(file.path))) {
+    return await commitPatchHost(deps, host, files);
+  }
+  return await commitPatchExec(deps, files);
+}
+
+/**
+ * Apply every file through atomic host writes. Applied files are rolled back
+ * in reverse order on a protocol failure; a transport failure falls through to
+ * the exec commit, which writes the same final contents and is idempotent.
+ */
+async function commitPatchHost(
+  deps: AgentRunDeps,
+  host: RuntimeFiles,
+  files: readonly StagedPatchFile[],
+): Promise<{ commit: unknown; staged: readonly StagedPatchFile[] }> {
+  const applied: StagedPatchFile[] = [];
+  try {
+    for (const file of files) {
+      if (file.after === null) {
+        await host.remove(file.path);
+      } else {
+        await host.write(
+          file.path,
+          file.before === null ? "create" : "overwrite",
+          new TextEncoder().encode(file.after),
+        );
+      }
+      applied.push(file);
+    }
+  } catch (error) {
+    if (!(error instanceof RuntimeFilesError)) {
+      return await commitPatchExec(deps, files);
+    }
+    const failed = await rollbackPatchHost(host, applied);
+    if (failed.length > 0) {
+      throw actionableToolError([
+        "The patch could not be committed, and the previous contents could not be fully restored.",
+        `Files that may be inconsistent: ${failed.join(", ")}.`,
+        "Read those files and repair them before continuing.",
+      ], { error, failed });
+    }
+    throw actionableToolError([
+      "No files were changed: the patched files could not be written.",
+      "The previous contents were restored.",
+      "Check available space and permissions in the target directories.",
+    ], { error });
+  }
+  return { commit: { host: true }, staged: files };
+}
+
+async function rollbackPatchHost(
+  host: RuntimeFiles,
+  files: readonly StagedPatchFile[],
+): Promise<string[]> {
+  const failed: string[] = [];
+  for (const file of [...files].reverse()) {
+    try {
+      if (file.before === null) {
+        await host.remove(file.path);
+      } else {
+        await host.write(
+          file.path,
+          "overwrite",
+          new TextEncoder().encode(file.before),
+        );
+      }
+    } catch {
+      failed.push(file.path);
+    }
+  }
+  return failed;
+}
+
+async function commitPatchExec(
+  deps: AgentRunDeps,
+  files: readonly StagedPatchFile[],
+): Promise<{ commit: unknown; staged: readonly StagedPatchFile[] }> {
   const temps = new Map<string, string>();
   try {
     for (const file of files) {

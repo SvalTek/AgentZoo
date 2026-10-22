@@ -96,6 +96,11 @@ export class RuntimeHostFiles implements RuntimeFiles {
     };
   }
 
+  async remove(path: string): Promise<{ readonly removed: boolean }> {
+    const { result } = await this.#request("fs.remove", { path });
+    return { removed: result.removed === true };
+  }
+
   async readText(path: string, maxBytes: number): Promise<string> {
     const stat = await this.stat(path);
     if (stat.type !== "file") {

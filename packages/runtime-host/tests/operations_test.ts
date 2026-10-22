@@ -311,3 +311,41 @@ Deno.test("fs.write creates, appends, and replaces a file atomically", async () 
     await Deno.remove(base, { recursive: true });
   }
 });
+
+Deno.test("fs.remove unlinks files and links without following them", async () => {
+  const { base, context } = await fixture({ "gone.txt": "x", "keep.txt": "y" });
+  const root = `${base}/alpha/merged`;
+  try {
+    const removed = await executeOperation(context, "fs.remove", "alpha", {
+      path: "/gone.txt",
+    });
+    assertEquals(removed.result, { path: "/gone.txt", removed: true });
+    await assertRejects(
+      () => Deno.lstat(`${root}/gone.txt`),
+      Deno.errors.NotFound,
+    );
+
+    const again = await executeOperation(context, "fs.remove", "alpha", {
+      path: "/gone.txt",
+    });
+    assertEquals(again.result, { path: "/gone.txt", removed: false });
+
+    await Deno.symlink("keep.txt", `${root}/link.txt`, { type: "file" });
+    await executeOperation(context, "fs.remove", "alpha", {
+      path: "/link.txt",
+    });
+    await assertRejects(
+      () => Deno.lstat(`${root}/link.txt`),
+      Deno.errors.NotFound,
+    );
+    assertEquals(await Deno.readTextFile(`${root}/keep.txt`), "y");
+
+    await assertRejects(
+      () => executeOperation(context, "fs.remove", "alpha", { path: "/" }),
+      HostError,
+      "not a file path",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});

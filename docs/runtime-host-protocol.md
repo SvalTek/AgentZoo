@@ -194,6 +194,17 @@ truncated file. Overwrites and appends preserve the existing mode and owner.
 file, a missing parent, and an existing create target are refused with
 `symlink`, `not_a_file`, `not_found`, and `conflict` respectively.
 
+### `fs.remove`
+
+```jsonc
+{ "agent": "alice", "params": { "path": "/root/old.py" } }
+// -> {"path":"/root/old.py","removed":true}
+```
+
+Unlinks the entry through the contained parent directory, so a symlink is
+removed rather than its referent. A missing path reports `removed: false`
+(idempotent); directories are refused with `not_a_file`.
+
 ## Write transactions (planned)
 
 The transaction stays in AgentZoo; the service provides exact primitives.
@@ -319,7 +330,7 @@ must be explicit.
    `list_directory`, and `search_files` via `RuntimeEnv.files`; the shell
    scripts remain the fallback.
 4. Add write ops and move `edit_file`/`write_file`; keep `apply_patch` in TS.
-   `write_file` is migrated; `edit_file` and the patch transaction are next.
+   `write_file`, `edit_file`, and the `apply_patch` commit path are migrated.
 5. Decide command execution and PTYs separately; they need namespace entry, not
    just file IO.
 

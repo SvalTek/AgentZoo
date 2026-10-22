@@ -183,3 +183,38 @@ export async function writeAgentFile(
     directory.close();
   }
 }
+
+export async function removeAgentFile(
+  root: string,
+  path: string,
+): Promise<{ result: Record<string, unknown> }> {
+  const { parent, name } = splitAgentPath(path);
+  const directory = await openTarget(root, parent, { requireDirectory: true });
+  try {
+    const targetPath = `${directory.listingPath}/${name}`;
+    let info: Deno.FileInfo | undefined;
+    try {
+      info = await Deno.lstat(targetPath);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        return { result: { path, removed: false } };
+      }
+      if (error instanceof Deno.errors.PermissionDenied) {
+        throw new HostError("permission_denied", `"${path}" is not removable`);
+      }
+      throw error;
+    }
+    if (info.isDirectory) {
+      throw new HostError(
+        "not_a_file",
+        `"${path}" is a directory; recursive removal is not supported`,
+      );
+    }
+    // Removing through the parent fd unlinks the entry itself, so a symlink is
+    // removed rather than its referent.
+    await Deno.remove(targetPath);
+    return { result: { path, removed: true } };
+  } finally {
+    directory.close();
+  }
+}

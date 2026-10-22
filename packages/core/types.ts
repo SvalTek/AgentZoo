@@ -236,6 +236,7 @@ export interface RuntimeFiles {
     bytes: Uint8Array,
   ): Promise<{ readonly created: boolean; readonly sizeBytes: number }>;
   stat(path: string): Promise<RuntimeStat>;
+  remove(path: string): Promise<{ readonly removed: boolean }>;
   /** Read a UTF-8 text file up to `maxBytes`, in bounded protocol pages. */
   readText(path: string, maxBytes: number): Promise<string>;
   /** Release the transport; the next call may reconnect. */
