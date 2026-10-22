@@ -49,10 +49,10 @@ const WriteParameters = z.object({
 });
 const EditParameters = z.object({
   path: PathParameter,
-  oldText: z.string().max(8_192).optional().describe(
+  oldText: z.string().max(65_536).optional().describe(
     "The exact text to replace, including normal line breaks when matching multiple lines. It must occur exactly once unless replaceAll is true.",
   ),
-  newText: z.string().max(8_192).optional().describe(
+  newText: z.string().max(65_536).optional().describe(
     "The replacement text. Provide multiline text directly with normal line breaks. Use an empty string to delete the matched text.",
   ),
   replaceAll: z.boolean().optional().describe(
@@ -1035,14 +1035,36 @@ function describeMissingMatch(content: string, oldText: string): string[] {
       }
     }
     if (bestIndex >= 0 && bestScore >= 2) {
-      hints.push(
-        `Closest current line (line ${bestIndex + 1}): ${
-          JSON.stringify(contentLines[bestIndex].slice(0, 160))
-        }`,
-      );
-      hints.push(
-        `Requested text starts with: ${JSON.stringify(wanted.slice(0, 160))}`,
-      );
+      const requestedLines = oldText.split("\n");
+      const wantedIndex = requestedLines.indexOf(wanted);
+      const firstLine = Math.max(0, bestIndex - Math.max(wantedIndex, 0));
+      let difference = -1;
+      for (let offset = 0; offset < requestedLines.length; offset++) {
+        const fileLine = contentLines[firstLine + offset];
+        if (fileLine === undefined) break;
+        if (fileLine !== requestedLines[offset]) {
+          difference = offset;
+          break;
+        }
+      }
+      if (difference >= 0) {
+        const fileLine = contentLines[firstLine + difference] ?? "";
+        hints.push(
+          `First difference at line ${firstLine + difference + 1}:`,
+        );
+        hints.push(`  file:      ${JSON.stringify(fileLine.slice(0, 160))}`);
+        hints.push(
+          `  requested: ${
+            JSON.stringify(requestedLines[difference].slice(0, 160))
+          }`,
+        );
+      } else {
+        hints.push(
+          `Closest current line (line ${bestIndex + 1}): ${
+            JSON.stringify(contentLines[bestIndex].slice(0, 160))
+          }`,
+        );
+      }
     }
   }
   if (content.includes("\r\n")) hints.push("The file uses CRLF line endings.");
@@ -1253,23 +1275,22 @@ async function execute(
 }
 
 /**
- * Check each hunk's declared line counts against its body before jsdiff runs.
- * jsdiff reports a stray line far from the actual mistake ("Unknown line 19"),
- * which gives the model nothing to repair.
+ * Rewrite each hunk header's line counts from its body.
+ *
+ * Models reliably reproduce the hunk body but miscount the header, and jsdiff
+ * cannot parse that. The count is mechanical, so derive it instead of making
+ * the model recount; unrelated failures (unknown prefixes, context that does
+ * not match) still surface.
  */
-function validatePatchHunks(patch: string): void {
+export function normalizePatchHunks(patch: string): string {
   // A trailing newline terminates the patch; an empty line inside a hunk is a
   // context line for an empty source line.
   const lines = (patch.endsWith("\n") ? patch.slice(0, -1) : patch).split("\n");
-  let hunk = 0;
   for (let index = 0; index < lines.length; index++) {
-    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(
       lines[index],
     );
     if (!header) continue;
-    hunk++;
-    const declaredOld = header[2] === undefined ? 1 : Number(header[2]);
-    const declaredNew = header[4] === undefined ? 1 : Number(header[4]);
     let oldLines = 0;
     let newLines = 0;
     let cursor = index + 1;
@@ -1282,18 +1303,27 @@ function validatePatchHunks(patch: string): void {
       else if (line.startsWith(" ") || line === "") {
         oldLines++;
         newLines++;
-      } else break;
+      } else {
+        throw actionableToolError([
+          `No files were changed: hunk at line ${
+            index + 1
+          } has an invalid line ${cursor + 1} (${
+            JSON.stringify(line.slice(0, 40))
+          }).`,
+          "Every hunk line must start with a space (context), '-' (removal), or '+' (addition).",
+        ], { line: cursor + 1 });
+      }
     }
+    if (oldLines === 0 && newLines === 0) continue;
+    const declaredOld = header[2] === undefined ? 1 : Number(header[2]);
+    const declaredNew = header[4] === undefined ? 1 : Number(header[4]);
     if (oldLines !== declaredOld || newLines !== declaredNew) {
-      throw actionableToolError([
-        `No files were changed: hunk ${hunk} (line ${index + 1}, ${
-          lines[index]
-        }) declares ${declaredOld} old and ${declaredNew} new lines but contains ${oldLines} old and ${newLines} new.`,
-        "Recount the hunk body or split it into smaller hunks.",
-        "Every context line, including an empty one, must start with a space.",
-      ], { hunk });
+      lines[index] = `@@ -${header[1]},${oldLines} +${
+        header[3]
+      },${newLines} @@${header[5]}`;
     }
   }
+  return `${lines.join("\n")}\n`;
 }
 
 const PATCH_FILE_LIMIT = 33_554_432;
@@ -1325,9 +1355,9 @@ async function stagePatch(
   // diff requires one consistent line ending, including the final line, and
   // autoConvertLineEndings adapts the result to each file. Mixed or
   // unterminated patches are normalised to LF before parsing.
-  const normalizedPatch = (patch.endsWith("\n") ? patch : `${patch}\n`)
-    .replaceAll("\r\n", "\n");
-  validatePatchHunks(normalizedPatch);
+  const normalizedPatch = normalizePatchHunks(
+    (patch.endsWith("\n") ? patch : `${patch}\n`).replaceAll("\r\n", "\n"),
+  );
   let files;
   try {
     files = parsePatch(normalizedPatch);

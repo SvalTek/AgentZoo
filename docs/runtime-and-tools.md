@@ -210,25 +210,26 @@ changes, prefer `apply_patch`.
 ### `edit_file`
 
 Replaces the exact `oldText` with `newText`. Both accept normal multiline text.
-When the text is missing, the error reports the closest current line and both
-sides' whitespace; when it is ambiguous, it reports the match count and line
-numbers. an empty `newText` deletes the match. `oldText` and `newText` are each
-limited to 8,192 characters. By default there must be exactly one match. Zero
-matches and ambiguous multiple matches fail. Set `replaceAll: true` to replace
-every exact match. Matching and replacement use the file's own line-ending
-convention, so LF text edits a CRLF file without mixing endings. Files larger
-than 4 MiB and binary files are rejected.
+When the text is missing, the error reports the first differing line within the
+closest candidate region; when it is ambiguous, it reports the match count and
+line numbers. An empty `newText` deletes the match. `oldText` and `newText` are
+each limited to 65,536 characters. By default there must be exactly one match.
+Zero matches and ambiguous multiple matches fail. Set `replaceAll: true` to
+replace every exact match. Matching and replacement use the file's own
+line-ending convention, so LF text edits a CRLF file without mixing endings.
+Files larger than 4 MiB and binary files are rejected.
 
 ### `apply_patch`
 
 Applies the multiline `patch` string as a unified diff. Paths are resolved from
 the optional `cwd`, or the agent's configured working directory when omitted; no
-Git worktree is required. Hunk line counts must be exact, and a hunk may begin
-or end with a changed line, so trailing context is not required. Patch lines are
-matched in the target file's own line endings, so an LF patch edits a CRLF file
-without mixing endings, and file creation and deletion (`--- /dev/null`,
-`+++ /dev/null`) are supported. A creation section refuses a path that already
-exists, including a directory.
+Git worktree is required. Hunk line counts are derived from each hunk body
+before parsing, so approximate counts do not fail the patch; the body's context
+still has to match the file. A hunk may begin or end with a changed line, so
+trailing context is not required. Patch lines are matched in the target file's
+own line endings, so an LF patch edits a CRLF file without mixing endings, and
+file creation and deletion (`--- /dev/null`, `+++ /dev/null`) are supported. A
+creation section refuses a path that already exists, including a directory.
 
 Every affected file is read and patched in memory before anything is written, so
 a parse error, missing file, oversized target (32 MiB), non-text file, or

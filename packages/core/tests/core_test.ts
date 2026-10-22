@@ -42,6 +42,7 @@ import {
   HttpFeature,
   loadConfig,
   ModelRegistry,
+  normalizePatchHunks,
   observedToolResult,
   parseConfig,
   resolveConfigEnvironment,
@@ -495,23 +496,16 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   );
   assert(ambiguousText.message.includes("replaceAll"));
 
-  const patchTool = tools.find((tool) => tool.name === "apply_patch")!;
-  const badHunk = await assertRejects(
-    () =>
-      patchTool.execute!(failingContext(49), {
-        patch: [
-          "--- a/note.txt",
-          "+++ b/note.txt",
-          "@@ -1,1 +1,1 @@",
-          " one",
-          " two",
-        ].join("\n"),
-        cwd: "/root",
-      }),
-    ToolExecutionError,
-    "declares 1 old and 1 new lines but contains 2 old and 2 new",
+  const corrected = normalizePatchHunks(
+    [
+      "--- a/note.txt",
+      "+++ b/note.txt",
+      "@@ -1,1 +1,1 @@",
+      " one",
+      " two",
+    ].join("\n") + "\n",
   );
-  assert(badHunk.message.includes("hunk 1"));
+  assert(corrected.includes("@@ -1,2 +1,2 @@"));
 
   const http = tools.find((tool) => tool.name === "http_request")!;
   const malformedHttp = http.parameters.safeParse({ url: "not a URL" });
