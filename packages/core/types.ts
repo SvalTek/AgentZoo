@@ -198,6 +198,14 @@ export interface RuntimeSearchOptions {
   readonly maxResults?: number;
 }
 
+export interface RuntimeStat {
+  readonly type: "file" | "directory" | "symlink" | "other";
+  readonly sizeBytes: number;
+  readonly mode: number | null;
+  readonly mtimeMs: number | null;
+  readonly symlink: boolean;
+}
+
 /** Byte-exact read-only filesystem operations served by the runtime host. */
 export interface RuntimeFiles {
   readBytes(
@@ -227,6 +235,9 @@ export interface RuntimeFiles {
     mode: "create" | "overwrite" | "append",
     bytes: Uint8Array,
   ): Promise<{ readonly created: boolean; readonly sizeBytes: number }>;
+  stat(path: string): Promise<RuntimeStat>;
+  /** Read a UTF-8 text file up to `maxBytes`, in bounded protocol pages. */
+  readText(path: string, maxBytes: number): Promise<string>;
   /** Release the transport; the next call may reconnect. */
   close?(): void;
 }

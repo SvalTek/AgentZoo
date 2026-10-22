@@ -437,6 +437,75 @@ Use these structured tools for ordinary file and directory work instead of shell
         execute: async (context, input) => {
           const oldText = input.oldText!;
           const newText = input.newText!;
+          const files = context.deps.runtime.files;
+          const target = resolveRuntimeDirectory(
+            context.deps.cwd,
+            input.path!,
+          );
+          if (files && useHostFiles(target)) {
+            try {
+              const stat = await files.stat(target);
+              // Editing through a symlink would replace the referent; keep the
+              // exec path for links so the agent's namespace resolves them.
+              if (!stat.symlink) {
+                let content: string;
+                try {
+                  content = await files.readText(target, 4_194_304);
+                } catch (error) {
+                  throwHostFailure(error, {
+                    not_found: editFailures[40],
+                    not_a_file: editFailures[41],
+                    too_large: editFailures[47],
+                    binary: editFailures[50],
+                    invalid_utf8: editFailures[50],
+                    permission_denied: [
+                      "No files were changed: the file could not be read.",
+                      "Check the file permissions or use shell for files this computer cannot read.",
+                    ],
+                  });
+                  throw error;
+                }
+                const outcome = replaceExact(
+                  content,
+                  oldText,
+                  newText,
+                  input.replaceAll ?? false,
+                );
+                if (outcome.failure !== undefined) {
+                  throw actionableToolError(editFailures[outcome.failure]);
+                }
+                try {
+                  await files.write(
+                    target,
+                    "overwrite",
+                    new TextEncoder().encode(outcome.content),
+                  );
+                } catch (error) {
+                  throwHostFailure(error, {
+                    not_found: editFailures[40],
+                    not_a_file: editFailures[41],
+                    symlink: editFailures[50],
+                    permission_denied: [
+                      "No files were changed: the file could not be written.",
+                      "Check the file permissions or use shell for this path.",
+                    ],
+                  });
+                  throw error;
+                }
+                const result = {
+                  path: input.path!,
+                  replacements: outcome.replacements,
+                  message:
+                    "Exact replacement finished. The oldText from this call is no longer current; read or test before another related edit.",
+                };
+                return observedToolResult(result, { host: "fs.edit", result });
+              }
+            } catch (error) {
+              // Protocol failures were already converted above; anything else
+              // (including a symlinked target) falls through to exec.
+              if (error instanceof ToolExecutionError) throw error;
+            }
+          }
           const encode = (value: string) =>
             btoa(String.fromCharCode(...new TextEncoder().encode(value)));
           const raw = await execute(
@@ -779,6 +848,43 @@ function useHostFiles(path: string): boolean {
   return !AGENT_NAMESPACE_MOUNTS.some((mount) =>
     path === mount || path.startsWith(`${mount}/`)
   );
+}
+
+/**
+ * Exact-text replacement in the file's own line endings. Returns a failure
+ * code used by edit_file's existing feedback when the match is missing or
+ * ambiguous.
+ */
+function replaceExact(
+  content: string,
+  oldText: string,
+  newText: string,
+  replaceAll: boolean,
+): { content: string; replacements: number; failure?: undefined } | {
+  content?: undefined;
+  replacements?: undefined;
+  failure: 44 | 45;
+} {
+  let oldValue = oldText;
+  let newValue = newText;
+  if (content.includes("\r\n")) {
+    oldValue = oldValue.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n");
+    newValue = newValue.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n");
+  }
+  let count = 0;
+  let rest = content;
+  while (rest.includes(oldValue)) {
+    count++;
+    rest = rest.slice(rest.indexOf(oldValue) + oldValue.length);
+  }
+  if (count === 0) return { failure: 44 };
+  if (!replaceAll && count !== 1) return { failure: 45 };
+  return {
+    content: replaceAll
+      ? content.replaceAll(oldValue, newValue)
+      : content.replace(oldValue, newValue),
+    replacements: replaceAll ? count : 1,
+  };
 }
 
 /**

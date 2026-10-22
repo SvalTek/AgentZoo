@@ -15,6 +15,7 @@ import type {
   RuntimeListEntry,
   RuntimeSearchMatch,
   RuntimeSearchOptions,
+  RuntimeStat,
 } from "./types.ts";
 import {
   RuntimeHostClient,
@@ -80,6 +81,51 @@ export class RuntimeHostFiles implements RuntimeFiles {
       ? result.entries as RuntimeListEntry[]
       : [];
     return { entries, truncated: result.truncated === true };
+  }
+
+  async stat(path: string): Promise<RuntimeStat> {
+    const { result } = await this.#request("fs.stat", { path });
+    return {
+      type: typeof result.type === "string"
+        ? result.type as RuntimeStat["type"]
+        : "other",
+      sizeBytes: numberField(result, "sizeBytes"),
+      mode: typeof result.mode === "number" ? result.mode : null,
+      mtimeMs: typeof result.mtimeMs === "number" ? result.mtimeMs : null,
+      symlink: result.symlink === true,
+    };
+  }
+
+  async readText(path: string, maxBytes: number): Promise<string> {
+    const stat = await this.stat(path);
+    if (stat.type !== "file") {
+      throw new RuntimeFilesError("not_a_file", `"${path}" is not a file`);
+    }
+    if (stat.sizeBytes > maxBytes) {
+      throw new RuntimeFilesError(
+        "too_large",
+        `"${path}" is larger than ${maxBytes} bytes`,
+      );
+    }
+    const parts: string[] = [];
+    const decoder = new TextDecoder();
+    let startLine = 1;
+    while (true) {
+      const { result, payload } = await this.#request("fs.read", {
+        path,
+        unit: "lines",
+        startLine,
+        lineLimit: 20_000,
+      });
+      parts.push(decoder.decode(payload));
+      const next = result.nextLine;
+      if (typeof next !== "number") break;
+      if (next <= startLine) {
+        throw new Error("runtime host did not advance the line cursor");
+      }
+      startLine = next;
+    }
+    return parts.join("");
   }
 
   async write(
