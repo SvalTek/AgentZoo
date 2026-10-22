@@ -175,9 +175,62 @@ export interface CommandResult {
   aborted: boolean;
 }
 
+/** One entry from a directory listing. */
+export interface RuntimeListEntry {
+  readonly name: string;
+  readonly type: "file" | "directory" | "symlink" | "other";
+  readonly sizeBytes: number | null;
+}
+
+/** One match from a recursive name or text search. */
+export interface RuntimeSearchMatch {
+  readonly path: string;
+  readonly type?: "file" | "directory" | "symlink" | "other";
+  readonly line?: number;
+  readonly snippet?: string;
+}
+
+export interface RuntimeSearchOptions {
+  readonly path: string;
+  readonly kind: "name" | "text";
+  readonly name?: string;
+  readonly text?: string;
+  readonly maxResults?: number;
+}
+
+/** Byte-exact read-only filesystem operations served by the runtime host. */
+export interface RuntimeFiles {
+  readBytes(
+    path: string,
+    offset: number,
+    limit: number,
+  ): Promise<{
+    readonly bytes: Uint8Array;
+    readonly offset: number;
+    readonly sizeBytes: number;
+    readonly truncated: boolean;
+    readonly nextOffset?: number;
+  }>;
+  list(
+    path: string,
+    limit?: number,
+  ): Promise<{
+    readonly entries: readonly RuntimeListEntry[];
+    readonly truncated: boolean;
+  }>;
+  search(options: RuntimeSearchOptions): Promise<{
+    readonly results: readonly RuntimeSearchMatch[];
+    readonly truncated: boolean;
+  }>;
+  /** Release the transport; the next call may reconnect. */
+  close?(): void;
+}
+
 export interface RuntimeEnv {
   /** Agent this environment belongs to. */
   readonly agentId: string;
+  /** Host-backed read-only filesystem access, when the backend provides it. */
+  readonly files?: RuntimeFiles;
   /** Prepare/check the environment (create chroot, mount shared, etc.). */
   prepare(): Promise<void>;
   /** Execute a command scoped to this agent's environment. */

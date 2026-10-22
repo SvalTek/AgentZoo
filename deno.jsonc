@@ -6,11 +6,12 @@
   },
   "tasks": {
     "dev": "deno run -A main.ts",
-    "check": "deno check main.ts mod.ts",
+    "check": "deno check main.ts mod.ts packages/runtime-host/main.ts",
     "lint": "deno lint",
     "test": "deno test -A",
     "tools:failures": "deno run -A scripts/tool_failures.ts",
-    "docker:build": "docker build --file packages/core/runtime/Containerfile --tag agent-runtime:dev --label agent-zoo.managed=true --label agent-zoo.resource=image packages/core/runtime/"
+    "runtime-host:build": "deno compile -A --bundle --minify --target x86_64-unknown-linux-gnu --output packages/core/runtime/agentzoo-runtime-host packages/runtime-host/main.ts",
+    "docker:build": "deno task runtime-host:build && docker build --file packages/core/runtime/Containerfile --tag agent-runtime:dev --label agent-zoo.managed=true --label agent-zoo.resource=image packages/core/runtime/"
   },
   "compilerOptions": {
     "jsx": "react-jsx",

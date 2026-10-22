@@ -61,3 +61,6 @@ agent-zoo-*.jsonl
 plans/
 *.local.yml
 agent-zoo.yaml
+
+# Compiled runtime-host binary staged for the Docker build
+packages/core/runtime/agentzoo-runtime-host

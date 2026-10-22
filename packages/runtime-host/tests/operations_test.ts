@@ -1,0 +1,227 @@
+import { assertEquals, assertRejects } from "@std/assert";
+import { HostError } from "../protocol.ts";
+import { executeOperation, type OperationContext } from "../operations.ts";
+
+async function fixture(files: Record<string, Uint8Array | string>) {
+  const base = await Deno.makeTempDir({ prefix: "runtime-host-read-" });
+  const root = `${base}/alpha/merged`;
+  await Deno.mkdir(root, { recursive: true });
+  for (const [path, content] of Object.entries(files)) {
+    await Deno.writeFile(
+      `${root}/${path}`,
+      typeof content === "string" ? new TextEncoder().encode(content) : content,
+    );
+  }
+  return { base, context: { agentsRoot: `${base}` } as OperationContext };
+}
+
+Deno.test("fs.read returns a byte window and the next offset", async () => {
+  const { base, context } = await fixture({ "numbers.txt": "0123456789" });
+  try {
+    const read = await executeOperation(context, "fs.read", "alpha", {
+      path: "/numbers.txt",
+      unit: "bytes",
+      offset: 2,
+      limit: 3,
+    });
+    assertEquals(new TextDecoder().decode(read.payload), "234");
+    assertEquals(read.result, {
+      unit: "bytes",
+      offset: 2,
+      bytesRead: 3,
+      sizeBytes: 10,
+      truncated: true,
+      nextByteOffset: 5,
+    });
+
+    const end = await executeOperation(context, "fs.read", "alpha", {
+      path: "/numbers.txt",
+      unit: "bytes",
+      offset: 10,
+      limit: 3,
+    });
+    assertEquals(end.payload?.length, 0);
+    assertEquals(end.result.truncated, false);
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test("fs.read refuses a range beyond the file", async () => {
+  const { base, context } = await fixture({ "short.txt": "abc" });
+  try {
+    await assertRejects(
+      () =>
+        executeOperation(context, "fs.read", "alpha", {
+          path: "/short.txt",
+          unit: "bytes",
+          offset: 4,
+          limit: 1,
+        }),
+      HostError,
+      "is 3 bytes, but offset was 4",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test("fs.read rejects binary and split UTF-8 content", async () => {
+  const { base, context } = await fixture({
+    "binary.bin": new Uint8Array([0x61, 0x00, 0x62]),
+    "euro.txt": new Uint8Array([0xe2, 0x82, 0xac]),
+  });
+  try {
+    await assertRejects(
+      () =>
+        executeOperation(context, "fs.read", "alpha", {
+          path: "/binary.bin",
+          unit: "bytes",
+        }),
+      HostError,
+      "not a text file",
+    );
+    await assertRejects(
+      () =>
+        executeOperation(context, "fs.read", "alpha", {
+          path: "/euro.txt",
+          unit: "bytes",
+          offset: 1,
+          limit: 1,
+        }),
+      HostError,
+      "not valid UTF-8",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test("fs.read returns 1-based line windows with their own endings", async () => {
+  const { base, context } = await fixture({
+    "lines.txt": "one\ntwo\r\nthree",
+  });
+  try {
+    const read = await executeOperation(context, "fs.read", "alpha", {
+      path: "/lines.txt",
+      unit: "lines",
+      startLine: 2,
+      lineLimit: 2,
+    });
+    assertEquals(new TextDecoder().decode(read.payload), "two\r\nthree");
+    assertEquals(read.result, {
+      unit: "lines",
+      startLine: 2,
+      linesReturned: 2,
+      totalLines: 3,
+      truncated: false,
+    });
+
+    const first = await executeOperation(context, "fs.read", "alpha", {
+      path: "/lines.txt",
+      unit: "lines",
+      startLine: 1,
+      lineLimit: 1,
+    });
+    assertEquals(new TextDecoder().decode(first.payload), "one\n");
+    assertEquals(first.result.truncated, true);
+    assertEquals(first.result.nextLine, 2);
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test("fs.read reports a line start beyond the file", async () => {
+  const { base, context } = await fixture({ "lines.txt": "one\ntwo\n" });
+  try {
+    await assertRejects(
+      () =>
+        executeOperation(context, "fs.read", "alpha", {
+          path: "/lines.txt",
+          unit: "lines",
+          startLine: 4,
+        }),
+      HostError,
+      "has 2 lines, but startLine was 4",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test("fs.read rejects mixed units and unknown operations", async () => {
+  const { base, context } = await fixture({ "lines.txt": "one\n" });
+  try {
+    await assertRejects(
+      () =>
+        executeOperation(context, "fs.read", "alpha", {
+          path: "/lines.txt",
+          unit: "bytes",
+          startLine: 1,
+        }),
+      HostError,
+      "byte reads take offset and limit",
+    );
+    await assertRejects(
+      () => executeOperation(context, "nope", "alpha", {}),
+      HostError,
+      'unknown operation "nope"',
+    );
+    await assertRejects(
+      () => executeOperation(context, "fs.stat", "missing", { path: "/x" }),
+      HostError,
+      "has no environment",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test("fs.stat reports type and size", async () => {
+  const { base, context } = await fixture({ "file.txt": "abc" });
+  try {
+    const stat = await executeOperation(context, "fs.stat", "alpha", {
+      path: "/file.txt",
+    });
+    assertEquals(stat.result.type, "file");
+    assertEquals(stat.result.sizeBytes, 3);
+    assertEquals(stat.result.symlink, false);
+
+    const directory = await executeOperation(context, "fs.stat", "alpha", {
+      path: "/",
+    });
+    assertEquals(directory.result.type, "directory");
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
+Deno.test({
+  name: "fs.read refuses a FIFO without blocking",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const { base, context } = await fixture({});
+    try {
+      const fifo = `${base}/alpha/merged/pipe`;
+      const created = await new Deno.Command("mkfifo", {
+        args: [fifo],
+      }).output();
+      if (!created.success) throw new Error("mkfifo failed");
+      const stat = await executeOperation(context, "fs.stat", "alpha", {
+        path: "/pipe",
+      });
+      assertEquals(stat.result.type, "other");
+      await assertRejects(
+        () =>
+          executeOperation(context, "fs.read", "alpha", {
+            path: "/pipe",
+            unit: "bytes",
+          }),
+        HostError,
+        "not a regular file",
+      );
+    } finally {
+      await Deno.remove(base, { recursive: true });
+    }
+  },
+});

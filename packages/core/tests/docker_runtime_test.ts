@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { resolve } from "@std/path";
 import { buildRuntimeImage, DockerRuntimeManager } from "../Runtime.ts";
+import { RuntimeHostClient } from "../RuntimeHostClient.ts";
 import { FilesystemFeature } from "../tools/FilesystemTools.ts";
 import { ShellFeature } from "../tools/ShellTool.ts";
 import { VisionFeature } from "../tools/ViewImageTool.ts";
@@ -304,6 +305,49 @@ Deno.test({
       assertEquals(bounded.content, "iva");
       assertEquals(bounded.truncated, true);
       assertEquals(bounded.nextOffset, 5);
+
+      const hostListing = await invoke(alpha, "list_directory", {
+        path: "/root",
+      });
+      const hostListingNames = (hostListing.entries as Array<{ name: string }>)
+        .map((entry) => entry.name);
+      assert(
+        hostListingNames.includes("private-tool"),
+        JSON.stringify(hostListingNames),
+      );
+
+      const hostNameMatches = await invoke(alpha, "search_files", {
+        path: "/root",
+        name: "private-*",
+      });
+      assert(
+        (hostNameMatches.results as Array<{ path: string }>).some((result) =>
+          result.path.endsWith("/private-tool")
+        ),
+        JSON.stringify(hostNameMatches.results),
+      );
+
+      const hostTextMatches = await invoke(alpha, "search_files", {
+        path: "/root",
+        text: "private-data",
+      });
+      assert(
+        (hostTextMatches.results as Array<{ path: string; line: number }>)
+          .some((result) =>
+            result.path.endsWith("/private-tool") && result.line === 1
+          ),
+        JSON.stringify(hostTextMatches.results),
+      );
+
+      const otherRootEntries = await invoke(beta, "list_directory", {
+        path: "/root",
+      });
+      assert(
+        !(otherRootEntries.entries as Array<{ name: string }>).some((entry) =>
+          entry.name === "private-tool"
+        ),
+        JSON.stringify(otherRootEntries.entries),
+      );
 
       await invoke(alpha, "write_file", {
         path: "/root/written",
@@ -1006,7 +1050,6 @@ Deno.test({
       });
       assertEquals(noop.filesChanged, 0);
 
-
       await alpha.exec([
         "/bin/bash",
         "-c",
@@ -1074,7 +1117,11 @@ Deno.test({
       ).map((result) => result.path);
       // The agent root also holds files created by earlier assertions, so
       // match the discovered paths by suffix rather than exact text.
-      assert(discoveredPaths.some((entry) => entry.endsWith("/tree") || entry === "./tree"));
+      assert(
+        discoveredPaths.some((entry) =>
+          entry.endsWith("/tree") || entry === "./tree"
+        ),
+      );
       assert(
         discoveredPaths.some((entry) =>
           entry.endsWith("/tree/child/deep") || entry === "./tree/child/deep"
@@ -1437,12 +1484,14 @@ Deno.test({
         await promise;
       }
       assert(
-        alphaListing.split("\n").some((entry) =>
-          /^[0-9]+$/.test(entry.trim())
-        ),
+        alphaListing.split("\n").some((entry) => /^[0-9]+$/.test(entry.trim())),
         `alpha should see its own pty: ${JSON.stringify(alphaListing)}`,
       );
-      const betaListing = await beta.exec(["/bin/bash", "-c", "ls -A /dev/pts"]);
+      const betaListing = await beta.exec([
+        "/bin/bash",
+        "-c",
+        "ls -A /dev/pts",
+      ]);
       assertEquals(betaListing.stdout.trim(), "ptmx");
       await holder;
     } finally {
@@ -1545,6 +1594,136 @@ Deno.test({
       assert(output.includes("RC=130"), output);
     } finally {
       await runtime.purge();
+      await Deno.remove(shared, { recursive: true });
+    }
+  },
+});
+
+async function delay(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  await promise;
+}
+
+async function connectRuntimeHost(
+  runtime: DockerRuntimeManager,
+): Promise<RuntimeHostClient> {
+  const deadline = Date.now() + 20_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    const endpoint = runtime.runtimeHostEndpoint();
+    if (endpoint) {
+      try {
+        return await RuntimeHostClient.connect(endpoint, { timeoutMs: 1_000 });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    await delay(200);
+  }
+  throw new Error(
+    `runtime host service did not become reachable: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`,
+  );
+}
+
+Deno.test({
+  name: "Docker runtime exposes the resident runtime host service",
+  ignore: !dockerIntegrationEnabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const shared = await Deno.makeTempDir({
+      prefix: "agent-zoo-runtime-host-test-",
+    });
+    const runtime = new DockerRuntimeManager(
+      shared,
+      "agent-runtime:test",
+      `agent-runtime-host-test-${crypto.randomUUID()}`,
+    );
+    let client: RuntimeHostClient | undefined;
+    try {
+      const alpha = await runtime.createEnv("host-alpha");
+      client = await connectRuntimeHost(runtime);
+
+      const ping = await client.request("ping");
+      assertEquals(ping.result.protocol, 1);
+
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\\ntwo\\n' > /root/host-lines.txt",
+      ]);
+      const lines = await client.request("fs.read", "host-alpha", {
+        path: "/root/host-lines.txt",
+        unit: "lines",
+        startLine: 1,
+        lineLimit: 1,
+      });
+      assertEquals(new TextDecoder().decode(lines.payload), "one\n");
+      assertEquals(lines.result.nextLine, 2);
+
+      const listing = await client.request("fs.list", "host-alpha", {
+        path: "/root",
+      });
+      const names = (listing.result.entries as Array<{ name: string }>).map(
+        (entry) => entry.name,
+      );
+      assert(names.includes("host-lines.txt"), JSON.stringify(names));
+
+      const search = await client.request("fs.search", "host-alpha", {
+        path: "/root",
+        kind: "text",
+        text: "two",
+      });
+      assert(
+        (search.result.results as Array<{ path: string; line: number }>).some(
+          (result) =>
+            result.path === "/root/host-lines.txt" && result.line === 2,
+        ),
+        JSON.stringify(search.result),
+      );
+
+      // The service binary lives outside every agent root.
+      const hidden = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "test ! -e /usr/local/bin/agentzoo-runtime-host",
+      ]);
+      assertEquals(hidden.exitCode, 0, JSON.stringify(hidden));
+
+      const events: string[][] = [];
+      const subscription = await client.subscribe(
+        "host-alpha",
+        { path: "/root", depth: 1, debounceMs: 50 },
+        (event) => {
+          if (Array.isArray(event.paths)) events.push(event.paths as string[]);
+        },
+      );
+      try {
+        await alpha.exec([
+          "/bin/bash",
+          "-c",
+          "printf x > /root/watched.txt",
+        ]);
+        const deadline = Date.now() + 5_000;
+        while (
+          !events.some((paths) => paths.includes("/root/watched.txt")) &&
+          Date.now() < deadline
+        ) {
+          await delay(50);
+        }
+        assert(
+          events.some((paths) => paths.includes("/root/watched.txt")),
+          JSON.stringify(events),
+        );
+      } finally {
+        subscription.close();
+      }
+    } finally {
+      client?.close();
+      await runtime.purge().catch(() => undefined);
       await Deno.remove(shared, { recursive: true });
     }
   },

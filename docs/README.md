@@ -37,6 +37,8 @@ template APIs.
   services, routers, context, and direct runner construction.
 - [Development and testing](development.md) — repository checks and gated
   Docker/Ollama tests.
+- [Runtime host protocol (proposed)](runtime-host-protocol.md) — resident
+  service design for tool IO, watches, and metrics.
 
 Direct imports such as `@agent-zoo/core` are available to workspace consumers
 that deliberately want a narrower package, but ordinary applications should

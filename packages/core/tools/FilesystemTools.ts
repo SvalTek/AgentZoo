@@ -15,6 +15,7 @@ import {
 } from "../ToolSupport.ts";
 import { relative as relativePath } from "@std/path/posix";
 import { resolveRuntimeDirectory } from "./RuntimePaths.ts";
+import { RuntimeFilesError } from "../RuntimeHostFiles.ts";
 
 const PathParameter = z.string().optional().describe(
   "The file path for this operation. Required for execution. Use an absolute path or a path relative to the current working directory.",
@@ -432,6 +433,60 @@ Use these structured tools for ordinary file and directory work instead of shell
         execute: async (context, input) => {
           const offset = input.offset ?? 0;
           const limit = input.limit ?? 65_536;
+          const files = context.deps.runtime.files;
+          if (files) {
+            const target = resolveRuntimeDirectory(
+              context.deps.cwd,
+              input.path!,
+            );
+            try {
+              const read = await files.readBytes(target, offset, limit);
+              const result = {
+                path: input.path!,
+                content: new TextDecoder().decode(read.bytes),
+                offset: read.offset,
+                bytesRead: read.bytes.length,
+                sizeBytes: read.sizeBytes,
+                truncated: read.truncated,
+                ...(read.nextOffset === undefined
+                  ? {}
+                  : { nextOffset: read.nextOffset }),
+              };
+              return observedToolResult(result, { host: "fs.read", result });
+            } catch (error) {
+              throwHostFailure(error, {
+                not_found: readFailures[40],
+                not_a_file: readFailures[41],
+                range: [
+                  "No bytes were read: offset is beyond the end of the file.",
+                  `The offset was ${offset}.`,
+                  "Read from offset 0 or use an offset no greater than the file size.",
+                ],
+                binary: [
+                  "The file is not suitable for text reading.",
+                  "Use shell for binary data or choose a UTF-8 text file.",
+                ],
+                invalid_utf8: [
+                  "The requested byte range is not valid UTF-8.",
+                  "The file may be binary, or offset and limit may split a multibyte character.",
+                  "Read from offset 0 or choose a different byte range before retrying.",
+                ],
+                too_large: [
+                  "The requested byte range is too large for one response.",
+                  "Reduce limit or use shell for the file.",
+                ],
+                permission_denied: [
+                  "The file could not be read: permission denied.",
+                  "Check the file permissions or use shell for files this computer cannot read.",
+                ],
+                path_escape: [
+                  "The path resolves outside the agent environment.",
+                  "Use a path inside the environment.",
+                ],
+              });
+              // Transport failure: fall back to the exec path below.
+            }
+          }
           const command = [
             "/bin/bash",
             "-c",
@@ -510,10 +565,42 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof ListParameters>({
         name: "list_directory",
         description:
-          "List the immediate contents of a directory without recursive traversal. Follows a symlinked directory when path itself is a link. Returns each entry's name, type, and sizeBytes (for a symlink, the length of its target path).",
+          "List the immediate contents of a directory without recursive traversal. Follows a symlinked directory when path itself is a link. Returns each entry's name, type, and sizeBytes (for a symlink, the length of its target path), plus truncated when more than 500 entries exist.",
         parameters: ListParameters,
         execute: async (context, input) => {
           const path = input.path ?? ".";
+          const files = context.deps.runtime.files;
+          if (files) {
+            const target = resolveRuntimeDirectory(context.deps.cwd, path);
+            try {
+              const listing = await files.list(target, 500);
+              const entries = listing.entries.map((entry) => ({
+                name: entry.name,
+                type: entry.type,
+                sizeBytes: entry.sizeBytes ?? 0,
+              }));
+              const result = {
+                path,
+                entries,
+                truncated: listing.truncated,
+              };
+              return observedToolResult(result, { host: "fs.list", result });
+            } catch (error) {
+              throwHostFailure(error, {
+                not_found: directoryFailures[40],
+                not_a_directory: directoryFailures[48],
+                permission_denied: [
+                  "The directory could not be listed: permission denied.",
+                  "Check the directory permissions or use shell for paths this computer cannot read.",
+                ],
+                path_escape: [
+                  "The path resolves outside the agent environment.",
+                  "Use a path inside the environment.",
+                ],
+              });
+              // Transport failure: fall back to the exec path below.
+            }
+          }
           const raw = await execute(
             context.deps,
             [
@@ -550,6 +637,52 @@ Use these structured tools for ordinary file and directory work instead of shell
         execute: async (context, input) => {
           const path = input.path ?? ".";
           const maxResults = input.maxResults ?? 50;
+          const files = context.deps.runtime.files;
+          if (files) {
+            const target = resolveRuntimeDirectory(context.deps.cwd, path);
+            const name = input.name ?? (input.text ? undefined : "*");
+            try {
+              const search = await files.search({
+                path: target,
+                kind: input.text ? "text" : "name",
+                ...(name === undefined ? {} : { name }),
+                ...(input.text === undefined ? {} : { text: input.text }),
+                maxResults,
+              });
+              // The host works in absolute agent paths; keep the model's
+              // relative form so results match the exec transport.
+              const results = path.startsWith("/")
+                ? search.results
+                : search.results.map((match) => ({
+                  ...match,
+                  path: path === "."
+                    ? `./${relativePath(target, match.path)}`
+                    : `${path.replace(/\/+$/, "")}/${
+                      relativePath(target, match.path)
+                    }`,
+                }));
+              const result = {
+                path,
+                results,
+                truncated: search.truncated,
+              };
+              return observedToolResult(result, { host: "fs.search", result });
+            } catch (error) {
+              throwHostFailure(error, {
+                not_found: directoryFailures[40],
+                not_a_directory: directoryFailures[48],
+                permission_denied: [
+                  "The search could not read a path: permission denied.",
+                  "Check the directory permissions or use shell for paths this computer cannot read.",
+                ],
+                path_escape: [
+                  "The path resolves outside the agent environment.",
+                  "Use a path inside the environment.",
+                ],
+              });
+              // Transport failure: fall back to the exec path below.
+            }
+          }
           const raw = input.text
             ? await execute(
               context.deps,
@@ -593,6 +726,23 @@ Use these structured tools for ordinary file and directory work instead of shell
       }),
     ];
   }
+}
+
+/**
+ * Surface a protocol-level host failure. Transport failures return normally so
+ * the caller can continue with the exec path; only the host itself answers the
+ * request (so no fallback would help) for the errors handled here.
+ */
+function throwHostFailure(
+  error: unknown,
+  feedback: Partial<Record<string, ToolFeedback>>,
+): void {
+  if (!(error instanceof RuntimeFilesError)) return;
+  throw actionableToolError(
+    feedback[error.code] ??
+      ["The runtime host could not complete the operation."],
+    { error: { code: error.code } },
+  );
 }
 
 function requirePath(
@@ -722,7 +872,9 @@ async function stagePatch(
   } catch (error) {
     throw actionableToolError([
       "No files were changed: the patch could not be parsed.",
-      `The patch parser reported: ${error instanceof Error ? error.message : String(error)}`,
+      `The patch parser reported: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
       "Check the '@@' hunk header and line counts, and start every hunk line with a space, '-', or '+'.",
     ], { patch });
   }
@@ -740,7 +892,9 @@ async function stagePatch(
     if (oldPath !== null && newPath !== null && oldPath !== newPath) {
       throw actionableToolError([
         "No files were changed: apply_patch does not move or rename files.",
-        `The patch changes ${relativeToDirectory(cwd, oldPath)} to ${relativeToDirectory(cwd, newPath)}.`,
+        `The patch changes ${relativeToDirectory(cwd, oldPath)} to ${
+          relativeToDirectory(cwd, newPath)
+        }.`,
         "Create the new file with write_file and remove the old one, or use shell.",
       ], { patch });
     }
@@ -753,7 +907,9 @@ async function stagePatch(
     }
     if (staged.has(path)) {
       throw actionableToolError([
-        `No files were changed: the patch modifies ${relativeToDirectory(cwd, path)} more than once.`,
+        `No files were changed: the patch modifies ${
+          relativeToDirectory(cwd, path)
+        } more than once.`,
         "Combine the changes for that file into one section.",
       ], { patch });
     }
@@ -764,14 +920,18 @@ async function stagePatch(
       const kind = await pathKind(deps, oldPath);
       if (kind === "symlink") {
         throw actionableToolError([
-          `No files were changed: ${relativeToDirectory(cwd, oldPath)} is a symbolic link.`,
+          `No files were changed: ${
+            relativeToDirectory(cwd, oldPath)
+          } is a symbolic link.`,
           "Patch the file it points to, or replace the link with shell.",
         ], { patch });
       }
       const read = await readPatchFile(deps, oldPath, cwd);
       if (read === null) {
         throw actionableToolError([
-          `No files were changed: ${relativeToDirectory(cwd, oldPath)} does not exist.`,
+          `No files were changed: ${
+            relativeToDirectory(cwd, oldPath)
+          } does not exist.`,
           "Read the affected files and rebuild the patch from their current contents.",
           "Create a new file with write_file, or with a '--- /dev/null' patch section.",
         ], { patch });
@@ -783,7 +943,9 @@ async function stagePatch(
       const kind = await pathKind(deps, path);
       if (kind !== "missing") {
         throw actionableToolError([
-          `No files were changed: ${relativeToDirectory(cwd, path)} already exists.`,
+          `No files were changed: ${
+            relativeToDirectory(cwd, path)
+          } already exists.`,
           kind === "symlink"
             ? "The path is a symbolic link."
             : kind === "directory"
@@ -852,14 +1014,18 @@ async function stagePatch(
           }
           if (occurrences === 0) {
             throw actionableToolError([
-              `No files were changed: the hunk at line ${hunk.oldStart} does not match ${relativeToDirectory(cwd, path)}.`,
+              `No files were changed: the hunk at line ${hunk.oldStart} does not match ${
+                relativeToDirectory(cwd, path)
+              }.`,
               "Read that file and rebuild the hunk from its current contents.",
               "Do not resend the same patch unchanged.",
             ], { patch });
           }
           if (occurrences > 1) {
             throw actionableToolError([
-              `No files were changed: the hunk at line ${hunk.oldStart} matches ${occurrences} places in ${relativeToDirectory(cwd, path)}.`,
+              `No files were changed: the hunk at line ${hunk.oldStart} matches ${occurrences} places in ${
+                relativeToDirectory(cwd, path)
+              }.`,
               "Include more surrounding context so the hunk identifies one location.",
               hunk.lines.some((line) => line.startsWith("-"))
                 ? "Read the file and copy the surrounding lines around the intended change."
@@ -887,7 +1053,9 @@ async function stagePatch(
       }
       if (next === false) {
         throw actionableToolError([
-          `No files were changed: the patch context does not match ${relativeToDirectory(cwd, path)}.`,
+          `No files were changed: the patch context does not match ${
+            relativeToDirectory(cwd, path)
+          }.`,
           "Read that file and rebuild the hunk from its current contents.",
           "Do not resend the same patch unchanged.",
         ], { patch });
@@ -900,7 +1068,9 @@ async function stagePatch(
     if (newPath === null && updated !== "") {
       const remaining = updated.replace(/\n$/, "").split("\n").length;
       throw actionableToolError([
-        `No files were changed: the patch does not delete all of ${relativeToDirectory(cwd, path)}.`,
+        `No files were changed: the patch does not delete all of ${
+          relativeToDirectory(cwd, path)
+        }.`,
         `The patch removes part of the file and would leave ${remaining} line(s).`,
         "Remove every line in the hunk, or patch the file instead of deleting it.",
       ], { patch });
@@ -1057,7 +1227,9 @@ async function readPatchFile(
   const bytes = decodeBase64Bytes(encoded.replaceAll(/\s+/g, ""));
   if (bytes.includes(0)) {
     throw actionableToolError([
-      `No files were changed: ${relativeToDirectory(cwd, path)} is not a text file.`,
+      `No files were changed: ${
+        relativeToDirectory(cwd, path)
+      } is not a text file.`,
       "Use shell for binary data.",
     ], { raw });
   }
@@ -1068,7 +1240,9 @@ async function readPatchFile(
     };
   } catch {
     throw actionableToolError([
-      `No files were changed: ${relativeToDirectory(cwd, path)} is not valid UTF-8 text.`,
+      `No files were changed: ${
+        relativeToDirectory(cwd, path)
+      } is not valid UTF-8 text.`,
       "Use shell for binary data.",
     ], { raw });
   }

@@ -22,6 +22,8 @@ export * from "./Config.ts";
 export * from "./Zoo.ts";
 export * from "./Workspace.ts";
 export * from "./Runtime.ts";
+export * from "./RuntimeHostClient.ts";
+export * from "./RuntimeHostFiles.ts";
 export * from "./Feature.ts";
 export * from "./Agent.ts";
 export * from "./tools/ShellTool.ts";
