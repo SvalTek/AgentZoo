@@ -194,12 +194,24 @@ truncated file. Overwrites and appends preserve the existing mode and owner.
 // -> {"path":"/root/x.py","mode":"create","created":true,"sizeBytes":4210}
 ```
 
-`mode` is `create`, `overwrite`, or `append`. Append writes in place with
-`O_APPEND`, keeping the inode so processes holding the file open continue to
-write to the named file; create and overwrite stage a temporary file and commit
-atomically. A symlink target, a non-regular file, a missing parent, and an
-existing create target are refused with `symlink`, `not_a_file`, `not_found`,
-and `conflict` respectively.
+`mode` is `create`, `overwrite`, or `append`.
+
+Create and overwrite stage a temporary file and commit with `link(2)` or
+`rename(2)`, so a failed write leaves the target unchanged. Append writes in
+place with `O_APPEND` to keep the inode for processes that already hold the file
+open; a failure partway through an append can leave a partial suffix (the
+transport also reports an unknown outcome when the request was sent), and it is
+not covered by the all-or-nothing guarantee.
+
+The optional `expectedSizeBytes`/`expectedMtimeMs` pair is a best-effort stale
+snapshot check: the host compares it immediately before the rename. It narrows
+the read-then-write window but is not a conditional replace, so an external
+writer that changes the file between that check and the rename can still be
+overwritten.
+
+A symlink target, a non-regular file, a missing parent, and an existing create
+target are refused with `symlink`, `not_a_file`, `not_found`, and `conflict`
+respectively.
 
 ### `fs.remove`
 
