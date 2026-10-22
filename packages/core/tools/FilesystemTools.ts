@@ -1156,6 +1156,10 @@ function throwHostFailure(
   feedback: Partial<Record<string, ToolFeedback>>,
 ): void {
   if (!(error instanceof RuntimeFilesError)) return;
+  // The host sees the merged root, not the agent's mount namespace. A path
+  // whose symlink target lands in /proc (for example /etc/mtab) is not_found
+  // there, so let exec resolve it inside the agent instead.
+  if (error.code === "not_found") return;
   throw actionableToolError(
     feedback[error.code] ??
       ["The runtime host could not complete the operation."],
@@ -1292,9 +1296,17 @@ export function normalizePatchHunks(patch: string): string {
       lines[index],
     );
     if (!header) continue;
-    const isFileHeader = (position: number) =>
-      lines[position]?.startsWith("--- ") &&
-      lines[position + 1]?.startsWith("+++ ");
+    const isFileHeader = (position: number): boolean => {
+      if (
+        !lines[position]?.startsWith("--- ") ||
+        !lines[position + 1]?.startsWith("+++ ")
+      ) {
+        return false;
+      }
+      const after = lines[position + 2] ?? "";
+      return after.startsWith("@@ ") || after.startsWith("diff ") ||
+        after.startsWith("Index: ") || isFileHeader(position + 2);
+    };
     let oldLines = 0;
     let newLines = 0;
     let cursor = index + 1;

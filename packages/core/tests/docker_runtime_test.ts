@@ -343,6 +343,18 @@ Deno.test({
       assertEquals(emptyRead.totalLines, 0);
       assertEquals(emptyRead.truncated, false);
 
+      // A lexical path that resolves through a symlink into the agent's /proc
+      // mount is invisible to the host; the tool must fall back to exec.
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "ln -sfn /proc /root/proc-link",
+      ]);
+      const mounts = await invoke(alpha, "read_file", {
+        path: "/root/proc-link/mounts",
+      });
+      assert(String(mounts.content).includes("overlay"));
+
       const hostListing = await invoke(alpha, "list_directory", {
         path: "/root",
       });

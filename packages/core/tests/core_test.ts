@@ -523,6 +523,18 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   ].join("\n"));
   assertEquals(separated.match(/@@ -1,1 \+1,1 @@/g)?.length, 2);
 
+  const headerLikeContent = normalizePatchHunks([
+    "--- a/x.txt",
+    "+++ b/x.txt",
+    "@@ -1,3 +1,3 @@",
+    " context",
+    "--- old",
+    "+++ new",
+    " context2",
+    "",
+  ].join("\n"));
+  assert(headerLikeContent.includes("@@ -1,3 +1,3 @@"));
+
   const removedDashes = normalizePatchHunks([
     "--- a/note.txt",
     "+++ b/note.txt",

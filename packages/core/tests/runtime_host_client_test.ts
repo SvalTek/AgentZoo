@@ -115,6 +115,43 @@ Deno.test({
 });
 
 Deno.test({
+  name: "concurrent appends do not lose bytes",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { base, root, server } = await fixture();
+    const client = await RuntimeHostClient.connect({
+      url: `ws://127.0.0.1:${server.port}`,
+      token,
+    });
+    try {
+      const encoder = new TextEncoder();
+      await Promise.all([
+        client.requestWithPayload(
+          "fs.write",
+          "alpha",
+          { path: "/root/log.txt", mode: "append" },
+          encoder.encode("A"),
+        ),
+        client.requestWithPayload(
+          "fs.write",
+          "alpha",
+          { path: "/root/log.txt", mode: "append" },
+          encoder.encode("B"),
+        ),
+      ]);
+      const content = await Deno.readTextFile(`${root}/root/log.txt`);
+      assertEquals(content.length, 2);
+      assert(content === "AB" || content === "BA");
+    } finally {
+      client.close();
+      await server.close();
+      await Deno.remove(base, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "runtime host reports a failed subscription and missing write payload",
   sanitizeOps: false,
   sanitizeResources: false,

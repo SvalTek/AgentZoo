@@ -17,6 +17,24 @@ export interface WriteResult {
   readonly result: Record<string, unknown>;
 }
 
+/** One tail promise per agent path, so concurrent writes cannot interleave. */
+const pathLocks = new Map<string, Promise<unknown>>();
+
+async function withPathLock<T>(
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = pathLocks.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(operation);
+  const tail = run.catch(() => undefined);
+  pathLocks.set(key, tail);
+  try {
+    return await run;
+  } finally {
+    if (pathLocks.get(key) === tail) pathLocks.delete(key);
+  }
+}
+
 function splitAgentPath(
   path: string,
 ): { parent: string; name: string } {
@@ -71,6 +89,19 @@ async function writeAll(
 }
 
 export async function writeAgentFile(
+  root: string,
+  path: string,
+  mode: WriteMode,
+  payload: Uint8Array,
+  permission?: number,
+): Promise<WriteResult> {
+  return await withPathLock(
+    `${root}\u0000${path}`,
+    () => writeAgentFileUnlocked(root, path, mode, payload, permission),
+  );
+}
+
+async function writeAgentFileUnlocked(
   root: string,
   path: string,
   mode: WriteMode,
@@ -156,6 +187,31 @@ export async function writeAgentFile(
         ) {
           await Deno.chown(tempPath, existing.uid, existing.gid).catch(() =>
             undefined
+          );
+        }
+      }
+
+      if (mode === "append") {
+        // The lock serializes service requests; this check catches an agent
+        // process (or another writer) appending after our snapshot.
+        let current: Deno.FileInfo | undefined;
+        try {
+          current = await Deno.lstat(targetPath);
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        }
+        const unchanged = existing === undefined
+          ? current === undefined
+          : current !== undefined &&
+            current.size === existing.size &&
+            (existing.ino === null || current.ino === null ||
+              current.ino === existing.ino) &&
+            (existing.mtime?.getTime() ?? null) ===
+              (current.mtime?.getTime() ?? null);
+        if (!unchanged) {
+          throw new HostError(
+            "conflict",
+            `"${path}" changed while it was being appended`,
           );
         }
       }
