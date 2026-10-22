@@ -278,6 +278,13 @@ Deno.test({
         >;
       };
 
+      const envLeak = await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "tr '\\0' '\\n' </proc/1/environ | grep -c '^AGENTZOO_RUNTIME_TOKEN=' || true",
+      ]);
+      assertEquals(envLeak.stdout.trim(), "0");
+
       await alpha.exec([
         "/bin/bash",
         "-c",

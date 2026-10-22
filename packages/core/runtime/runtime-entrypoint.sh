@@ -9,15 +9,15 @@ if [[ -d "${runtime_data}" ]]; then
   if [[ ! -s "${token_file}" ]]; then
     (umask 077; od -An -tx1 -N32 /dev/urandom | tr -d " \n" > "${token_file}")
   fi
-  export AGENTZOO_RUNTIME_TOKEN="$(cat "${token_file}")"
 fi
 
 # Start the resident service for the container's main process. It runs outside
 # every agent root and is restarted if it exits.
-if [[ "${1:-}" == "sleep" && -x /usr/local/bin/agentzoo-runtime-host && -n "${AGENTZOO_RUNTIME_TOKEN:-}" ]]; then
+if [[ "${1:-}" == "sleep" && -x /usr/local/bin/agentzoo-runtime-host && -s "${token_file}" ]]; then
   (
     while true; do
-      /usr/local/bin/agentzoo-runtime-host || true
+      AGENTZOO_RUNTIME_TOKEN="$(cat "${token_file}")" \
+        /usr/local/bin/agentzoo-runtime-host || true
       sleep 1
     done
   ) >>"${runtime_data}/runtime-host.log" 2>&1 &

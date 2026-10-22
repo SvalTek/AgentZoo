@@ -78,6 +78,29 @@ async function readCurrentFile(
   }
 }
 
+/**
+ * Locate the descriptor that still points at the temp file, so mode and owner
+ * changes act on the inode rather than on a directory entry the agent could
+ * have swapped for a symlink.
+ */
+async function descriptorPathFor(tempPath: string): Promise<string> {
+  if (Deno.build.os !== "linux") return tempPath;
+  try {
+    for await (const entry of Deno.readDir("/proc/self/fd")) {
+      if (!/^\d+$/.test(entry.name)) continue;
+      const fdPath = `/proc/self/fd/${entry.name}`;
+      try {
+        if (await Deno.readLink(fdPath) === tempPath) return fdPath;
+      } catch {
+        // The descriptor closed while we scanned.
+      }
+    }
+  } catch {
+    // /proc is unavailable; fall back to the path.
+  }
+  return tempPath;
+}
+
 async function writeAll(
   file: Deno.FsFile,
   bytes: Uint8Array,
@@ -171,24 +194,23 @@ async function writeAgentFileUnlocked(
         // Persist before the atomic commit; a crash after rename must not
         // leave the new name pointing at unflushed content.
         await file.sync();
-      } finally {
-        file.close();
-      }
 
-      if (permission !== undefined) {
-        await Deno.chmod(tempPath, permission & 0o7777);
-      } else if (existing) {
-        if (existing.mode !== null) {
-          await Deno.chmod(tempPath, existing.mode & 0o7777);
+        const permissionPath = await descriptorPathFor(tempPath);
+        if (permission !== undefined) {
+          await Deno.chmod(permissionPath, permission & 0o7777);
+        } else if (existing?.mode !== null && existing !== undefined) {
+          await Deno.chmod(permissionPath, existing.mode! & 0o7777);
         }
         if (
-          Deno.build.os === "linux" && existing.uid !== null &&
-          existing.gid !== null
+          Deno.build.os === "linux" && existing?.uid !== null &&
+          existing?.uid !== undefined && existing.gid !== null
         ) {
-          await Deno.chown(tempPath, existing.uid, existing.gid).catch(() =>
-            undefined
+          await Deno.chown(permissionPath, existing.uid, existing.gid).catch(
+            () => undefined,
           );
         }
+      } finally {
+        file.close();
       }
 
       if (mode === "append") {

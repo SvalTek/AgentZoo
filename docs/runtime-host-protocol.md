@@ -5,12 +5,13 @@ description: Proposed design for the resident runtime-host service that tools ca
 
 # Runtime host protocol (proposed)
 
-Status: phase 1 is implemented and wired into the runtime image: handshake,
-ping, stat, read, list, search, `fs.write`, and `fs.watch` subscriptions.
-`read_file`, `list_directory`, `search_files`, and `write_file` use the host
-when the backend provides it (`RuntimeEnv.files`) and keep the `exec` path as
-the fallback. `edit_file`, `apply_patch`, shell, and terminals still run through
-`exec`.
+Status: implemented and wired into the runtime image: handshake, ping,
+`fs.stat`, `fs.read`, `fs.list`, `fs.search`, `fs.write`, `fs.remove`, and
+`fs.watch`. `read_file`, `list_directory`, `search_files`, `write_file`, and
+`edit_file` use the host when the backend provides it (`RuntimeEnv.files`);
+`apply_patch` keeps its diff logic in TypeScript and commits through host writes
+and removals. Every migrated tool keeps the `exec` path as the fallback. Shell
+and terminals still run through `exec`.
 
 The runtime container currently carries most tool logic as shell strings passed
 to `bash -c`. Quoting, exit-code tables, `PIPESTATUS`, `sed`/`awk` behaviour,
@@ -87,7 +88,7 @@ flowchart LR
 // client -> server
 {"op":"hello","protocol":1,"token":"<per-container random>"}
 // server -> client
-{"ok":true,"result":{"protocol":1,"helperVersion":"0.1.0","runtimeId":"..."}}
+{"ok":true,"result":{"protocol":1,"helperVersion":"0.1.0"}}
 ```
 
 The token is generated per container, passed only to the service and to
@@ -116,7 +117,7 @@ escapes, including symlinks and `..`.
 
 ```jsonc
 { "agent": "alice", "path": "/root/x.py" }
-// -> {"type":"file","size":4210,"mode":420,"mtimeMs":...,"symlink":false}
+// -> {"type":"file","sizeBytes":4210,"mode":420,"mtimeMs":...,"symlink":false}
 ```
 
 `type` describes the referent (`file`, `directory`, or `other`), because the
@@ -150,7 +151,7 @@ only chooses defaults.
 
 ```jsonc
 { "agent": "alice", "path": "/root", "limit": 500 }
-// -> {"path":"/root","entries":[{"name":".bashrc","type":"file","size":3779}],"truncated":false}
+// -> {"path":"/root","entries":[{"name":".bashrc","type":"file","sizeBytes":3779}],"truncated":false}
 ```
 
 Immediate entries only; no recursion. Entry types come from `lstat`, so a

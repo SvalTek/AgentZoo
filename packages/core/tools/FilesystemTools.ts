@@ -450,7 +450,13 @@ Use these structured tools for ordinary file and directory work instead of shell
                   "Use a path inside the environment.",
                 ],
               });
-              // Transport failure: fall back to the exec path below.
+              if (mode !== "overwrite") {
+                throw actionableToolError([
+                  "The write outcome is unknown: the runtime host connection failed after the request was sent.",
+                  "Read the file before retrying so content cannot be duplicated.",
+                ], { error });
+              }
+              // overwrite is idempotent; fall back to the exec path below.
             }
           }
           const raw = await execute(
@@ -548,7 +554,10 @@ Use these structured tools for ordinary file and directory work instead of shell
                       "Check the file permissions or use shell for this path.",
                     ],
                   });
-                  throw error;
+                  throw actionableToolError([
+                    "The edit outcome is unknown: the runtime host connection failed after the write was sent.",
+                    "Read the file before retrying; the edit may already be applied.",
+                  ], { error });
                 }
                 const result = {
                   path: input.path!,
@@ -1291,6 +1300,8 @@ export function normalizePatchHunks(patch: string): string {
   // A trailing newline terminates the patch; an empty line inside a hunk is a
   // context line for an empty source line.
   const lines = (patch.endsWith("\n") ? patch.slice(0, -1) : patch).split("\n");
+  // A trailing blank line is an extra newline, not a context line.
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   for (let index = 0; index < lines.length; index++) {
     const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(
       lines[index],
