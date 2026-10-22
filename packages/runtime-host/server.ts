@@ -81,6 +81,23 @@ function failure(id: string | undefined, error: unknown): ServerMessage {
   };
 }
 
+function logFailure(
+  op: string,
+  agent: string | undefined,
+  error: unknown,
+): void {
+  const code = error instanceof HostError ? error.code : "internal";
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(
+    `[${new Date().toISOString()}] ${op} agent=${
+      agent ?? "-"
+    } code=${code}: ${message}`,
+  );
+  if (!(error instanceof HostError) && error instanceof Error && error.stack) {
+    console.error(error.stack);
+  }
+}
+
 export function createRuntimeHostServer(
   options: RuntimeHostServerOptions,
 ): RuntimeHostServer {
@@ -190,6 +207,7 @@ export function createRuntimeHostServer(
         });
       } catch (error) {
         subscriptionCount--;
+        logFailure("subscribe", agent, error);
         send(failureForSubscription(sub, error));
       }
       return true;
@@ -229,6 +247,11 @@ export function createRuntimeHostServer(
       const hello = HelloSchema.safeParse(message);
       if (hello.success) {
         if (hello.data.protocol !== PROTOCOL_VERSION) {
+          console.error(
+            `[${
+              new Date().toISOString()
+            }] hello rejected: protocol ${hello.data.protocol}`,
+          );
           send(unauthorized(
             `protocol ${hello.data.protocol} is not supported (expected ${PROTOCOL_VERSION})`,
           ));
@@ -236,6 +259,7 @@ export function createRuntimeHostServer(
           return;
         }
         if (hello.data.token !== options.token) {
+          console.error(`[${new Date().toISOString()}] hello rejected: token`);
           send(unauthorized("token rejected"));
           socket.close(1008, "unauthorized");
           return;
@@ -302,6 +326,7 @@ export function createRuntimeHostServer(
           result: result.result,
         });
       } catch (error) {
+        logFailure(op, agent, error);
         send(failure(id, error));
       }
     };

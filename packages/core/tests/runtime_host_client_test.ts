@@ -307,3 +307,57 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "multipart uploads hold the entry lock across chunks",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { base, root, server } = await fixture();
+    const endpoint = { url: `ws://127.0.0.1:${server.port}`, token };
+    const client = await RuntimeHostClient.connect(endpoint);
+    const files = new RuntimeHostFiles("alpha", () => endpoint);
+    const encoder = new TextEncoder();
+    try {
+      await files.write("/root/lock.txt", "create", encoder.encode("start"));
+      const start = await client.request("fs.writeStart", "alpha", {
+        path: "/root/lock.txt",
+        mode: "append",
+        sizeBytes: 2,
+      });
+      const upload = String(start.result.upload);
+      await client.requestWithPayload(
+        "fs.writeChunk",
+        "alpha",
+        { upload },
+        encoder.encode("A"),
+      );
+
+      const oneShot = client.requestWithPayload(
+        "fs.write",
+        "alpha",
+        { path: "/root/lock.txt", mode: "append" },
+        encoder.encode("B"),
+      );
+      await delay(50);
+      await client.requestWithPayload(
+        "fs.writeChunk",
+        "alpha",
+        { upload },
+        encoder.encode("C"),
+      );
+      await client.request("fs.writeCommit", "alpha", { upload });
+      await oneShot;
+
+      assertEquals(
+        await Deno.readTextFile(`${root}/root/lock.txt`),
+        "startACB",
+      );
+    } finally {
+      files.close();
+      client.close();
+      await server.close();
+      await Deno.remove(base, { recursive: true });
+    }
+  },
+});

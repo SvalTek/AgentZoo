@@ -45,7 +45,9 @@ import {
   normalizePatchHunks,
   observedToolResult,
   parseConfig,
+  patchRollbackCandidates,
   resolveConfigEnvironment,
+  RuntimeFilesError,
   ShellFeature,
   TemplateRegistry,
   ToolExecutionError,
@@ -522,6 +524,19 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
     "",
   ].join("\n"));
   assertEquals(separated.match(/@@ -1,1 \+1,1 @@/g)?.length, 2);
+
+  assertEquals(
+    patchRollbackCandidates(
+      new RuntimeFilesError("conflict", "exists"),
+      ["applied"],
+      "current",
+    ),
+    ["applied"],
+  );
+  assertEquals(
+    patchRollbackCandidates(new Error("transport"), ["applied"], "current"),
+    ["applied", "current"],
+  );
 
   const extraNewline = normalizePatchHunks([
     "--- a/one.txt",

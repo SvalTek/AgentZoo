@@ -1397,8 +1397,10 @@ const PATCH_FILE_LIMIT = 33_554_432;
 
 interface StagedPatchFile {
   readonly path: string;
-  /** Original text, or null when the patch creates the file. */
+  /** Original text without a leading BOM, or null when the patch creates it. */
   readonly before: string | null;
+  /** The file began with a UTF-8 BOM; re-add it on every write. */
+  readonly bom: boolean;
   /** Original permission bits, used when a rollback must recreate the file. */
   readonly mode: string | null;
   /** Patched text, or null when the patch deletes the file. */
@@ -1475,6 +1477,7 @@ async function stagePatch(
 
     let before: string | null = null;
     let mode: string | null = null;
+    let bom = false;
     if (oldPath !== null) {
       const kind = await pathKind(deps, oldPath);
       if (kind === "symlink") {
@@ -1497,6 +1500,7 @@ async function stagePatch(
       }
       before = read.content;
       mode = read.mode;
+      bom = read.bom;
     } else {
       // A creation section must not replace something that is already there.
       const kind = await pathKind(deps, path);
@@ -1639,6 +1643,7 @@ async function stagePatch(
     staged.set(path, {
       path,
       before,
+      bom,
       mode,
       after: newPath === null ? null : updated,
       additions: file.hunks.reduce(
@@ -1676,6 +1681,27 @@ async function commitPatch(
  * is always recoverable. There is deliberately no fallback to the exec commit
  * after a mutation was attempted.
  */
+/**
+ * A conflict is raised before the host writes (create target exists, stale
+ * snapshot), so the in-flight file must not be rolled back as if we created it.
+ * Any other failure may have committed it, so it stays in the set.
+ */
+export function patchRollbackCandidates<T>(
+  error: unknown,
+  applied: readonly T[],
+  current: T | undefined,
+): readonly T[] {
+  const currentNotWritten = error instanceof RuntimeFilesError &&
+    error.code === "conflict";
+  return current === undefined || currentNotWritten
+    ? applied
+    : [...applied, current];
+}
+
+function withBom(value: string | null, bom: boolean): string | null {
+  return value === null || !bom ? value : `\uFEFF${value}`;
+}
+
 async function commitPatchHost(
   deps: AgentRunDeps,
   host: RuntimeFiles,
@@ -1692,7 +1718,7 @@ async function commitPatchHost(
         await host.write(
           file.path,
           file.before === null ? "create" : "overwrite",
-          new TextEncoder().encode(file.after),
+          new TextEncoder().encode(withBom(file.after, file.bom)!),
         );
       }
       applied.push(file);
@@ -1701,7 +1727,7 @@ async function commitPatchHost(
   } catch (error) {
     // The in-flight file may have been committed even when the response was
     // lost, so include it in the rollback candidates.
-    const candidates = current === undefined ? applied : [...applied, current];
+    const candidates = patchRollbackCandidates(error, applied, current);
     const failed = await rollbackPatch(deps, candidates, new Map());
     if (failed.length > 0) {
       throw actionableToolError([
@@ -1732,7 +1758,7 @@ async function commitPatchExec(
         await writeTempFile(
           deps,
           file.path,
-          file.after,
+          withBom(file.after, file.bom)!,
           file.before === null ? "mode:644" : "copy",
         ),
       );
@@ -1796,7 +1822,7 @@ async function rollbackPatch(
       const temp = await writeTempFile(
         deps,
         file.path,
-        file.before,
+        withBom(file.before, file.bom)!,
         `mode:${file.mode ?? "644"}`,
       );
       const moved = await runPatchCommand(
@@ -1819,7 +1845,7 @@ async function readPatchFile(
   deps: AgentRunDeps,
   path: string,
   cwd: string,
-): Promise<{ content: string; mode: string } | null> {
+): Promise<{ content: string; mode: string; bom: boolean } | null> {
   const raw = await runPatchCommand(
     deps,
     READ_TEXT_SCRIPT,
@@ -1855,11 +1881,18 @@ async function readPatchFile(
   }
   try {
     return {
-      content: new TextDecoder("utf-8", {
-        fatal: true,
-        ignoreBOM: true,
-      }).decode(bytes),
-      mode: modeLine.trim(),
+      ...(() => {
+        const text = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(bytes);
+        const bom = text.startsWith("\uFEFF");
+        return {
+          content: bom ? text.slice(1) : text,
+          mode: modeLine.trim(),
+          bom,
+        };
+      })(),
     };
   } catch {
     throw actionableToolError([

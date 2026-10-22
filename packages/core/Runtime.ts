@@ -1,6 +1,6 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
-import { fromFileUrl, resolve } from "@std/path";
+import { dirname, fromFileUrl, join, resolve } from "@std/path";
 import type {
   CommandOptions,
   CommandResult,
@@ -71,6 +71,8 @@ export class DockerRuntimeManager implements RuntimeManager {
   #runtimeHostToken: string | undefined;
   #runtimeHostPort: number | undefined;
   readonly #dataVolumeName: string;
+  readonly #runtimeLogDir: string;
+  readonly #runtimeLogFile: string;
   #prepared = false;
   readonly runId: string;
   readonly createdAt: string;
@@ -92,6 +94,16 @@ export class DockerRuntimeManager implements RuntimeManager {
     this.createdAt = metadata.createdAt ?? new Date().toISOString();
     this.hostName = hostName ?? `agent-runtime-${this.runId}`;
     this.#dataVolumeName = `${this.hostName}-data`;
+    const projectDir = /\.(?:ya?ml|jsonc?)$/i.test(this.project)
+      ? dirname(this.project)
+      : this.project;
+    this.#runtimeLogDir = join(projectDir, ".agent-zoo-logs");
+    this.#runtimeLogFile = join(this.#runtimeLogDir, "runtime-host.log");
+  }
+
+  /** Host-visible log rewritten when the runtime container starts. */
+  runtimeLogFile(): string {
+    return this.#runtimeLogFile;
   }
 
   get dataVolumeName(): string {
@@ -234,6 +246,14 @@ export class DockerRuntimeManager implements RuntimeManager {
   }
 
   async #createHostContainer(): Promise<void> {
+    let logMount: string[] = [];
+    try {
+      await Deno.mkdir(this.#runtimeLogDir, { recursive: true });
+      logMount = ["--volume", `${this.#runtimeLogDir}:/var/log/agentzoo`];
+    } catch {
+      // Diagnostics only; run without the host-visible log if the path is
+      // unavailable.
+    }
     await runDocker([
       "run",
       "--detach",
@@ -243,6 +263,7 @@ export class DockerRuntimeManager implements RuntimeManager {
       ...this.#resourceLabelArgs("runtime"),
       "--volume",
       `${this.workspace}:/shared`,
+      ...logMount,
       "--mount",
       `source=${this.#dataVolumeName},target=/var/lib/runtime`,
       "--publish",

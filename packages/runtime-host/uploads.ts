@@ -17,8 +17,10 @@ import {
 import { type OpenedTarget, openTarget } from "./containment.ts";
 import { agentRoot } from "./paths.ts";
 import {
+  acquirePathLock,
   changedSince,
   descriptorPathFor,
+  lockKey,
   splitAgentPath,
   writeAll,
   type WriteExpectation,
@@ -50,6 +52,7 @@ interface Session {
   readonly append?: OpenedTarget;
   readonly temp?: Deno.FsFile;
   readonly tempPath?: string;
+  readonly release: () => void;
   received: number;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -112,6 +115,9 @@ export class UploadManager {
     const directory = await openTarget(root, parent, {
       requireDirectory: true,
     });
+    // Hold the entry lock for the whole session, so one-shot writes and other
+    // uploads cannot interleave with the chunks of this append/replace.
+    const release = await acquirePathLock(lockKey(root, directory, name));
     let appendTarget: OpenedTarget | undefined;
     let temp: Deno.FsFile | undefined;
     let tempPath: string | undefined;
@@ -196,12 +202,14 @@ export class UploadManager {
         append: appendTarget,
         temp,
         tempPath,
+        release,
         received: 0,
         timer,
       };
       this.#sessions.set(id, session);
       return { result: { upload: id, chunkSize: UPLOAD_CHUNK_BYTES } };
     } catch (error) {
+      release();
       appendTarget?.close();
       try {
         temp?.close();
@@ -348,6 +356,7 @@ export class UploadManager {
       await this.#cleanup(session);
       throw error;
     } finally {
+      session.release();
       session.directory.close();
     }
   }
@@ -392,6 +401,7 @@ export class UploadManager {
 
   async #cleanup(session: Session, closeDirectory = false): Promise<void> {
     clearTimeout(session.timer);
+    session.release();
     try {
       session.append?.close();
     } catch {

@@ -500,7 +500,7 @@ Deno.test({
       await alpha.exec([
         "/bin/bash",
         "-c",
-        "printf '\\357\\273\\277hello world\\n' > /root/bom.txt",
+        "printf '\\357\\273\\277hello world\\n' > /root/bom.txt; printf '\\357\\273\\277alpha\\nbeta\\n' > /root/bom-patch.txt",
       ]);
       await invoke(alpha, "edit_file", {
         path: "/root/bom.txt",
@@ -514,6 +514,28 @@ Deno.test({
           "-tx1",
           "-N3",
           "/root/bom.txt",
+        ]))
+          .stdout.replaceAll(/\s+/g, ""),
+        "efbbbf",
+      );
+
+      await invoke(alpha, "apply_patch", {
+        patch: [
+          "--- a/bom-patch.txt",
+          "+++ b/bom-patch.txt",
+          "@@ -1,2 +1,2 @@",
+          "-alpha",
+          "+ALPHA",
+          " beta",
+        ].join("\n"),
+      });
+      assertEquals(
+        (await alpha.exec([
+          "/usr/bin/od",
+          "-An",
+          "-tx1",
+          "-N3",
+          "/root/bom-patch.txt",
         ]))
           .stdout.replaceAll(/\s+/g, ""),
         "efbbbf",
@@ -1778,6 +1800,16 @@ Deno.test({
 
       const ping = await client.request("ping");
       assertEquals(ping.result.protocol, 1);
+
+      const logFile = runtime.runtimeLogFile();
+      let log = "";
+      const logDeadline = Date.now() + 3_000;
+      while (Date.now() < logDeadline) {
+        log = await Deno.readTextFile(logFile).catch(() => "");
+        if (log.includes("listening")) break;
+        await delay(50);
+      }
+      assert(log.includes("listening"), `empty runtime host log: ${logFile}`);
 
       await alpha.exec([
         "/bin/bash",

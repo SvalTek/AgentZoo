@@ -14,13 +14,20 @@ fi
 # Start the resident service for the container's main process. It runs outside
 # every agent root and is restarted if it exits.
 if [[ "${1:-}" == "sleep" && -x /usr/local/bin/agentzoo-runtime-host && -s "${token_file}" ]]; then
+  # Truncate only for the container's main process. `docker exec` invocations
+  # of this script must not erase the log that the service is writing to.
+  log_file=/var/log/agentzoo/runtime-host.log
+  if ! { mkdir -p /var/log/agentzoo && : > "${log_file}"; } 2>/dev/null; then
+    log_file="${runtime_data}/runtime-host.log"
+    : > "${log_file}" 2>/dev/null || true
+  fi
   (
     while true; do
       AGENTZOO_RUNTIME_TOKEN="$(cat "${token_file}")" \
         /usr/local/bin/agentzoo-runtime-host || true
       sleep 1
     done
-  ) >>"${runtime_data}/runtime-host.log" 2>&1 &
+  ) >>"${log_file}" 2>&1 &
 fi
 
 agent_root() {

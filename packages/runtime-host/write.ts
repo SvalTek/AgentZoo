@@ -24,20 +24,33 @@ export interface WriteExpectation {
 }
 
 /** One tail promise per target, so concurrent writes cannot interleave. */
-const pathLocks = new Map<string, Promise<unknown>>();
+const pathLocks = new Map<string, Promise<void>>();
+
+/** Acquire the per-entry lock; the returned release is idempotent. */
+export async function acquirePathLock(key: string): Promise<() => void> {
+  const previous = pathLocks.get(key) ?? Promise.resolve();
+  const release = Promise.withResolvers<void>();
+  const tail = previous.then(() => release.promise);
+  pathLocks.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release.resolve();
+    if (pathLocks.get(key) === tail) pathLocks.delete(key);
+  };
+}
 
 async function withPathLock<T>(
   key: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const previous = pathLocks.get(key) ?? Promise.resolve();
-  const run = previous.catch(() => undefined).then(operation);
-  const tail = run.catch(() => undefined);
-  pathLocks.set(key, tail);
+  const release = await acquirePathLock(key);
   try {
-    return await run;
+    return await operation();
   } finally {
-    if (pathLocks.get(key) === tail) pathLocks.delete(key);
+    release();
   }
 }
 
@@ -46,7 +59,7 @@ async function withPathLock<T>(
  * covers hard links and symlinked parents; the resolved path is the fallback
  * on platforms without inode numbers.
  */
-function lockKey(
+export function lockKey(
   root: string,
   directory: OpenedTarget,
   name: string,

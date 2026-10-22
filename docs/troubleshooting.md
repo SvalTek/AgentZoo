@@ -121,3 +121,13 @@ stimuli. Add another population member or stop the open-ended run externally.
 
 Use `--no-ui` for line-oriented output. The durable JSONL log is written in both
 modes.
+
+## Runtime host logs
+
+The resident runtime host writes to `<project>/.agent-zoo-logs/runtime-host.log`
+on the host (bind-mounted at `/var/log/agentzoo`). The file is truncated when
+the runtime container's main process starts, so it reflects the current run. It
+records startup, handshake rejections, and operation failures with the
+operation, agent, error code, and message. If the bind mount is unavailable, the
+entrypoint falls back to `/var/lib/runtime/runtime-host.log` inside the data
+volume.
