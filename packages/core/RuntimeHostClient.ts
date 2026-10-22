@@ -202,13 +202,22 @@ export class RuntimeHostClient {
       timer,
     });
     this.#subscriptions.set(sub, onEvent);
-    this.#socket.send(JSON.stringify({
-      op: "subscribe",
-      sub,
-      channel: "fs.watch",
-      agent,
-      params,
-    }));
+    try {
+      this.#socket.send(JSON.stringify({
+        op: "subscribe",
+        sub,
+        channel: "fs.watch",
+        agent,
+        params,
+      }));
+    } catch (error) {
+      this.#pendingSubscriptions.delete(sub);
+      this.#subscriptions.delete(sub);
+      clearTimeout(timer);
+      acknowledgement.reject(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
     await acknowledgement.promise;
     return {
       close: () => {
@@ -253,23 +262,22 @@ export class RuntimeHostClient {
       pending.resolve({ result: {} });
       return;
     }
-    if (typeof message.id !== "string") return;
-    const subscriptionKey = typeof message.sub === "string"
-      ? message.sub
-      : message.id;
-    const pendingSubscription = subscriptionKey === undefined
-      ? undefined
-      : this.#pendingSubscriptions.get(subscriptionKey);
-    if (pendingSubscription && message.ok === false) {
-      this.#pendingSubscriptions.delete(subscriptionKey!);
-      this.#subscriptions.delete(subscriptionKey!);
-      clearTimeout(pendingSubscription.timer);
-      const error = message.error as { message?: string } | undefined;
-      pendingSubscription.reject(
-        new Error(error?.message ?? "runtime host subscription failed"),
-      );
+    if (message.ok === false && typeof message.sub === "string") {
+      const pending = this.#pendingSubscriptions.get(message.sub);
+      if (pending) {
+        this.#pendingSubscriptions.delete(message.sub);
+        this.#subscriptions.delete(message.sub);
+        clearTimeout(pending.timer);
+        const error = message.error as
+          | { code?: string; message?: string }
+          | undefined;
+        pending.reject(
+          new Error(error?.message ?? "runtime host subscription failed"),
+        );
+      }
       return;
     }
+    if (typeof message.id !== "string") return;
     const pending = this.#pending.get(message.id);
     if (!pending) return;
     this.#pending.delete(message.id);

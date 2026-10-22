@@ -32,10 +32,25 @@ interface SearchState {
 
 function globRegExp(pattern: string): RegExp {
   let source = "^";
-  for (const character of pattern) {
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index];
     if (character === "*") source += ".*";
     else if (character === "?") source += ".";
-    else source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+    else if (character === "[") {
+      const close = pattern.indexOf("]", index + 1);
+      if (close < 0) {
+        source += "\\[";
+        continue;
+      }
+      let body = pattern.slice(index + 1, close);
+      const negated = body.startsWith("!");
+      if (negated) body = body.slice(1);
+      body = body.replaceAll("\\", "\\\\").replaceAll("]", "\\]");
+      source += `[${negated ? "^" : ""}${body}]`;
+      index = close;
+    } else {
+      source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+    }
   }
   return new RegExp(`${source}$`);
 }

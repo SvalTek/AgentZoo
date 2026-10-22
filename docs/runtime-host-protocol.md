@@ -96,14 +96,15 @@ AgentZoo, and never placed in an agent-visible path or argv.
 ### Requests
 
 ```jsonc
-{"id":"42","op":"fs.read","agent":"alice","params":{"path":"/root/x.py","unit":"lines","start":40,"count":200}}
+{"id":"42","op":"fs.read","agent":"alice","params":{"path":"/root/x.py","unit":"lines","startLine":40,"lineLimit":200}}
 {"id":"42","ok":true,"result":{"unit":"lines","startLine":40,"linesReturned":200,"totalLines":312,"nextLine":240,"truncated":true}}
 {"id":"42","ok":false,"error":{"code":"path_escape","message":"/root/x.py resolves outside the agent root"}}
 ```
 
 - Cancellation is planned; today a client-side timeout is the only bound.
-- Idempotent ops may be retried with the same `id` after reconnect. Writes are
-  not retried unless they carry an idempotency key.
+- The client does not retry a request after it is sent; it drops the connection
+  and reconnects on the next call. Retrying an append after an unknown outcome
+  would duplicate content.
 
 ## File operations
 
@@ -118,8 +119,10 @@ escapes, including symlinks and `..`.
 // -> {"type":"file","size":4210,"mode":420,"mtimeMs":...,"symlink":false}
 ```
 
-`type` is `file`, `directory`, `symlink`, or `other`. Symlinks report their
-referent only when it stays inside the root.
+`type` describes the referent (`file`, `directory`, or `other`), because the
+open follows links inside the root. The separate `symlink` flag reports whether
+the requested path traversed a symbolic link; `type: "symlink"` is therefore not
+produced.
 
 ### `fs.read`
 

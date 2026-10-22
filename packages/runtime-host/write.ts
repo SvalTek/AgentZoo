@@ -75,6 +75,7 @@ export async function writeAgentFile(
   path: string,
   mode: WriteMode,
   payload: Uint8Array,
+  permission?: number,
 ): Promise<WriteResult> {
   if (payload.length > MAX_REQUEST_BYTES) {
     throw new HostError(
@@ -136,11 +137,16 @@ export async function writeAgentFile(
       try {
         if (prefix.length > 0) await writeAll(file, prefix);
         await writeAll(file, payload);
+        // Persist before the atomic commit; a crash after rename must not
+        // leave the new name pointing at unflushed content.
+        await file.sync();
       } finally {
         file.close();
       }
 
-      if (existing) {
+      if (permission !== undefined) {
+        await Deno.chmod(tempPath, permission & 0o7777);
+      } else if (existing) {
         if (existing.mode !== null) {
           await Deno.chmod(tempPath, existing.mode & 0o7777);
         }

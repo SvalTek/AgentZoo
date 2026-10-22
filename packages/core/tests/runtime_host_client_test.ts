@@ -115,6 +115,52 @@ Deno.test({
 });
 
 Deno.test({
+  name: "runtime host reports a failed subscription and missing write payload",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { base, root, server } = await fixture();
+    const client = await RuntimeHostClient.connect({
+      url: `ws://127.0.0.1:${server.port}`,
+      token,
+    });
+    try {
+      await assertRejects(
+        () =>
+          client.subscribe(
+            "alpha",
+            { path: "/root/missing", depth: 1 },
+            () => {},
+          ),
+        Error,
+        "does not exist",
+      );
+
+      await assertRejects(
+        () =>
+          client.request("fs.write", "alpha", {
+            path: "/root/no-payload.txt",
+            mode: "create",
+          }),
+        HostError,
+        "requires a payload",
+      );
+      await assertRejects(
+        () => Deno.lstat(`${root}/root/no-payload.txt`),
+        Deno.errors.NotFound,
+      );
+
+      const ping = await client.request("ping");
+      assertEquals(ping.result.protocol, 1);
+    } finally {
+      client.close();
+      await server.close();
+      await Deno.remove(base, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "runtime host refuses a bad token",
   sanitizeOps: false,
   sanitizeResources: false,

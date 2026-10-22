@@ -332,6 +332,17 @@ Deno.test({
       assertEquals(linesPage.truncated, true);
       assertEquals(linesPage.nextLine, 3);
 
+      await invoke(alpha, "write_file", {
+        path: "/root/empty.txt",
+        content: "",
+      });
+      const emptyRead = await invoke(alpha, "read_file", {
+        path: "/root/empty.txt",
+      });
+      assertEquals(emptyRead.content, "");
+      assertEquals(emptyRead.totalLines, 0);
+      assertEquals(emptyRead.truncated, false);
+
       const hostListing = await invoke(alpha, "list_directory", {
         path: "/root",
       });

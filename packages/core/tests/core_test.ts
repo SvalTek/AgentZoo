@@ -507,6 +507,32 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   );
   assert(corrected.includes("@@ -1,2 +1,2 @@"));
 
+  const separated = normalizePatchHunks([
+    "--- a/one.txt",
+    "+++ b/one.txt",
+    "@@ -1,1 +1,1 @@",
+    "-one",
+    "+ONE",
+    "",
+    "--- a/two.txt",
+    "+++ b/two.txt",
+    "@@ -1,1 +1,1 @@",
+    "-two",
+    "+TWO",
+    "",
+  ].join("\n"));
+  assertEquals(separated.match(/@@ -1,1 \+1,1 @@/g)?.length, 2);
+
+  const removedDashes = normalizePatchHunks([
+    "--- a/note.txt",
+    "+++ b/note.txt",
+    "@@ -1,1 +1,0 @@",
+    "--- sql comment",
+    " keep",
+    "",
+  ].join("\n"));
+  assert(removedDashes.includes("@@ -1,2 +1,1 @@"));
+
   const http = tools.find((tool) => tool.name === "http_request")!;
   const malformedHttp = http.parameters.safeParse({ url: "not a URL" });
   assert(malformedHttp.success, "diagnosable URLs must reach argsValidator");
@@ -1903,6 +1929,17 @@ Deno.test("parseConfig: rejects invalid param type", () => {
         ].join("\n"),
       ),
     ConfigValidationError,
+  );
+});
+
+Deno.test("ShellFeature: rejects a configured tool that collides with the alias", async () => {
+  await assertRejects(
+    () =>
+      new ShellFeature({
+        bash: { command: "echo {text}", description: "custom", params: {} },
+      }).createTools(),
+    Error,
+    "conflicts with the built-in alias",
   );
 });
 

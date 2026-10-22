@@ -96,6 +96,11 @@ Use dedicated command tools when one directly matches the operation. Use the she
   }
 
   async createTools(): Promise<readonly ToolDefinition<AgentRunDeps>[]> {
+    if (Object.hasOwn(this.#configuredTools, "bash")) {
+      throw new Error(
+        'Configured shell tool name "bash" conflicts with the built-in alias for "shell".',
+      );
+    }
     const builtIn = await this.createTool();
     const configured: ToolDefinition<AgentRunDeps>[] = [];
     for (const [name, config] of Object.entries(this.#configuredTools)) {

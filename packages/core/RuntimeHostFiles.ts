@@ -167,10 +167,17 @@ export class RuntimeHostFiles implements RuntimeFiles {
     path: string,
     mode: "create" | "overwrite" | "append",
     bytes: Uint8Array,
+    options: { readonly permission?: number } = {},
   ): Promise<{ readonly created: boolean; readonly sizeBytes: number }> {
     const { result } = await this.#request(
       "fs.write",
-      { path, mode },
+      {
+        path,
+        mode,
+        ...(options.permission === undefined
+          ? {}
+          : { permission: options.permission }),
+      },
       bytes,
     );
     return {
@@ -202,34 +209,30 @@ export class RuntimeHostFiles implements RuntimeFiles {
     params: unknown,
     payload?: Uint8Array,
   ): Promise<{ result: Record<string, unknown>; payload?: Uint8Array }> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const client = await this.#connection();
-      try {
-        return payload === undefined
-          ? await client.request(op, this.agentId, params)
-          : await client.requestWithPayload(op, this.agentId, params, payload);
-      } catch (error) {
-        if (error instanceof HostError) {
-          throw new RuntimeFilesError(error.code, error.message);
-        }
-        lastError = error;
-        // The socket closed or timed out; the next attempt reconnects.
-        this.#client = undefined;
-        client.close();
+    const client = await this.#connection();
+    try {
+      return payload === undefined
+        ? await client.request(op, this.agentId, params)
+        : await client.requestWithPayload(op, this.agentId, params, payload);
+    } catch (error) {
+      if (error instanceof HostError) {
+        throw new RuntimeFilesError(error.code, error.message);
       }
+      // The request may have reached the service before the socket failed.
+      // Retrying a non-idempotent write would duplicate it, so drop the
+      // connection and let a later call reconnect.
+      this.#client = undefined;
+      client.close();
+      throw error;
     }
-    throw lastError instanceof Error
-      ? lastError
-      : new Error("runtime host request failed");
   }
 
   async #connection(): Promise<RuntimeHostClient> {
     if (this.#client) return this.#client;
-    this.#connecting ??= this.#open().finally(() => {
-      this.#connecting = undefined;
+    const connecting = this.#connecting ??= this.#open().finally(() => {
+      if (this.#connecting === connecting) this.#connecting = undefined;
     });
-    return await this.#connecting;
+    return await connecting;
   }
 
   async #open(): Promise<RuntimeHostClient> {

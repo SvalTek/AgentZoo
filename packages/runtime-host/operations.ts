@@ -61,6 +61,7 @@ const RemoveParams = z.object({
 const WriteParams = z.object({
   path: z.string().min(1),
   mode: z.enum(["create", "overwrite", "append"]),
+  permission: z.number().int().nonnegative().max(0o7777).optional(),
 });
 
 const ReadParams = z.object({
@@ -180,12 +181,16 @@ export async function executeOperation(
 
   if (op === "fs.write") {
     const input = parseParams(WriteParams, params);
+    if (payload === undefined) {
+      throw new HostError("invalid_request", "fs.write requires a payload");
+    }
     const root = await existingAgentRoot(context, agent);
     return await writeAgentFile(
       root,
       input.path,
       input.mode as WriteMode,
-      payload ?? new Uint8Array(),
+      payload,
+      input.permission,
     );
   }
 

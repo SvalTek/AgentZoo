@@ -116,7 +116,9 @@ export async function readLines(
   const text = decodeText(content, label);
   const lines = splitLines(text);
   const totalLines = lines.length;
-  if (requestedStart > totalLines) {
+  // An empty file has no lines, but reading line 1 is an empty page rather
+  // than an out-of-range error.
+  if (requestedStart > Math.max(totalLines, 1)) {
     throw new HostError(
       "range",
       `${label} has ${totalLines} lines, but startLine was ${requestedStart}`,

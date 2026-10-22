@@ -349,3 +349,37 @@ Deno.test("fs.remove unlinks files and links without following them", async () =
     await Deno.remove(base, { recursive: true });
   }
 });
+
+Deno.test("fs.read returns an empty page for line 1 of an empty file", async () => {
+  const { base, context } = await fixture({ "empty.txt": "" });
+  try {
+    const read = await executeOperation(context, "fs.read", "alpha", {
+      path: "/empty.txt",
+      unit: "lines",
+      startLine: 1,
+      lineLimit: 10,
+    });
+    assertEquals(read.result, {
+      unit: "lines",
+      startLine: 1,
+      linesReturned: 0,
+      totalLines: 0,
+      truncated: false,
+    });
+    assertEquals(read.payload?.length, 0);
+
+    await assertRejects(
+      () =>
+        executeOperation(context, "fs.read", "alpha", {
+          path: "/empty.txt",
+          unit: "lines",
+          startLine: 2,
+          lineLimit: 10,
+        }),
+      HostError,
+      "startLine was 2",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});

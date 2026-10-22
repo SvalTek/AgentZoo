@@ -412,6 +412,7 @@ Use these structured tools for ordinary file and directory work instead of shell
                     path: input.path!,
                     bytesWritten: bytes.length,
                     sizeBytes: bytes.length,
+                    created: false,
                     mode,
                     message:
                       "The file already existed with identical content; nothing changed.",
@@ -674,7 +675,7 @@ Use these structured tools for ordinary file and directory work instead of shell
               raw,
             );
             const allLines = splitTextLines(content);
-            if (startLine > allLines.length) {
+            if (startLine > Math.max(allLines.length, 1)) {
               throw actionableToolError([
                 "No lines were read: startLine is beyond the end of the file.",
                 `startLine was ${startLine}, but the file has ${allLines.length} lines.`,
@@ -1291,16 +1292,30 @@ export function normalizePatchHunks(patch: string): string {
       lines[index],
     );
     if (!header) continue;
+    const isFileHeader = (position: number) =>
+      lines[position]?.startsWith("--- ") &&
+      lines[position + 1]?.startsWith("+++ ");
     let oldLines = 0;
     let newLines = 0;
     let cursor = index + 1;
     for (; cursor < lines.length; cursor++) {
       const line = lines[cursor];
-      if (/^(?:@@ |diff |Index: |--- )/.test(line)) break;
+      if (/^(?:@@ |diff |Index: )/.test(line)) break;
+      if (isFileHeader(cursor)) break;
+      if (line === "") {
+        // A blank line can be an empty context line, or the separator before
+        // the next file header. Anything else is context.
+        let lookahead = cursor;
+        while (lookahead < lines.length && lines[lookahead] === "") lookahead++;
+        if (isFileHeader(lookahead)) break;
+        oldLines++;
+        newLines++;
+        continue;
+      }
       if (line.startsWith("\\")) continue;
       if (line.startsWith("-")) oldLines++;
       else if (line.startsWith("+")) newLines++;
-      else if (line.startsWith(" ") || line === "") {
+      else if (line.startsWith(" ")) {
         oldLines++;
         newLines++;
       } else {
@@ -1657,10 +1672,14 @@ async function rollbackPatchHost(
       if (file.before === null) {
         await host.remove(file.path);
       } else {
+        const permission = file.mode === null
+          ? undefined
+          : Number.parseInt(file.mode, 8);
         await host.write(
           file.path,
           "overwrite",
           new TextEncoder().encode(file.before),
+          permission === undefined ? undefined : { permission },
         );
       }
     } catch {

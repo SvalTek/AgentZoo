@@ -102,6 +102,29 @@ Deno.test("fs.search finds files by name glob", async () => {
   }
 });
 
+Deno.test("fs.search name globs support character classes", async () => {
+  const { base, context } = await fixture(async (root) => {
+    await Deno.writeTextFile(`${root}/ab.txt`, "");
+    await Deno.writeTextFile(`${root}/ac.txt`, "");
+    await Deno.writeTextFile(`${root}/ad.txt`, "");
+  });
+  try {
+    const found = await executeOperation(context, "fs.search", "alpha", {
+      path: "/",
+      kind: "name",
+      name: "a[bc].txt",
+    });
+    assertEquals(
+      (found.result.results as Array<{ path: string }>).map((result) =>
+        result.path
+      ),
+      ["/ab.txt", "/ac.txt"],
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
+
 Deno.test("fs.search finds literal text with line numbers", async () => {
   const { base, context } = await fixture();
   try {

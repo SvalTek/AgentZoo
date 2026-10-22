@@ -246,6 +246,16 @@ export function createRuntimeHostServer(
         ? undefined
         : payloads.get(payloadSeq);
       if (payloadSeq !== undefined) payloads.delete(payloadSeq);
+      if (payloadSeq !== undefined && payload === undefined) {
+        send(failure(
+          id,
+          new HostError(
+            "invalid_request",
+            `payload frame ${payloadSeq} was not received`,
+          ),
+        ));
+        return;
+      }
       sequence = (sequence + 1) >>> 0 || 1;
       try {
         const result = await executeOperation(
