@@ -219,6 +219,18 @@ export interface RuntimeFiles {
     readonly truncated: boolean;
     readonly nextOffset?: number;
   }>;
+  readLines(
+    path: string,
+    startLine: number,
+    lineLimit: number,
+  ): Promise<{
+    readonly text: string;
+    readonly startLine: number;
+    readonly linesReturned: number;
+    readonly totalLines: number;
+    readonly truncated: boolean;
+    readonly nextLine?: number;
+  }>;
   list(
     path: string,
     limit?: number,

@@ -20,12 +20,18 @@ import { RuntimeFilesError } from "../RuntimeHostFiles.ts";
 const PathParameter = z.string().optional().describe(
   "The file path for this operation. Required for execution. Use an absolute path or a path relative to the current working directory.",
 );
-const ReadParameters = z.object({
+const ReadParameters = z.looseObject({
   path: PathParameter,
-  offset: z.number().int().nonnegative().optional().describe(
-    "The zero-based byte offset at which to begin reading. Defaults to 0.",
+  startLine: z.number().int().positive().optional().describe(
+    "The 1-based line number at which to begin reading. Use with lineLimit. Defaults to 1.",
   ),
-  limit: z.number().int().positive().max(262_144).optional().describe(
+  lineLimit: z.number().int().positive().max(20_000).optional().describe(
+    "The maximum number of lines to read. Defaults to 2000 and cannot exceed 20000.",
+  ),
+  byteOffset: z.number().int().nonnegative().optional().describe(
+    "The zero-based byte offset at which to begin reading. Use with byteLimit. Byte ranges can split a UTF-8 character, so prefer lines for text.",
+  ),
+  byteLimit: z.number().int().positive().max(262_144).optional().describe(
     "The maximum number of bytes to read. Defaults to 65536 and cannot exceed 262144.",
   ),
 });
@@ -86,6 +92,8 @@ const SearchParameters = z.object({
     "The maximum number of results to return. Defaults to 50 and cannot exceed 200.",
   ),
 });
+
+const MAX_LINE_FILE_BYTES = 33_554_432;
 
 const READ_SCRIPT = String.raw`
 path=$1 offset=$2 limit=$3
@@ -296,6 +304,14 @@ Use these structured tools for ordinary file and directory work instead of shell
         "No bytes were read: the read could not be prepared.",
         "Retry the read, or use shell when the problem persists.",
       ],
+      43: [
+        "The file is too large for line reading.",
+        "Use byteOffset and byteLimit for a bounded byte window.",
+      ],
+      44: [
+        "The file could not be read as text.",
+        "Use shell for binary data or choose a UTF-8 text file.",
+      ],
     };
     const directoryFailures: Record<number, ToolFeedback> = {
       40: [
@@ -374,6 +390,7 @@ Use these structured tools for ordinary file and directory work instead of shell
                 path: input.path!,
                 bytesWritten: bytes.length,
                 sizeBytes: written.sizeBytes,
+                created: written.created,
                 mode,
                 message: mode === "overwrite"
                   ? "Complete file replacement finished. Read or test this file before another write."
@@ -381,6 +398,39 @@ Use these structured tools for ordinary file and directory work instead of shell
               };
               return observedToolResult(result, { host: "fs.write", result });
             } catch (error) {
+              if (
+                mode === "create" && error instanceof RuntimeFilesError &&
+                error.code === "conflict"
+              ) {
+                const existing = await inspectExistingFile(
+                  files,
+                  target,
+                  bytes,
+                );
+                if (existing === "identical") {
+                  const result = {
+                    path: input.path!,
+                    bytesWritten: bytes.length,
+                    sizeBytes: bytes.length,
+                    mode,
+                    message:
+                      "The file already existed with identical content; nothing changed.",
+                  };
+                  return observedToolResult(result, {
+                    host: "fs.write",
+                    result,
+                  });
+                }
+                if (existing !== undefined) {
+                  throw actionableToolError([
+                    ...writeFailures[54],
+                    `The existing file has ${existing.sizeBytes} bytes and was modified ${
+                      new Date(existing.mtimeMs ?? Date.now()).toISOString()
+                    }.`,
+                    "Its content differs from the content in this call.",
+                  ], { error });
+                }
+              }
               throwHostFailure(error, {
                 not_found: writeFailures[43],
                 not_a_file: writeFailures[41],
@@ -420,6 +470,7 @@ Use these structured tools for ordinary file and directory work instead of shell
             path: input.path!,
             bytesWritten: new TextEncoder().encode(content).length,
             sizeBytes: Number(raw.stdout.trim()),
+            created: mode === "create",
             mode,
             message: mode === "overwrite"
               ? "Complete file replacement finished. Read or test this file before another write."
@@ -472,7 +523,13 @@ Use these structured tools for ordinary file and directory work instead of shell
                   input.replaceAll ?? false,
                 );
                 if (outcome.failure !== undefined) {
-                  throw actionableToolError(editFailures[outcome.failure]);
+                  const hints = outcome.failure === 44
+                    ? describeMissingMatch(content, oldText)
+                    : describeAmbiguousMatch(content, oldText);
+                  throw actionableToolError([
+                    ...editFailures[outcome.failure],
+                    ...hints,
+                  ]);
                 }
                 try {
                   await files.write(
@@ -537,22 +594,120 @@ Use these structured tools for ordinary file and directory work instead of shell
       tool<AgentRunDeps, typeof ReadParameters>({
         name: "read_file",
         description:
-          "Read a bounded section of a UTF-8 text file. offset, limit, and nextOffset are byte positions: offset is the zero-based byte at which reading starts, limit is the maximum number of bytes, and nextOffset is the offset to pass to continue when truncated is true. Returns content, offset, bytesRead, sizeBytes, truncated, and nextOffset while more data remains.",
+          "Read a UTF-8 text file. Choose one unit. For lines, pass startLine (1-based) and lineLimit; the default is line mode from line 1, 2000 lines. For bytes, pass byteOffset (0-based) and byteLimit. The units are mutually exclusive: offset never means lines. Returns content plus unit metadata: startLine, linesReturned, totalLines, nextLine for lines; offset, bytesRead, sizeBytes, nextByteOffset for bytes. truncated is true when more data remains.",
         parameters: ReadParameters,
-        argsValidator: (input) => requirePath(input.path, "read"),
+        argsValidator: validateReadArguments,
         execute: async (context, input) => {
-          const offset = input.offset ?? 0;
-          const limit = input.limit ?? 65_536;
+          validateReadArguments(input);
           const files = context.deps.runtime.files;
-          const target = resolveRuntimeDirectory(
-            context.deps.cwd,
-            input.path!,
-          );
+          const target = resolveRuntimeDirectory(context.deps.cwd, input.path!);
+          const byteUnit = input.byteOffset !== undefined ||
+            input.byteLimit !== undefined;
+          if (!byteUnit) {
+            const startLine = input.startLine ?? 1;
+            const lineLimit = input.lineLimit ?? 2_000;
+            if (files && useHostFiles(target)) {
+              try {
+                const page = await files.readLines(
+                  target,
+                  startLine,
+                  lineLimit,
+                );
+                const result = {
+                  path: input.path!,
+                  unit: "lines" as const,
+                  content: page.text,
+                  startLine: page.startLine,
+                  linesReturned: page.linesReturned,
+                  totalLines: page.totalLines,
+                  truncated: page.truncated,
+                  ...(page.nextLine === undefined
+                    ? {}
+                    : { nextLine: page.nextLine }),
+                };
+                return observedToolResult(result, { host: "fs.read", result });
+              } catch (error) {
+                throwHostFailure(error, {
+                  not_found: readFailures[40],
+                  not_a_file: readFailures[41],
+                  range: [
+                    "No lines were read: startLine is beyond the end of the file.",
+                    `startLine was ${startLine}.`,
+                    "Read from line 1 or use a line number within the file.",
+                  ],
+                  too_large: [
+                    "The file is too large for line reading.",
+                    "Use byteOffset and byteLimit for a bounded byte window.",
+                  ],
+                  binary: [
+                    "The file is not suitable for text reading.",
+                    "Use shell for binary data or choose a UTF-8 text file.",
+                  ],
+                  invalid_utf8: [
+                    "The file is not valid UTF-8 text.",
+                    "Use shell for binary data or choose a UTF-8 text file.",
+                  ],
+                  permission_denied: [
+                    "The file could not be read: permission denied.",
+                    "Check the file permissions or use shell for files this computer cannot read.",
+                  ],
+                });
+              }
+            }
+            const raw = await execute(
+              context.deps,
+              [
+                "/bin/bash",
+                "-c",
+                READ_TEXT_SCRIPT,
+                "read_file",
+                input.path!,
+                String(MAX_LINE_FILE_BYTES),
+              ],
+              undefined,
+              undefined,
+              readFailures,
+            );
+            const [, encoded = ""] = raw.stdout.split("\n", 2);
+            const content = decodeTextFile(
+              encoded.replaceAll(/\s+/g, ""),
+              raw,
+            );
+            const allLines = splitTextLines(content);
+            if (startLine > allLines.length) {
+              throw actionableToolError([
+                "No lines were read: startLine is beyond the end of the file.",
+                `startLine was ${startLine}, but the file has ${allLines.length} lines.`,
+                "Read from line 1 or use a line number within the file.",
+              ], { command: raw });
+            }
+            const selected = allLines.slice(
+              startLine - 1,
+              startLine - 1 + lineLimit,
+            );
+            const truncated = startLine - 1 + selected.length <
+              allLines.length;
+            const result = {
+              path: input.path!,
+              unit: "lines" as const,
+              content: selected.join(""),
+              startLine,
+              linesReturned: selected.length,
+              totalLines: allLines.length,
+              truncated,
+              ...(truncated ? { nextLine: startLine + selected.length } : {}),
+            };
+            return observedToolResult(result, { command: raw, result });
+          }
+
+          const offset = input.byteOffset ?? 0;
+          const limit = input.byteLimit ?? 65_536;
           if (files && useHostFiles(target)) {
             try {
               const read = await files.readBytes(target, offset, limit);
               const result = {
                 path: input.path!,
+                unit: "bytes" as const,
                 content: new TextDecoder().decode(read.bytes),
                 offset: read.offset,
                 bytesRead: read.bytes.length,
@@ -560,7 +715,7 @@ Use these structured tools for ordinary file and directory work instead of shell
                 truncated: read.truncated,
                 ...(read.nextOffset === undefined
                   ? {}
-                  : { nextOffset: read.nextOffset }),
+                  : { nextByteOffset: read.nextOffset }),
               };
               return observedToolResult(result, { host: "fs.read", result });
             } catch (error) {
@@ -579,11 +734,11 @@ Use these structured tools for ordinary file and directory work instead of shell
                 invalid_utf8: [
                   "The requested byte range is not valid UTF-8.",
                   "The file may be binary, or offset and limit may split a multibyte character.",
-                  "Read from offset 0 or choose a different byte range before retrying.",
+                  "Use startLine and lineLimit for line-oriented reads.",
                 ],
                 too_large: [
                   "The requested byte range is too large for one response.",
-                  "Reduce limit or use shell for the file.",
+                  "Reduce byteLimit or use shell for the file.",
                 ],
                 permission_denied: [
                   "The file could not be read: permission denied.",
@@ -594,21 +749,19 @@ Use these structured tools for ordinary file and directory work instead of shell
                   "Use a path inside the environment.",
                 ],
               });
-              // Transport failure: fall back to the exec path below.
             }
           }
-          const command = [
-            "/bin/bash",
-            "-c",
-            READ_SCRIPT,
-            "read_file",
-            input.path!,
-            String(offset),
-            String(limit),
-          ];
           const raw = await execute(
             context.deps,
-            command,
+            [
+              "/bin/bash",
+              "-c",
+              READ_SCRIPT,
+              "read_file",
+              input.path!,
+              String(offset),
+              String(limit),
+            ],
             undefined,
             undefined,
             readFailures,
@@ -622,56 +775,38 @@ Use these structured tools for ordinary file and directory work instead of shell
               "Read from offset 0 or use an offset no greater than the file size.",
             ], { command: raw });
           }
-          let bytes: Uint8Array;
-          try {
-            bytes = Uint8Array.from(
-              atob(encoded.trim()),
-              (char) => char.charCodeAt(0),
-            );
-          } catch {
-            throw actionableToolError(
-              [
-                "The file contents could not be decoded.",
-                "Use shell for binary data or retry read_file with a valid text file.",
-              ],
-              { command: raw },
-            );
-          }
+          const bytes = decodeBase64Bytes(encoded.trim());
           if (bytes.includes(0)) {
-            throw actionableToolError(
-              [
-                "The file is not suitable for text reading.",
-                "Use shell for binary data or choose a UTF-8 text file.",
-              ],
-              { command: raw },
-            );
+            throw actionableToolError([
+              "The file is not suitable for text reading.",
+              "Use shell for binary data or choose a UTF-8 text file.",
+            ], { command: raw });
           }
           let content: string;
           try {
             content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
           } catch {
-            throw actionableToolError(
-              [
-                "The requested byte range is not valid UTF-8.",
-                "The file may be binary, or offset and limit may split a multibyte character.",
-                "Read from offset 0 or choose a different byte range before retrying.",
-              ],
-              { command: raw },
-            );
+            throw actionableToolError([
+              "The requested byte range is not valid UTF-8.",
+              "The file may be binary, or offset and limit may split a multibyte character.",
+              "Use startLine and lineLimit for line-oriented reads.",
+            ], { command: raw });
           }
           const truncated = offset + bytes.length < sizeBytes;
           const result = {
             path: input.path!,
+            unit: "bytes" as const,
             content,
             offset,
             bytesRead: bytes.length,
             sizeBytes,
             truncated,
-            ...(truncated ? { nextOffset: offset + bytes.length } : {}),
+            ...(truncated ? { nextByteOffset: offset + bytes.length } : {}),
           };
           return observedToolResult(result, { command: raw, result });
         },
       }),
+
       tool<AgentRunDeps, typeof ListParameters>({
         name: "list_directory",
         description:
@@ -850,6 +985,107 @@ function useHostFiles(path: string): boolean {
   );
 }
 
+function lineNumberAt(content: string, index: number): number {
+  let line = 1;
+  for (let cursor = 0; cursor < index; cursor++) {
+    if (content[cursor] === "\n") line++;
+  }
+  return line;
+}
+
+function matchLineNumbers(content: string, text: string): number[] {
+  const lines: number[] = [];
+  let start = 0;
+  while (true) {
+    const index = content.indexOf(text, start);
+    if (index < 0) break;
+    lines.push(lineNumberAt(content, index));
+    start = index + text.length;
+  }
+  return lines;
+}
+
+/** Concrete hints for an exact match that was not found. */
+function describeMissingMatch(content: string, oldText: string): string[] {
+  const hints: string[] = [];
+  if (content.includes("\r\n") && !oldText.includes("\r\n")) {
+    const normalized = oldText.replaceAll("\r\n", "\n").replaceAll(
+      "\n",
+      "\r\n",
+    );
+    if (content.includes(normalized)) {
+      hints.push(
+        "The text matches after CRLF normalization; this file uses CRLF line endings.",
+      );
+    }
+  }
+  const wanted = oldText.split("\n").find((line) => line.trim().length > 0);
+  const contentLines = content.split("\n");
+  if (wanted !== undefined) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    for (let index = 0; index < contentLines.length; index++) {
+      const candidate = contentLines[index];
+      const limit = Math.min(candidate.length, wanted.length);
+      let score = 0;
+      while (score < limit && candidate[score] === wanted[score]) score++;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    }
+    if (bestIndex >= 0 && bestScore >= 2) {
+      hints.push(
+        `Closest current line (line ${bestIndex + 1}): ${
+          JSON.stringify(contentLines[bestIndex].slice(0, 160))
+        }`,
+      );
+      hints.push(
+        `Requested text starts with: ${JSON.stringify(wanted.slice(0, 160))}`,
+      );
+    }
+  }
+  if (content.includes("\r\n")) hints.push("The file uses CRLF line endings.");
+  hints.push(
+    `The file has ${contentLines.length} lines; read it again and copy the exact current text.`,
+  );
+  return hints;
+}
+
+/** Concrete hints for an exact match that occurs more than once. */
+function describeAmbiguousMatch(content: string, oldText: string): string[] {
+  const lineNumbers = matchLineNumbers(content, oldText);
+  const shown = lineNumbers.slice(0, 8).join(", ");
+  return [
+    `The text occurs ${lineNumbers.length} times (lines ${shown}${
+      lineNumbers.length > 8 ? ", …" : ""
+    }).`,
+    "Include enough surrounding text to identify one occurrence, or set replaceAll to true.",
+  ];
+}
+
+async function inspectExistingFile(
+  files: RuntimeFiles,
+  path: string,
+  bytes: Uint8Array,
+): Promise<
+  "identical" | { sizeBytes: number; mtimeMs: number | null } | undefined
+> {
+  try {
+    const stat = await files.stat(path);
+    if (stat.type !== "file") return undefined;
+    if (stat.sizeBytes !== bytes.length) {
+      return { sizeBytes: stat.sizeBytes, mtimeMs: stat.mtimeMs };
+    }
+    const existing = await files.readText(path, Math.max(stat.sizeBytes, 1));
+    return existing === new TextDecoder().decode(bytes)
+      ? "identical"
+      : { sizeBytes: stat.sizeBytes, mtimeMs: stat.mtimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Exact-text replacement in the file's own line endings. Returns a failure
  * code used by edit_file's existing feedback when the match is missing or
@@ -912,6 +1148,28 @@ function requirePath(
   throw actionableToolError(
     ["No file path was provided.", `Provide the file to ${operation} in path.`],
   );
+}
+
+function validateReadArguments(input: z.infer<typeof ReadParameters>): void {
+  requirePath(input.path, "read");
+  const legacy = input as Record<string, unknown>;
+  if (legacy.offset !== undefined || legacy.limit !== undefined) {
+    throw actionableToolError([
+      "offset and limit are no longer read_file parameters.",
+      "They were byte positions, which is easy to confuse with line numbers.",
+      "Use byteOffset and byteLimit for bytes, or startLine and lineLimit for lines.",
+    ]);
+  }
+  const byteUnit = input.byteOffset !== undefined ||
+    input.byteLimit !== undefined;
+  const lineUnit = input.startLine !== undefined ||
+    input.lineLimit !== undefined;
+  if (byteUnit && lineUnit) {
+    throw actionableToolError([
+      "Choose one unit: byteOffset/byteLimit or startLine/lineLimit.",
+      "They cannot be combined in one read.",
+    ]);
+  }
 }
 
 function validateWriteArguments(input: z.infer<typeof WriteParameters>): void {
@@ -994,6 +1252,50 @@ async function execute(
   throw new ToolExecutionError("The operation failed.", { command: raw });
 }
 
+/**
+ * Check each hunk's declared line counts against its body before jsdiff runs.
+ * jsdiff reports a stray line far from the actual mistake ("Unknown line 19"),
+ * which gives the model nothing to repair.
+ */
+function validatePatchHunks(patch: string): void {
+  // A trailing newline terminates the patch; an empty line inside a hunk is a
+  // context line for an empty source line.
+  const lines = (patch.endsWith("\n") ? patch.slice(0, -1) : patch).split("\n");
+  let hunk = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(
+      lines[index],
+    );
+    if (!header) continue;
+    hunk++;
+    const declaredOld = header[2] === undefined ? 1 : Number(header[2]);
+    const declaredNew = header[4] === undefined ? 1 : Number(header[4]);
+    let oldLines = 0;
+    let newLines = 0;
+    let cursor = index + 1;
+    for (; cursor < lines.length; cursor++) {
+      const line = lines[cursor];
+      if (/^(?:@@ |diff |Index: |--- )/.test(line)) break;
+      if (line.startsWith("\\")) continue;
+      if (line.startsWith("-")) oldLines++;
+      else if (line.startsWith("+")) newLines++;
+      else if (line.startsWith(" ") || line === "") {
+        oldLines++;
+        newLines++;
+      } else break;
+    }
+    if (oldLines !== declaredOld || newLines !== declaredNew) {
+      throw actionableToolError([
+        `No files were changed: hunk ${hunk} (line ${index + 1}, ${
+          lines[index]
+        }) declares ${declaredOld} old and ${declaredNew} new lines but contains ${oldLines} old and ${newLines} new.`,
+        "Recount the hunk body or split it into smaller hunks.",
+        "Every context line, including an empty one, must start with a space.",
+      ], { hunk });
+    }
+  }
+}
+
 const PATCH_FILE_LIMIT = 33_554_432;
 
 interface StagedPatchFile {
@@ -1025,6 +1327,7 @@ async function stagePatch(
   // unterminated patches are normalised to LF before parsing.
   const normalizedPatch = (patch.endsWith("\n") ? patch : `${patch}\n`)
     .replaceAll("\r\n", "\n");
+  validatePatchHunks(normalizedPatch);
   let files;
   try {
     files = parsePatch(normalizedPatch);
@@ -1599,6 +1902,37 @@ function encodeBase64(value: string): string {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
   }
   return btoa(binary);
+}
+
+function splitTextLines(text: string): string[] {
+  const lines: string[] = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index++) {
+    if (text[index] === "\n") {
+      lines.push(text.slice(start, index + 1));
+      start = index + 1;
+    }
+  }
+  if (start < text.length) lines.push(text.slice(start));
+  return lines;
+}
+
+function decodeTextFile(encoded: string, raw: CommandResult): string {
+  const bytes = decodeBase64Bytes(encoded);
+  if (bytes.includes(0)) {
+    throw actionableToolError([
+      "The file is not suitable for text reading.",
+      "Use shell for binary data or choose a UTF-8 text file.",
+    ], { command: raw });
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw actionableToolError([
+      "The file is not valid UTF-8 text.",
+      "Use shell for binary data or choose a UTF-8 text file.",
+    ], { command: raw });
+  }
 }
 
 function decodeBase64Bytes(value: string): Uint8Array {

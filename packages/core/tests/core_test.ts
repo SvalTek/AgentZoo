@@ -126,6 +126,7 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
     genericTools.map((tool) => tool.name),
     [
       "shell",
+      "bash",
       "start_background",
       "stop_background",
       "get_background",
@@ -241,6 +242,7 @@ Deno.test("Vibes preserves provider-facing tool definition order", async () => {
   await agent.run("Inspect the available functions.");
   assertEquals(renderedTools.map((tool) => tool.name), [
     "shell",
+    "bash",
     "start_background",
     "stop_background",
     "get_background",
@@ -493,6 +495,24 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   );
   assert(ambiguousText.message.includes("replaceAll"));
 
+  const patchTool = tools.find((tool) => tool.name === "apply_patch")!;
+  const badHunk = await assertRejects(
+    () =>
+      patchTool.execute!(failingContext(49), {
+        patch: [
+          "--- a/note.txt",
+          "+++ b/note.txt",
+          "@@ -1,1 +1,1 @@",
+          " one",
+          " two",
+        ].join("\n"),
+        cwd: "/root",
+      }),
+    ToolExecutionError,
+    "declares 1 old and 1 new lines but contains 2 old and 2 new",
+  );
+  assert(badHunk.message.includes("hunk 1"));
+
   const http = tools.find((tool) => tool.name === "http_request")!;
   const malformedHttp = http.parameters.safeParse({ url: "not a URL" });
   assert(malformedHttp.success, "diagnosable URLs must reach argsValidator");
@@ -581,9 +601,10 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   for (
     const term of [
       "UTF-8",
-      "Defaults to 0",
+      "Defaults to 1",
       "Defaults to 65536",
-      "nextOffset",
+      "nextByteOffset",
+      "startLine",
     ]
   ) assert(exposed.read_file.includes(term));
 
@@ -1893,8 +1914,10 @@ Deno.test("parseConfig: rejects invalid param type", () => {
 
 Deno.test("ShellFeature: emits only shell when no configured tools", async () => {
   const tools = await new ShellFeature().createTools();
-  assertEquals(tools.length, 5);
+  assertEquals(tools.length, 6);
   assertEquals(tools[0].name, "shell");
+  assertEquals(tools[1].name, "bash");
+  assertEquals(tools[1].execute, tools[0].execute);
   const background = [
     "start_background",
     "stop_background",
@@ -1933,10 +1956,11 @@ Deno.test("ShellFeature: emits raw shell plus configured tools", async () => {
       },
     },
   }).createTools();
-  assertEquals(tools.length, 7);
+  assertEquals(tools.length, 8);
   assertEquals(tools[0].name, "shell");
-  assertEquals(tools[1].name, "search_code");
-  assertEquals(tools[2].name, "run_linter");
+  assertEquals(tools[1].name, "bash");
+  assertEquals(tools[2].name, "search_code");
+  assertEquals(tools[3].name, "run_linter");
   const background = [
     "start_background",
     "stop_background",

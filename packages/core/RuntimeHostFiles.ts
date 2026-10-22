@@ -133,6 +133,36 @@ export class RuntimeHostFiles implements RuntimeFiles {
     return parts.join("");
   }
 
+  async readLines(
+    path: string,
+    startLine: number,
+    lineLimit: number,
+  ): Promise<{
+    readonly text: string;
+    readonly startLine: number;
+    readonly linesReturned: number;
+    readonly totalLines: number;
+    readonly truncated: boolean;
+    readonly nextLine?: number;
+  }> {
+    const { result, payload } = await this.#request("fs.read", {
+      path,
+      unit: "lines",
+      startLine,
+      lineLimit,
+    });
+    return {
+      text: new TextDecoder().decode(payload),
+      startLine: numberField(result, "startLine"),
+      linesReturned: numberField(result, "linesReturned"),
+      totalLines: numberField(result, "totalLines"),
+      truncated: result.truncated === true,
+      ...(typeof result.nextLine === "number"
+        ? { nextLine: result.nextLine }
+        : {}),
+    };
+  }
+
   async write(
     path: string,
     mode: "create" | "overwrite" | "append",

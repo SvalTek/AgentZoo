@@ -1,6 +1,7 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
 import type { ToolDefinition } from "@vibesjs/sdk";
+import { withToolAliases } from "../ToolSupport.ts";
 import { TextTemplate } from "@agent-zoo/shared";
 import { z } from "zod";
 import type { AgentRunDeps } from "../Agent.ts";
@@ -101,7 +102,11 @@ Use dedicated command tools when one directly matches the operation. Use the she
       configured.push(await this.createConfiguredTool(name, config));
     }
     const background = await this.createBackgroundTools();
-    return [builtIn, ...configured, ...background];
+    return [
+      ...withToolAliases(builtIn, ["bash"]),
+      ...configured,
+      ...background,
+    ];
   }
 
   async createTool(): Promise<ToolDefinition<AgentRunDeps>> {
@@ -227,7 +232,11 @@ Use dedicated command tools when one directly matches the operation. Use the she
         );
         if (result.exitCode !== 0) {
           const message = result.stderr.trim();
-          if (/can't find (session|pane)|no such (session|pane)|not found/i.test(message)) {
+          if (
+            /can't find (session|pane)|no such (session|pane)|not found/i.test(
+              message,
+            )
+          ) {
             return observedToolResult({
               name: params.name,
               status: "not_found",
@@ -270,7 +279,9 @@ Use dedicated command tools when one directly matches the operation. Use the she
           { cwd: context.deps.cwd },
         );
         const panes = await context.deps.runtime.exec(
-          `tmux list-panes -t ${shellQuote(params.name)} -F '#{pane_dead} #{pane_dead_status}'`,
+          `tmux list-panes -t ${
+            shellQuote(params.name)
+          } -F '#{pane_dead} #{pane_dead_status}'`,
           { cwd: context.deps.cwd },
         );
         const [deadFlag = "0", deadStatus = ""] = panes.stdout.trim().split(
@@ -316,7 +327,11 @@ Use dedicated command tools when one directly matches the operation. Use the she
         );
         if (result.exitCode !== 0) {
           const message = result.stderr.trim();
-          if (/can't find (session|pane)|no such (session|pane)|not found/i.test(message)) {
+          if (
+            /can't find (session|pane)|no such (session|pane)|not found/i.test(
+              message,
+            )
+          ) {
             return observedToolResult({
               name: params.name,
               status: "not_found",

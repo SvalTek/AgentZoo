@@ -299,12 +299,38 @@ Deno.test({
 
       const bounded = await invoke(alpha, "read_file", {
         path: "/root/private-tool",
-        offset: 2,
-        limit: 3,
+        byteOffset: 2,
+        byteLimit: 3,
       });
       assertEquals(bounded.content, "iva");
       assertEquals(bounded.truncated, true);
-      assertEquals(bounded.nextOffset, 5);
+      assertEquals(bounded.nextByteOffset, 5);
+
+      await assertRejects(
+        () =>
+          invoke(alpha, "read_file", {
+            path: "/root/private-tool",
+            offset: 2,
+          }),
+        Error,
+        "no longer read_file parameters",
+      );
+
+      await alpha.exec([
+        "/bin/bash",
+        "-c",
+        "printf 'one\ntwo\nthree\n' > /root/lines.txt",
+      ]);
+      const linesPage = await invoke(alpha, "read_file", {
+        path: "/root/lines.txt",
+        startLine: 2,
+        lineLimit: 1,
+      });
+      assertEquals(linesPage.content, "two\n");
+      assertEquals(linesPage.startLine, 2);
+      assertEquals(linesPage.totalLines, 3);
+      assertEquals(linesPage.truncated, true);
+      assertEquals(linesPage.nextLine, 3);
 
       const hostListing = await invoke(alpha, "list_directory", {
         path: "/root",
@@ -362,6 +388,12 @@ Deno.test({
         (await alpha.exec(["/bin/cat", "/root/written"])).stdout,
         "one-two",
       );
+      const idempotent = await invoke(alpha, "write_file", {
+        path: "/root/written",
+        content: "one-two",
+      });
+      assertEquals(idempotent.sizeBytes, 7);
+      assert(String(idempotent.message).includes("identical"));
       await assertRejects(
         () =>
           invoke(alpha, "write_file", {
@@ -408,7 +440,7 @@ Deno.test({
         path: "/root/editable",
         content: "same same",
       });
-      await assertRejects(
+      const missingEdit = await assertRejects(
         () =>
           invoke(alpha, "edit_file", {
             path: "/root/editable",
@@ -418,6 +450,7 @@ Deno.test({
         Error,
         "The requested text was not found",
       );
+      assert(String(missingEdit.message).includes("The file has"));
       await assertRejects(
         () =>
           invoke(alpha, "edit_file", {
