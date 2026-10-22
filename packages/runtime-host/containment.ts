@@ -14,6 +14,8 @@ import { resolveExisting } from "./paths.ts";
 
 const SYS_OPENAT2 = 437n;
 const O_RDONLY = 0;
+const O_WRONLY = 0x1;
+const O_APPEND = 0x400;
 const O_CLOEXEC = 0x80000;
 const O_NONBLOCK = 0x800;
 const O_DIRECTORY = 0x10000;
@@ -80,6 +82,7 @@ function openBeneath(
   root: string,
   requested: string,
   directory: boolean,
+  append = false,
 ): number {
   const symbols = libc();
   const rootFd = Number(symbols.syscall(
@@ -99,7 +102,10 @@ function openBeneath(
       BigInt(rootFd),
       encodePath(relative),
       openHow(
-        O_RDONLY | O_CLOEXEC | O_NONBLOCK | (directory ? O_DIRECTORY : 0),
+        (append
+          ? O_WRONLY | O_APPEND
+          : O_RDONLY | (directory ? O_DIRECTORY : 0)) |
+          O_CLOEXEC | O_NONBLOCK,
         RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
       ),
       BigInt(OPEN_HOW_SIZE),
@@ -125,6 +131,8 @@ export interface OpenedTarget {
 export interface OpenTargetOptions {
   readonly requireFile?: boolean;
   readonly requireDirectory?: boolean;
+  /** Open an existing regular file for appending instead of reading. */
+  readonly append?: boolean;
 }
 
 /**
@@ -151,7 +159,9 @@ export async function openTarget(
         `"${requested}" is not a directory`,
       );
     }
-    const file = options.requireFile
+    const file = options.append
+      ? await Deno.open(resolved.path, { write: true, append: true })
+      : options.requireFile
       ? await Deno.open(resolved.path, { read: true })
       : undefined;
     return {
@@ -164,7 +174,12 @@ export async function openTarget(
     };
   }
 
-  const fd = openBeneath(root, requested, options.requireDirectory === true);
+  const fd = openBeneath(
+    root,
+    requested,
+    options.requireDirectory === true,
+    options.append === true,
+  );
   if (fd < 0) {
     // The lexical pass succeeded, so classify the refusal from the resolved
     // referent; the kernel still made the security decision.
@@ -206,7 +221,9 @@ export async function openTarget(
         `"${requested}" is not a directory`,
       );
     }
-    const file = options.requireFile
+    const file = options.append
+      ? await Deno.open(procPath, { write: true, append: true })
+      : options.requireFile
       ? await Deno.open(procPath, { read: true })
       : undefined;
     return {

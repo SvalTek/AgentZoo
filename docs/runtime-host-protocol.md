@@ -194,9 +194,12 @@ truncated file. Overwrites and appends preserve the existing mode and owner.
 // -> {"path":"/root/x.py","mode":"create","created":true,"sizeBytes":4210}
 ```
 
-`mode` is `create`, `overwrite`, or `append`. A symlink target, a non-regular
-file, a missing parent, and an existing create target are refused with
-`symlink`, `not_a_file`, `not_found`, and `conflict` respectively.
+`mode` is `create`, `overwrite`, or `append`. Append writes in place with
+`O_APPEND`, keeping the inode so processes holding the file open continue to
+write to the named file; create and overwrite stage a temporary file and commit
+atomically. A symlink target, a non-regular file, a missing parent, and an
+existing create target are refused with `symlink`, `not_a_file`, `not_found`,
+and `conflict` respectively.
 
 ### `fs.remove`
 

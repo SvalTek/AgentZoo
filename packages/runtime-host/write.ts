@@ -72,36 +72,6 @@ function splitAgentPath(
   return { parent, name };
 }
 
-async function readCurrentFile(
-  targetPath: string,
-  expected: Deno.FileInfo,
-): Promise<Uint8Array> {
-  const file = await Deno.open(targetPath, { read: true });
-  try {
-    const current = await file.stat();
-    // The lstat and the open are separate calls; refuse when the path changed
-    // underneath us instead of reading a swapped target.
-    if (
-      (expected.dev !== undefined && current.dev !== undefined &&
-        expected.dev !== current.dev) ||
-      (expected.ino !== undefined && current.ino !== undefined &&
-        expected.ino !== current.ino)
-    ) {
-      throw new HostError("conflict", "the file changed while it was opened");
-    }
-    const bytes = new Uint8Array(current.size);
-    let read = 0;
-    while (read < bytes.length) {
-      const chunk = await file.read(bytes.subarray(read));
-      if (chunk === null) break;
-      read += chunk;
-    }
-    return bytes.subarray(0, read);
-  } finally {
-    file.close();
-  }
-}
-
 /**
  * Locate the descriptor that still points at the temp file, so mode and owner
  * changes act on the inode rather than on a directory entry the agent could
@@ -188,6 +158,7 @@ export async function writeAgentFile(
       lockKey(root, directory, name),
       () =>
         writeIntoDirectory(
+          root,
           directory,
           parent,
           path,
@@ -204,6 +175,7 @@ export async function writeAgentFile(
 }
 
 async function writeIntoDirectory(
+  root: string,
   directory: OpenedTarget,
   parent: string,
   path: string,
@@ -239,9 +211,39 @@ async function writeIntoDirectory(
     throw new HostError("conflict", `"${path}" already exists`);
   }
 
-  const prefix = mode === "append" && existing
-    ? await readCurrentFile(targetPath, existing)
-    : new Uint8Array();
+  if (mode === "append" && existing) {
+    // In-place O_APPEND keeps the inode, so a process that already holds the
+    // file open continues writing to the named file. The contained open plus
+    // the snapshot comparison reject a path swapped after the lstat.
+    const target = await openTarget(root, path, {
+      requireFile: true,
+      append: true,
+    });
+    try {
+      const file = target.file!;
+      const current = await file.stat();
+      const unchanged = current.size === existing.size &&
+        (existing.ino === null || current.ino === null ||
+          current.ino === existing.ino) &&
+        (current.mtime?.getTime() ?? null) ===
+          (existing.mtime?.getTime() ?? null);
+      if (!unchanged) {
+        throw new HostError(
+          "conflict",
+          `"${path}" changed while it was being appended`,
+        );
+      }
+      await writeAll(file, payload);
+      await file.sync();
+      const final = await file.stat();
+      return {
+        result: { path, mode, created: false, sizeBytes: final.size },
+      };
+    } finally {
+      target.close();
+    }
+  }
+
   const tempPath =
     `${directory.listingPath}/.agentzoo-write-${crypto.randomUUID()}`;
   try {
@@ -262,7 +264,6 @@ async function writeIntoDirectory(
       throw error;
     }
     try {
-      if (prefix.length > 0) await writeAll(file, prefix);
       await writeAll(file, payload);
       // Persist before the atomic commit; a crash after rename must not
       // leave the new name pointing at unflushed content.
@@ -287,30 +288,7 @@ async function writeIntoDirectory(
       file.close();
     }
 
-    if (mode === "append") {
-      // The lock serializes service requests; this check catches an agent
-      // process (or another writer) appending after our snapshot.
-      let current: Deno.FileInfo | undefined;
-      try {
-        current = await Deno.lstat(targetPath);
-      } catch (error) {
-        if (!(error instanceof Deno.errors.NotFound)) throw error;
-      }
-      const unchanged = existing === undefined
-        ? current === undefined
-        : current !== undefined &&
-          current.size === existing.size &&
-          (existing.ino === null || current.ino === null ||
-            current.ino === existing.ino) &&
-          (current.mtime?.getTime() ?? null) ===
-            (existing.mtime?.getTime() ?? null);
-      if (!unchanged) {
-        throw new HostError(
-          "conflict",
-          `"${path}" changed while it was being appended`,
-        );
-      }
-    } else if (mode === "overwrite" && expected !== undefined) {
+    if (mode === "overwrite" && expected !== undefined) {
       // edit_file passes the snapshot it read; refuse to replace a file that
       // changed after that read.
       let current: Deno.FileInfo | undefined;
@@ -327,7 +305,7 @@ async function writeIntoDirectory(
       }
     }
 
-    if (mode === "create") {
+    if (mode === "create" || existing === undefined) {
       try {
         await Deno.link(tempPath, targetPath);
       } catch (error) {
@@ -349,7 +327,7 @@ async function writeIntoDirectory(
       path,
       mode,
       created: existing === undefined,
-      sizeBytes: prefix.length + payload.length,
+      sizeBytes: payload.length,
     },
   };
 }

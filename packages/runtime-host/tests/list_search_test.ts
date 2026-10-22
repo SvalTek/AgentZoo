@@ -245,3 +245,28 @@ Deno.test({
     }
   },
 });
+
+Deno.test("fs.search truncates only after finding an extra match", async () => {
+  const { base, context } = await fixture();
+  try {
+    const exact = await executeOperation(context, "fs.search", "alpha", {
+      path: "/",
+      kind: "text",
+      text: "needle",
+      maxResults: 2,
+    });
+    assertEquals((exact.result.results as unknown[]).length, 2);
+    assertEquals(exact.result.truncated, false);
+
+    const overlow = await executeOperation(context, "fs.search", "alpha", {
+      path: "/",
+      kind: "text",
+      text: "needle",
+      maxResults: 1,
+    });
+    assertEquals((overlow.result.results as unknown[]).length, 1);
+    assertEquals(overlow.result.truncated, true);
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});

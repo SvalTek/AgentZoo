@@ -412,3 +412,25 @@ Deno.test("fs.write refuses a stale expected snapshot", async () => {
     await Deno.remove(base, { recursive: true });
   }
 });
+
+Deno.test("fs.write append keeps the target inode", async () => {
+  const { base, context } = await fixture({ "log.txt": "start" });
+  const root = `${base}/alpha/merged`;
+  try {
+    const before = await Deno.stat(`${root}/log.txt`);
+    await executeOperation(
+      context,
+      "fs.write",
+      "alpha",
+      { path: "/log.txt", mode: "append" },
+      new TextEncoder().encode(" more"),
+    );
+    const after = await Deno.stat(`${root}/log.txt`);
+    assertEquals(await Deno.readTextFile(`${root}/log.txt`), "start more");
+    if (before.ino !== null && after.ino !== null) {
+      assertEquals(after.ino, before.ino);
+    }
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});

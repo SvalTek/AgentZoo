@@ -113,7 +113,7 @@ async function searchTextFile(
         line: index + 1,
         snippet: truncate(lines[index].trimEnd()),
       });
-      if (state.results.length >= options.maxResults) {
+      if (state.results.length > options.maxResults) {
         state.truncated = true;
         return;
       }
@@ -142,7 +142,7 @@ async function walk(
     if (entry.isSymlink && options.kind === "name") {
       if (pattern?.test(entry.name)) {
         state.results.push({ path: agentPath, type: "symlink" });
-        if (state.results.length >= options.maxResults) {
+        if (state.results.length > options.maxResults) {
           state.truncated = true;
           return;
         }
@@ -154,7 +154,7 @@ async function walk(
       // only reports files that contain the text.
       if (options.kind === "name" && pattern?.test(entry.name)) {
         state.results.push({ path: agentPath, type: "directory" });
-        if (state.results.length >= options.maxResults) {
+        if (state.results.length > options.maxResults) {
           state.truncated = true;
           return;
         }
@@ -197,7 +197,7 @@ async function walk(
         path: agentPath,
         type: entry.isSymlink ? "symlink" : "file",
       });
-      if (state.results.length >= options.maxResults) {
+      if (state.results.length > options.maxResults) {
         state.truncated = true;
         return;
       }
@@ -226,8 +226,9 @@ export async function searchFiles(
     result: {
       path: options.path,
       kind: options.kind,
-      results: state.results,
-      truncated: state.truncated,
+      results: state.results.slice(0, options.maxResults),
+      truncated: state.truncated ||
+        state.results.length > options.maxResults,
     },
   };
 }
