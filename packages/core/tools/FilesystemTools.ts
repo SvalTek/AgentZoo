@@ -450,12 +450,17 @@ Use these structured tools for ordinary file and directory work instead of shell
                   "Use a path inside the environment.",
                 ],
               });
-              if (mode !== "overwrite") {
-                throw actionableToolError([
-                  "The write outcome is unknown: the runtime host connection failed after the request was sent.",
-                  "Read the file before retrying so content cannot be duplicated.",
-                ], { error });
+              if (!(error instanceof RuntimeFilesError)) {
+                if (mode !== "overwrite") {
+                  throw actionableToolError([
+                    "The write outcome is unknown: the runtime host connection failed after the request was sent.",
+                    "Read the file before retrying so content cannot be duplicated.",
+                  ], { error });
+                }
+                // overwrite is idempotent; fall back to the exec path below.
               }
+              // A host not_found means the parent is gone and nothing was
+              // written, so the exec path can report the real error.
               // overwrite is idempotent; fall back to the exec path below.
             }
           }
@@ -557,11 +562,23 @@ Use these structured tools for ordinary file and directory work instead of shell
                     not_found: editFailures[40],
                     not_a_file: editFailures[41],
                     symlink: editFailures[50],
+                    conflict: [
+                      "No files were changed: the file changed after it was read.",
+                      "Read the current file and retry the edit against its new contents.",
+                    ],
                     permission_denied: [
                       "No files were changed: the file could not be written.",
                       "Check the file permissions or use shell for this path.",
                     ],
                   });
+                  if (
+                    error instanceof RuntimeFilesError &&
+                    error.code === "not_found"
+                  ) {
+                    // The target or its parent disappeared before anything
+                    // was written; let the outer handler fall back to exec.
+                    throw error;
+                  }
                   throw actionableToolError([
                     "The edit outcome is unknown: the runtime host connection failed after the write was sent.",
                     "Read the file before retrying; the edit may already be applied.",
