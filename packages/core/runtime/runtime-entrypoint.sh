@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+runtime_data=/var/lib/runtime
+token_file="${runtime_data}/runtime-host.token"
+# Persist the per-container token in the data volume so it survives restarts
+# and is readable only by the runtime host, never inside an agent root.
+if [[ -d "${runtime_data}" ]]; then
+  if [[ ! -s "${token_file}" ]]; then
+    (umask 077; od -An -tx1 -N32 /dev/urandom | tr -d " \n" > "${token_file}")
+  fi
+fi
+
+# Start the resident service for the container's main process. It runs outside
+# every agent root and is restarted if it exits.
+if [[ "${1:-}" == "sleep" && -x /usr/local/bin/agentzoo-runtime-host && -s "${token_file}" ]]; then
+  (
+    fresh=1
+    while true; do
+      AGENTZOO_RUNTIME_TOKEN="$(cat "${token_file}")" \
+        AGENTZOO_LOG_FRESH="${fresh}" \
+        /usr/local/bin/agentzoo-runtime-host || true
+      fresh=0
+      sleep 1
+    done
+  ) &
+fi
+
 agent_root() {
   local id="$1"
   [[ "$id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "invalid agent id" >&2; exit 2; }

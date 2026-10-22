@@ -175,9 +175,98 @@ export interface CommandResult {
   aborted: boolean;
 }
 
+/** One entry from a directory listing. */
+export interface RuntimeListEntry {
+  readonly name: string;
+  readonly type: "file" | "directory" | "symlink" | "other";
+  readonly sizeBytes: number | null;
+}
+
+/** One match from a recursive name or text search. */
+export interface RuntimeSearchMatch {
+  readonly path: string;
+  readonly type?: "file" | "directory" | "symlink" | "other";
+  readonly line?: number;
+  readonly snippet?: string;
+}
+
+export interface RuntimeSearchOptions {
+  readonly path: string;
+  readonly kind: "name" | "text";
+  readonly name?: string;
+  readonly text?: string;
+  readonly maxResults?: number;
+}
+
+export interface RuntimeStat {
+  readonly type: "file" | "directory" | "symlink" | "other";
+  readonly sizeBytes: number;
+  readonly mode: number | null;
+  readonly mtimeMs: number | null;
+  readonly symlink: boolean;
+}
+
+/** Byte-exact read-only filesystem operations served by the runtime host. */
+export interface RuntimeFiles {
+  readBytes(
+    path: string,
+    offset: number,
+    limit: number,
+  ): Promise<{
+    readonly bytes: Uint8Array;
+    readonly offset: number;
+    readonly sizeBytes: number;
+    readonly truncated: boolean;
+    readonly nextOffset?: number;
+  }>;
+  readLines(
+    path: string,
+    startLine: number,
+    lineLimit: number,
+  ): Promise<{
+    readonly text: string;
+    readonly startLine: number;
+    readonly linesReturned: number;
+    readonly totalLines: number;
+    readonly truncated: boolean;
+    readonly nextLine?: number;
+  }>;
+  list(
+    path: string,
+    limit?: number,
+  ): Promise<{
+    readonly entries: readonly RuntimeListEntry[];
+    readonly truncated: boolean;
+  }>;
+  search(options: RuntimeSearchOptions): Promise<{
+    readonly results: readonly RuntimeSearchMatch[];
+    readonly truncated: boolean;
+  }>;
+  write(
+    path: string,
+    mode: "create" | "overwrite" | "append",
+    bytes: Uint8Array,
+    options?: {
+      readonly permission?: number;
+      readonly expected?: {
+        readonly sizeBytes?: number;
+        readonly mtimeMs?: number;
+      };
+    },
+  ): Promise<{ readonly created: boolean; readonly sizeBytes: number }>;
+  stat(path: string): Promise<RuntimeStat>;
+  remove(path: string): Promise<{ readonly removed: boolean }>;
+  /** Read a UTF-8 text file up to `maxBytes`, in bounded protocol pages. */
+  readText(path: string, maxBytes: number): Promise<string>;
+  /** Release the transport; the next call may reconnect. */
+  close?(): void;
+}
+
 export interface RuntimeEnv {
   /** Agent this environment belongs to. */
   readonly agentId: string;
+  /** Host-backed read-only filesystem access, when the backend provides it. */
+  readonly files?: RuntimeFiles;
   /** Prepare/check the environment (create chroot, mount shared, etc.). */
   prepare(): Promise<void>;
   /** Execute a command scoped to this agent's environment. */

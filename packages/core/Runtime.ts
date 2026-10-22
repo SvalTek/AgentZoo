@@ -1,12 +1,21 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
-import { fromFileUrl, resolve } from "@std/path";
+import {
+  dirname,
+  fromFileUrl,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "@std/path";
 import type {
   CommandOptions,
   CommandResult,
   RuntimeEnv,
+  RuntimeFiles,
   RuntimeManager,
 } from "./types.ts";
+import { RuntimeHostFiles } from "./RuntimeHostFiles.ts";
 
 export function assertAgentId(agentId: string): void {
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(agentId)) {
@@ -61,9 +70,16 @@ export class WslRuntimeManager implements RuntimeManager {
  * container may stop between CLI runs, while its labelled data volume keeps
  * each agent's private upperdir persistent by stable agent id.
  */
+const RUNTIME_HOST_PORT = 8787;
+const RUNTIME_HOST_TOKEN_PATH = "/var/lib/runtime/runtime-host.token";
+
 export class DockerRuntimeManager implements RuntimeManager {
   readonly #envs = new Map<string, RuntimeEnv>();
+  #runtimeHostToken: string | undefined;
+  #runtimeHostPort: number | undefined;
   readonly #dataVolumeName: string;
+  readonly #runtimeLogDir: string;
+  readonly #runtimeLogFile: string;
   #prepared = false;
   readonly runId: string;
   readonly createdAt: string;
@@ -85,6 +101,23 @@ export class DockerRuntimeManager implements RuntimeManager {
     this.createdAt = metadata.createdAt ?? new Date().toISOString();
     this.hostName = hostName ?? `agent-runtime-${this.runId}`;
     this.#dataVolumeName = `${this.hostName}-data`;
+    const projectDir = /\.(?:ya?ml|jsonc?)$/i.test(this.project)
+      ? dirname(this.project)
+      : this.project;
+    // Never place the log inside the workspace mounted at /shared: agents can
+    // read and write that tree.
+    const insideWorkspace = (() => {
+      const rel = relative(resolve(this.workspace), resolve(projectDir));
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    })();
+    const logBase = insideWorkspace ? dirname(this.workspace) : projectDir;
+    this.#runtimeLogDir = join(logBase, ".agent-zoo-logs", this.runId);
+    this.#runtimeLogFile = join(this.#runtimeLogDir, "runtime-host.log");
+  }
+
+  /** Host-visible log rewritten when the runtime container starts. */
+  runtimeLogFile(): string {
+    return this.#runtimeLogFile;
   }
 
   get dataVolumeName(): string {
@@ -131,7 +164,67 @@ export class DockerRuntimeManager implements RuntimeManager {
       await runDocker(["start", this.hostName]);
     }
 
+    await this.#waitForRuntimeHost();
     this.#prepared = true;
+  }
+
+  /** WebSocket endpoint of the resident runtime-host service, when present. */
+  runtimeHostEndpoint(): { url: string; token: string } | undefined {
+    if (!this.#runtimeHostToken || this.#runtimeHostPort === undefined) {
+      return undefined;
+    }
+    return {
+      url: `ws://127.0.0.1:${this.#runtimeHostPort}`,
+      token: this.#runtimeHostToken,
+    };
+  }
+
+  /**
+   * The entrypoint creates the token and starts the service moments after the
+   * container starts, so a single read races a fresh volume. Retry briefly;
+   * the endpoint stays optional and tools fall back to exec.
+   */
+  async #waitForRuntimeHost(): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    do {
+      this.#runtimeHostToken = await this.#readRuntimeHostToken();
+      this.#runtimeHostPort = await this.#resolveRuntimeHostPort();
+      if (this.#runtimeHostToken && this.#runtimeHostPort !== undefined) {
+        return;
+      }
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 100);
+      await promise;
+    } while (Date.now() < deadline);
+  }
+
+  async #readRuntimeHostToken(): Promise<string | undefined> {
+    try {
+      const result = await runDockerResult([
+        "exec",
+        this.hostName,
+        "cat",
+        RUNTIME_HOST_TOKEN_PATH,
+      ]);
+      const token = result.stdout.trim();
+      return token || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async #resolveRuntimeHostPort(): Promise<number | undefined> {
+    try {
+      const result = await runDockerResult([
+        "port",
+        this.hostName,
+        `${RUNTIME_HOST_PORT}/tcp`,
+      ]);
+      const match = /:(\d+)\s*$/m.exec(result.stdout);
+      return match ? Number(match[1]) : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Ensure the runtime image exists locally, building from source when the
@@ -167,6 +260,14 @@ export class DockerRuntimeManager implements RuntimeManager {
   }
 
   async #createHostContainer(): Promise<void> {
+    let logMount: string[] = [];
+    try {
+      await Deno.mkdir(this.#runtimeLogDir, { recursive: true });
+      logMount = ["--volume", `${this.#runtimeLogDir}:/var/log/agentzoo`];
+    } catch {
+      // Diagnostics only; run without the host-visible log if the path is
+      // unavailable.
+    }
     await runDocker([
       "run",
       "--detach",
@@ -176,8 +277,11 @@ export class DockerRuntimeManager implements RuntimeManager {
       ...this.#resourceLabelArgs("runtime"),
       "--volume",
       `${this.workspace}:/shared`,
+      ...logMount,
       "--mount",
       `source=${this.#dataVolumeName},target=/var/lib/runtime`,
+      "--publish",
+      `127.0.0.1::${RUNTIME_HOST_PORT}`,
       this.image,
     ]);
   }
@@ -235,7 +339,12 @@ export class DockerRuntimeManager implements RuntimeManager {
       "create-agent",
       agentId,
     ]);
-    const environment = new DockerChrootEnvironment(this.hostName, agentId);
+    const endpoint = this.runtimeHostEndpoint();
+    const environment = new DockerChrootEnvironment(
+      this.hostName,
+      agentId,
+      endpoint ? () => this.runtimeHostEndpoint() : undefined,
+    );
     this.#envs.set(agentId, environment);
     return environment;
   }
@@ -399,9 +508,54 @@ const DOCKER_WORKSPACE_LABEL = "agent-zoo.workspace";
 
 /** Build the managed runtime image tagged for AgentZoo, carrying the same
  * ownership labels that the CLI uses to recognise its resources. */
+async function compileRuntimeHost(): Promise<void> {
+  const source = fromFileUrl(
+    new URL("../runtime-host/main.ts", import.meta.url),
+  );
+  const output = fromFileUrl(
+    new URL("./runtime/agentzoo-runtime-host", import.meta.url),
+  );
+  // The target runtime archive is unpacked through the system temp directory.
+  // Keep that under the repository's tmp/ directory so a constrained system
+  // drive does not break the build with a misleading "not enough space" error.
+  const tempDir = fromFileUrl(
+    new URL("../../tmp/deno-compile", import.meta.url),
+  );
+  await Deno.mkdir(tempDir, { recursive: true });
+  const result = await new Deno.Command(Deno.execPath(), {
+    args: [
+      "compile",
+      "-A",
+      "--bundle",
+      "--minify",
+      "--target",
+      "x86_64-unknown-linux-gnu",
+      "--output",
+      output,
+      source,
+    ],
+    stdout: "piped",
+    stderr: "piped",
+    env: {
+      ...Deno.env.toObject(),
+      TEMP: tempDir,
+      TMP: tempDir,
+      TMPDIR: tempDir,
+    },
+  }).output();
+  if (!result.success) {
+    throw new Error(
+      `runtime host binary could not be compiled: ${
+        new TextDecoder().decode(result.stderr).trim()
+      }`,
+    );
+  }
+}
+
 export async function buildRuntimeImage(
   image = "agent-runtime:dev",
 ): Promise<void> {
+  await compileRuntimeHost();
   await runDocker([
     "build",
     "--file",
@@ -573,9 +727,13 @@ async function cleanupSelectedDockerRuns(
   selected: readonly ManagedDockerRun[],
   pruneImages: boolean,
 ): Promise<DockerCleanupResult> {
-  const containers = [...new Set(selected.flatMap((run) =>
-    run.containers.map((container) => container.name)
-  ))];
+  const containers = [
+    ...new Set(
+      selected.flatMap((run) =>
+        run.containers.map((container) => container.name)
+      ),
+    ),
+  ];
   const volumes = [...new Set(selected.flatMap((run) => [...run.volumes]))];
   if (containers.length) await runDocker(["rm", "--force", ...containers]);
   if (volumes.length) await runDocker(["volume", "rm", ...volumes]);
@@ -716,7 +874,19 @@ async function runDockerResult(
 
 class DockerChrootEnvironment implements RuntimeEnv {
   #prepared = true;
-  constructor(readonly hostName: string, readonly agentId: string) {}
+  readonly hostName: string;
+  readonly agentId: string;
+  readonly files?: RuntimeFiles;
+
+  constructor(
+    hostName: string,
+    agentId: string,
+    endpoint?: () => { url: string; token: string } | undefined,
+  ) {
+    this.hostName = hostName;
+    this.agentId = agentId;
+    if (endpoint) this.files = new RuntimeHostFiles(agentId, endpoint);
+  }
 
   async prepare(): Promise<void> {
     if (this.#prepared) return;
@@ -783,9 +953,7 @@ class DockerChrootEnvironment implements RuntimeEnv {
         // nothing to stop then, but the environment must still be released so
         // later exec() calls fail through the controlled "not running" path
         // instead of surfacing a raw Docker error.
-        const message = error instanceof Error
-          ? error.message
-          : String(error);
+        const message = error instanceof Error ? error.message : String(error);
         if (
           !/(not running|no such container|stopped state|does not exist)/i
             .test(message)
@@ -795,6 +963,7 @@ class DockerChrootEnvironment implements RuntimeEnv {
       }
     }
     this.#prepared = false;
+    this.files?.close?.();
   }
 
   /** Reset means explicitly discard the private chroot and recreate it. */

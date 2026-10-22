@@ -50,6 +50,11 @@ RUN apt-get update \
     && mkdir -p /opt/runtime/rootfs-template/dev /opt/runtime/rootfs-template/proc /opt/runtime/rootfs-template/run /opt/runtime/rootfs-template/shared /opt/runtime/rootfs-template/tmp \
     && chmod 1777 /opt/runtime/rootfs-template/tmp
 
+# The resident runtime-host service runs outside every agent root. It is copied
+# after the rootfs template, so it is not visible inside agent chroots.
+COPY agentzoo-runtime-host /usr/local/bin/agentzoo-runtime-host
+RUN chmod 0755 /usr/local/bin/agentzoo-runtime-host
+
 # These are broadly useful, lightweight language/package tools for arbitrary work.
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
     && deno --version

@@ -587,6 +587,7 @@ completion:
   try {
     assertEquals((built.zoo.getAgent("654ddb14e1dc") as ZooAgent).toolNames, [
       "shell",
+      "bash",
       "apply_patch",
       "write_file",
       "edit_file",
@@ -601,6 +602,7 @@ completion:
     ]);
     assertEquals((built.zoo.getAgent("6d58953e1a16") as ZooAgent).toolNames, [
       "shell",
+      "bash",
       "apply_patch",
       "write_file",
       "edit_file",

@@ -1,0 +1,9 @@
+{
+  "name": "@agent-zoo/runtime-host",
+  "version": "0.0.1",
+  "exports": {
+    ".": "./mod.ts",
+    "./protocol": "./protocol.ts",
+    "./server": "./server.ts"
+  }
+}

@@ -42,9 +42,12 @@ import {
   HttpFeature,
   loadConfig,
   ModelRegistry,
+  normalizePatchHunks,
   observedToolResult,
   parseConfig,
+  patchRollbackCandidates,
   resolveConfigEnvironment,
+  RuntimeFilesError,
   ShellFeature,
   TemplateRegistry,
   ToolExecutionError,
@@ -126,6 +129,7 @@ Deno.test("model-facing defaults do not disclose the harness identity or mechani
     genericTools.map((tool) => tool.name),
     [
       "shell",
+      "bash",
       "start_background",
       "stop_background",
       "get_background",
@@ -241,6 +245,7 @@ Deno.test("Vibes preserves provider-facing tool definition order", async () => {
   await agent.run("Inspect the available functions.");
   assertEquals(renderedTools.map((tool) => tool.name), [
     "shell",
+    "bash",
     "start_background",
     "stop_background",
     "get_background",
@@ -493,6 +498,79 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   );
   assert(ambiguousText.message.includes("replaceAll"));
 
+  const corrected = normalizePatchHunks(
+    [
+      "--- a/note.txt",
+      "+++ b/note.txt",
+      "@@ -1,1 +1,1 @@",
+      " one",
+      " two",
+    ].join("\n") + "\n",
+  );
+  assert(corrected.includes("@@ -1,2 +1,2 @@"));
+
+  const separated = normalizePatchHunks([
+    "--- a/one.txt",
+    "+++ b/one.txt",
+    "@@ -1,1 +1,1 @@",
+    "-one",
+    "+ONE",
+    "",
+    "--- a/two.txt",
+    "+++ b/two.txt",
+    "@@ -1,1 +1,1 @@",
+    "-two",
+    "+TWO",
+    "",
+  ].join("\n"));
+  assertEquals(separated.match(/@@ -1,1 \+1,1 @@/g)?.length, 2);
+
+  assertEquals(
+    patchRollbackCandidates(
+      new RuntimeFilesError("conflict", "exists"),
+      ["applied"],
+      "current",
+    ),
+    ["applied"],
+  );
+  assertEquals(
+    patchRollbackCandidates(new Error("transport"), ["applied"], "current"),
+    ["applied", "current"],
+  );
+
+  const extraNewline = normalizePatchHunks([
+    "--- a/one.txt",
+    "+++ b/one.txt",
+    "@@ -1,1 +1,1 @@",
+    "-one",
+    "+ONE",
+    "",
+    "",
+  ].join("\n"));
+  assert(extraNewline.includes("@@ -1,1 +1,1 @@"));
+
+  const headerLikeContent = normalizePatchHunks([
+    "--- a/x.txt",
+    "+++ b/x.txt",
+    "@@ -1,3 +1,3 @@",
+    " context",
+    "--- old",
+    "+++ new",
+    " context2",
+    "",
+  ].join("\n"));
+  assert(headerLikeContent.includes("@@ -1,3 +1,3 @@"));
+
+  const removedDashes = normalizePatchHunks([
+    "--- a/note.txt",
+    "+++ b/note.txt",
+    "@@ -1,1 +1,0 @@",
+    "--- sql comment",
+    " keep",
+    "",
+  ].join("\n"));
+  assert(removedDashes.includes("@@ -1,2 +1,1 @@"));
+
   const http = tools.find((tool) => tool.name === "http_request")!;
   const malformedHttp = http.parameters.safeParse({ url: "not a URL" });
   assert(malformedHttp.success, "diagnosable URLs must reach argsValidator");
@@ -581,9 +659,10 @@ Deno.test("generic tools expose usable provider-facing instructions", async () =
   for (
     const term of [
       "UTF-8",
-      "Defaults to 0",
+      "Defaults to 1",
       "Defaults to 65536",
-      "nextOffset",
+      "nextByteOffset",
+      "startLine",
     ]
   ) assert(exposed.read_file.includes(term));
 
@@ -1891,10 +1970,23 @@ Deno.test("parseConfig: rejects invalid param type", () => {
   );
 });
 
+Deno.test("ShellFeature: rejects a configured tool that collides with the alias", async () => {
+  await assertRejects(
+    () =>
+      new ShellFeature({
+        bash: { command: "echo {text}", description: "custom", params: {} },
+      }).createTools(),
+    Error,
+    "conflicts with the built-in alias",
+  );
+});
+
 Deno.test("ShellFeature: emits only shell when no configured tools", async () => {
   const tools = await new ShellFeature().createTools();
-  assertEquals(tools.length, 5);
+  assertEquals(tools.length, 6);
   assertEquals(tools[0].name, "shell");
+  assertEquals(tools[1].name, "bash");
+  assertEquals(tools[1].execute, tools[0].execute);
   const background = [
     "start_background",
     "stop_background",
@@ -1933,10 +2025,11 @@ Deno.test("ShellFeature: emits raw shell plus configured tools", async () => {
       },
     },
   }).createTools();
-  assertEquals(tools.length, 7);
+  assertEquals(tools.length, 8);
   assertEquals(tools[0].name, "shell");
-  assertEquals(tools[1].name, "search_code");
-  assertEquals(tools[2].name, "run_linter");
+  assertEquals(tools[1].name, "bash");
+  assertEquals(tools[2].name, "search_code");
+  assertEquals(tools[3].name, "run_linter");
   const background = [
     "start_background",
     "stop_background",

@@ -295,6 +295,7 @@ async function configureGitIdentity(
 
 const BuiltinToolOrder = [
   "shell",
+  "bash",
   "terminal_create",
   "terminal_list",
   "terminal_read",

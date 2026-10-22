@@ -1,5 +1,7 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
+import type { ToolDefinition } from "@vibesjs/sdk";
+
 const ObservedResult = Symbol("observed-tool-result");
 
 export interface ObservedToolResult<T> {
@@ -56,4 +58,22 @@ export function actionableToolError(
   telemetry?: unknown,
 ): ToolExecutionError {
   return new ToolExecutionError(feedback.filter(Boolean).join("\n"), telemetry);
+}
+
+/**
+ * Expose one tool under additional names.
+ *
+ * The alias shares the canonical definition's parameters, validator, and
+ * execute function, so the behaviour cannot drift. Use it only for names
+ * models naturally reach for (for example `bash` for `shell`), not as a
+ * versioning mechanism.
+ */
+export function withToolAliases<TDeps>(
+  definition: ToolDefinition<TDeps>,
+  aliases: readonly string[],
+): readonly ToolDefinition<TDeps>[] {
+  return [
+    definition,
+    ...aliases.map((name): ToolDefinition<TDeps> => ({ ...definition, name })),
+  ];
 }

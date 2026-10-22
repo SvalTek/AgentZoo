@@ -1,0 +1,325 @@
+/**
+ * Read-only filesystem access through the resident runtime host.
+ *
+ * The adapter keeps one WebSocket per agent environment. Protocol errors keep
+ * their code so tools can map them onto their existing model-facing feedback;
+ * a socket failure drops the connection for the next call to reconnect.
+ */
+
+import {
+  HostError,
+  HostErrorCodeSchema,
+  MAX_REQUEST_BYTES,
+  UPLOAD_CHUNK_BYTES,
+} from "@agent-zoo/runtime-host/protocol";
+import type {
+  RuntimeFiles,
+  RuntimeListEntry,
+  RuntimeSearchMatch,
+  RuntimeSearchOptions,
+  RuntimeStat,
+} from "./types.ts";
+import {
+  RuntimeHostClient,
+  type RuntimeHostEndpoint,
+  RuntimeHostTimeoutError,
+} from "./RuntimeHostClient.ts";
+
+export class RuntimeFilesError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "RuntimeFilesError";
+  }
+}
+
+export class RuntimeHostFiles implements RuntimeFiles {
+  #client?: RuntimeHostClient;
+  #connecting?: Promise<RuntimeHostClient>;
+
+  constructor(
+    readonly agentId: string,
+    readonly endpoint: () => RuntimeHostEndpoint | undefined,
+  ) {}
+
+  async readBytes(
+    path: string,
+    offset: number,
+    limit: number,
+  ): Promise<{
+    readonly bytes: Uint8Array;
+    readonly offset: number;
+    readonly sizeBytes: number;
+    readonly truncated: boolean;
+    readonly nextOffset?: number;
+  }> {
+    const { result, payload } = await this.#request("fs.read", {
+      path,
+      unit: "bytes",
+      offset,
+      limit,
+    });
+    return {
+      bytes: payload ?? new Uint8Array(),
+      offset: numberField(result, "offset"),
+      sizeBytes: numberField(result, "sizeBytes"),
+      truncated: result.truncated === true,
+      ...(typeof result.nextByteOffset === "number"
+        ? { nextOffset: result.nextByteOffset }
+        : {}),
+    };
+  }
+
+  async list(
+    path: string,
+    limit?: number,
+  ): Promise<{
+    readonly entries: readonly RuntimeListEntry[];
+    readonly truncated: boolean;
+  }> {
+    const { result } = await this.#request("fs.list", {
+      path,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    const entries = Array.isArray(result.entries)
+      ? result.entries as RuntimeListEntry[]
+      : [];
+    return { entries, truncated: result.truncated === true };
+  }
+
+  async stat(path: string): Promise<RuntimeStat> {
+    const { result } = await this.#request("fs.stat", { path });
+    return {
+      type: typeof result.type === "string"
+        ? result.type as RuntimeStat["type"]
+        : "other",
+      sizeBytes: numberField(result, "sizeBytes"),
+      mode: typeof result.mode === "number" ? result.mode : null,
+      mtimeMs: typeof result.mtimeMs === "number" ? result.mtimeMs : null,
+      symlink: result.symlink === true,
+    };
+  }
+
+  async remove(path: string): Promise<{ readonly removed: boolean }> {
+    const { result } = await this.#request("fs.remove", { path });
+    return { removed: result.removed === true };
+  }
+
+  async readText(path: string, maxBytes: number): Promise<string> {
+    const stat = await this.stat(path);
+    if (stat.type !== "file") {
+      throw new RuntimeFilesError("not_a_file", `"${path}" is not a file`);
+    }
+    if (stat.sizeBytes > maxBytes) {
+      throw new RuntimeFilesError(
+        "too_large",
+        `"${path}" is larger than ${maxBytes} bytes`,
+      );
+    }
+    const bytes = new Uint8Array(stat.sizeBytes);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { payload } = await this.#request("fs.read", {
+        path,
+        unit: "bytes",
+        offset,
+        limit: Math.min(bytes.length - offset, 1_048_576),
+        raw: true,
+      });
+      if (!payload || payload.length === 0) {
+        throw new RuntimeFilesError(
+          "conflict",
+          `"${path}" changed while it was being read`,
+        );
+      }
+      bytes.set(payload, offset);
+      offset += payload.length;
+    }
+    if (bytes.includes(0)) {
+      throw new RuntimeFilesError("binary", `"${path}" is not a text file`);
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+        .decode(bytes);
+    } catch {
+      throw new RuntimeFilesError("invalid_utf8", `"${path}" is not UTF-8`);
+    }
+  }
+
+  async readLines(
+    path: string,
+    startLine: number,
+    lineLimit: number,
+  ): Promise<{
+    readonly text: string;
+    readonly startLine: number;
+    readonly linesReturned: number;
+    readonly totalLines: number;
+    readonly truncated: boolean;
+    readonly nextLine?: number;
+  }> {
+    const { result, payload } = await this.#request("fs.read", {
+      path,
+      unit: "lines",
+      startLine,
+      lineLimit,
+    });
+    return {
+      text: new TextDecoder("utf-8", { ignoreBOM: true }).decode(payload),
+      startLine: numberField(result, "startLine"),
+      linesReturned: numberField(result, "linesReturned"),
+      totalLines: numberField(result, "totalLines"),
+      truncated: result.truncated === true,
+      ...(typeof result.nextLine === "number"
+        ? { nextLine: result.nextLine }
+        : {}),
+    };
+  }
+
+  async write(
+    path: string,
+    mode: "create" | "overwrite" | "append",
+    bytes: Uint8Array,
+    options: {
+      readonly permission?: number;
+      readonly expected?: {
+        readonly sizeBytes?: number;
+        readonly mtimeMs?: number;
+      };
+    } = {},
+  ): Promise<{ readonly created: boolean; readonly sizeBytes: number }> {
+    const params = {
+      path,
+      mode,
+      ...(options.permission === undefined
+        ? {}
+        : { permission: options.permission }),
+      ...(options.expected?.sizeBytes === undefined
+        ? {}
+        : { expectedSizeBytes: options.expected.sizeBytes }),
+      ...(options.expected?.mtimeMs === undefined
+        ? {}
+        : { expectedMtimeMs: options.expected.mtimeMs }),
+    };
+    if (bytes.length <= MAX_REQUEST_BYTES) {
+      const { result } = await this.#request("fs.write", params, bytes);
+      return {
+        created: result.created === true,
+        sizeBytes: numberField(result, "sizeBytes"),
+      };
+    }
+
+    const start = await this.#request("fs.writeStart", {
+      ...params,
+      sizeBytes: bytes.length,
+    });
+    const upload = String(start.result.upload);
+    try {
+      for (
+        let offset = 0;
+        offset < bytes.length;
+        offset += UPLOAD_CHUNK_BYTES
+      ) {
+        await this.#request(
+          "fs.writeChunk",
+          { upload },
+          bytes.subarray(offset, offset + UPLOAD_CHUNK_BYTES),
+        );
+      }
+      const { result } = await this.#request(
+        "fs.writeCommit",
+        { upload },
+        undefined,
+        { timeoutMs: 120_000 },
+      );
+      return {
+        created: result.created === true,
+        sizeBytes: numberField(result, "sizeBytes"),
+      };
+    } catch (error) {
+      await this.#request("fs.writeAbort", { upload }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async search(options: RuntimeSearchOptions): Promise<{
+    readonly results: readonly RuntimeSearchMatch[];
+    readonly truncated: boolean;
+  }> {
+    const { result } = await this.#request("fs.search", options);
+    const results = Array.isArray(result.results)
+      ? result.results as RuntimeSearchMatch[]
+      : [];
+    return { results, truncated: result.truncated === true };
+  }
+
+  /** Close the socket; the next request reconnects. */
+  close(): void {
+    const client = this.#client;
+    this.#client = undefined;
+    client?.close();
+  }
+
+  async #request(
+    op: string,
+    params: unknown,
+    payload?: Uint8Array,
+    options: { readonly timeoutMs?: number } = {},
+  ): Promise<{ result: Record<string, unknown>; payload?: Uint8Array }> {
+    const client = await this.#connection();
+    try {
+      return payload === undefined
+        ? await client.request(op, this.agentId, params, options)
+        : await client.requestWithPayload(
+          op,
+          this.agentId,
+          params,
+          payload,
+          options,
+        );
+    } catch (error) {
+      if (error instanceof HostError) {
+        throw new RuntimeFilesError(error.code, error.message);
+      }
+      if (error instanceof RuntimeHostTimeoutError) {
+        // The socket is still usable; only this request gave up.
+        throw error;
+      }
+      // The request may have reached the service before the socket failed.
+      // Retrying a non-idempotent write would duplicate it, so drop the
+      // connection and let a later call reconnect.
+      this.#client = undefined;
+      client.close();
+      throw error;
+    }
+  }
+
+  async #connection(): Promise<RuntimeHostClient> {
+    if (this.#client) return this.#client;
+    const connecting = this.#connecting ??= this.#open().finally(() => {
+      if (this.#connecting === connecting) this.#connecting = undefined;
+    });
+    return await connecting;
+  }
+
+  async #open(): Promise<RuntimeHostClient> {
+    const endpoint = this.endpoint();
+    if (!endpoint) throw new Error("runtime host is not available");
+    const client = await RuntimeHostClient.connect(endpoint);
+    this.#client = client;
+    return client;
+  }
+}
+
+function numberField(result: Record<string, unknown>, key: string): number {
+  return typeof result[key] === "number" ? result[key] : 0;
+}
+
+/** Whether a thrown value carries a known runtime-host error code. */
+export function runtimeFilesErrorCode(error: unknown): string | undefined {
+  if (error instanceof RuntimeFilesError) return error.code;
+  if (error instanceof HostError) return error.code;
+  return typeof error === "object" && error !== null &&
+      "code" in error && typeof error.code === "string"
+    ? HostErrorCodeSchema.safeParse(error.code).success ? error.code : undefined
+    : undefined;
+}

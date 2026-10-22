@@ -23,8 +23,8 @@ Consequences:
 - Each agent receives a private minimal `/dev` with its own `/dev/pts` and
   `/dev/shm`, and a persistent private PID namespace with its own `/proc`. An
   attached terminal allocates its pty from the agent's own devpts instance, so
-  `tty`, `ttyname()`, and job control work without exposing sibling agents'
-  or the operator's terminals. Background processes remain visible to later
+  `tty`, `ttyname()`, and job control work without exposing sibling agents' or
+  the operator's terminals. Background processes remain visible to later
   commands in the same environment but are not visible or signalable from
   another agent environment.
 - Debian package management is available inside the private root; packages
@@ -122,11 +122,15 @@ why no further action is needed and is recorded as the activation output.
 
 ## `shell` feature
 
-Exposes one tool:
+Exposes one tool under two names:
 
 ```text
 shell — Execute a shell command.
+bash  — Alias of shell; shares its schema, validation, and implementation.
 ```
+
+The alias exists because models commonly reach for `bash` by name. It is
+declared through the shared `withToolAliases` helper, not a second definition.
 
 The command runs using login Bash inside the calling agent's environment. Inputs
 are:
@@ -145,16 +149,16 @@ are:
 
 Model-visible stdout and stderr are each bounded to 65,536 characters, keeping
 the first 65,536 characters, and report whether truncation occurred. `exitCode`
-does not describe a command failure when `timedOut` or `aborted` is true. Durable
-telemetry retains the complete available runtime result.
+does not describe a command failure when `timedOut` or `aborted` is true.
+Durable telemetry retains the complete available runtime result.
 
-The feature also exposes `start_background`, `get_background`, `send_background`,
-and `stop_background`, which manage named long-running processes in tmux
-sessions. A background session keeps its pane after the command exits, so
-`get_background` still returns the captured output and the exit status
-(`alive: false`). Its output is capped at 65,536 characters, keeping the most
-recent content, and `last` selects trailing lines. A missing name returns
-`status: "not_found"`.
+The feature also exposes `start_background`, `get_background`,
+`send_background`, and `stop_background`, which manage named long-running
+processes in tmux sessions. A background session keeps its pane after the
+command exits, so `get_background` still returns the captured output and the
+exit status (`alive: false`). Its output is capped at 65,536 characters, keeping
+the most recent content, and `last` selects trailing lines. A missing name
+returns `status: "not_found"`.
 
 When a tool can identify a specific input or operation failure, its error also
 states the smallest safe correction. Provider-facing schemas describe each
@@ -173,52 +177,68 @@ execution boundary as `shell`.
 
 ### `read_file`
 
-Reads UTF-8 text from `path`. `offset` defaults to 0 and `limit` defaults to
-65,536 bytes, with a maximum of 262,144. `offset`, `limit`, and `nextOffset` are
-byte positions; pass `nextOffset` back as `offset` to continue. The result
-reports file size, bytes read, and truncation. Binary/non-UTF-8 content and a
-file that cannot be read produce a neutral error naming the cause.
+Reads UTF-8 text from `path` in one explicit unit.
+
+- Lines: `startLine` (1-based, default 1) and `lineLimit` (default 2000, maximum
+  20000). This is the default when no byte parameters are given.
+- Bytes: `byteOffset` (0-based, default 0) and `byteLimit` (default 65,536,
+  maximum 262,144). Prefer lines for text; a byte window can split a UTF-8
+  character.
+
+The units are mutually exclusive, and the old `offset`/`limit` names are
+rejected with a migration message because they meant bytes while reading like
+line numbers. Results report `unit` plus line metadata (`startLine`,
+`linesReturned`, `totalLines`, `nextLine`) or byte metadata (`offset`,
+`bytesRead`, `sizeBytes`, `nextByteOffset`), and `truncated` when more data
+remains. Binary/non-UTF-8 content and unreadable files produce a neutral error
+naming the cause.
 
 ### `write_file`
 
 Writes the multiline `content` string to `path`. Normal line breaks are accepted
 directly. With no `mode`, it uses `create`: a new file is created, but an
-existing path is never replaced. Use `mode: append` to add content. Replacing an
-entire existing file is deliberately explicit and requires both
-`mode: overwrite` and `force: true`. The result reports `bytesWritten` for this
-call and `sizeBytes` for the file afterwards. Missing parent directories are not
-created automatically. For a small exact change to an existing file, prefer
-`edit_file`; for larger or multi-region changes, prefer `apply_patch`.
+existing path is never replaced. A create whose existing content is
+byte-for-byte identical succeeds as a no-op (`created: false`); differing
+content is refused with the existing size and modification time. Use
+`mode: append` to add content. Replacing an entire existing file is deliberately
+explicit and requires both `mode: overwrite` and `force: true`. The result
+reports `bytesWritten` for this call and `sizeBytes` for the file afterwards.
+Missing parent directories are not created automatically. For a small exact
+change to an existing file, prefer `edit_file`; for larger or multi-region
+changes, prefer `apply_patch`.
 
 ### `edit_file`
 
-Replaces the exact `oldText` with `newText`. Both accept normal multiline text;
-an empty `newText` deletes the match. `oldText` and `newText` are each limited
-to 8,192 characters. By default there must be exactly one match. Zero matches
-and ambiguous multiple matches fail. Set `replaceAll: true` to replace every
-exact match. Matching and replacement use the file's own line-ending convention,
-so LF text edits a CRLF file without mixing endings. Files larger than 4 MiB and
-binary files are rejected.
+Replaces the exact `oldText` with `newText`. Both accept normal multiline text.
+When the text is missing, the error reports the first differing line within the
+closest candidate region; when it is ambiguous, it reports the match count and
+line numbers. An empty `newText` deletes the match. `oldText` and `newText` are
+each limited to 65,536 characters. By default there must be exactly one match.
+Zero matches and ambiguous multiple matches fail. Set `replaceAll: true` to
+replace every exact match. Matching and replacement use the file's own
+line-ending convention, so LF text edits a CRLF file without mixing endings.
+Files larger than 4 MiB and binary files are rejected.
 
 ### `apply_patch`
 
 Applies the multiline `patch` string as a unified diff. Paths are resolved from
-the optional `cwd`, or the agent's configured working directory when omitted;
-no Git worktree is required. Hunk line counts must be exact, and a hunk may
-begin or end with a changed line, so trailing context is not required. Patch
-lines are matched in the target file's own line endings, so an LF patch edits a
-CRLF file without mixing endings, and file creation and deletion
-(`--- /dev/null`, `+++ /dev/null`) are supported. A creation section refuses a
-path that already exists, including a directory.
+the optional `cwd`, or the agent's configured working directory when omitted; no
+Git worktree is required. Hunk line counts are derived from each hunk body
+before parsing, so approximate counts do not fail the patch; the body's context
+still has to match the file. A hunk may begin or end with a changed line, so
+trailing context is not required. Patch lines are matched in the target file's
+own line endings, so an LF patch edits a CRLF file without mixing endings, and
+file creation and deletion (`--- /dev/null`, `+++ /dev/null`) are supported. A
+creation section refuses a path that already exists, including a directory.
 
-Every affected file is read and patched in memory before anything is written,
-so a parse error, missing file, oversized target (32 MiB), non-text file, or
+Every affected file is read and patched in memory before anything is written, so
+a parse error, missing file, oversized target (32 MiB), non-text file, or
 context mismatch leaves the filesystem untouched. A hunk whose context matches
-more than one location is rejected with a request for more surrounding lines. Replacements are then staged
-as temporary files in the target directories and renamed into place; if any
-write fails, the earlier files are restored from the contents read at the start.
-The result summarizes changed files, relative to `cwd`, with addition and
-deletion counts.
+more than one location is rejected with a request for more surrounding lines.
+Replacements are then staged as temporary files in the target directories and
+renamed into place; if any write fails, the earlier files are restored from the
+contents read at the start. The result summarizes changed files, relative to
+`cwd`, with addition and deletion counts.
 
 ### `list_directory`
 
@@ -255,8 +275,8 @@ method, headers, and body. It follows at most five redirects and enforces a
 most 65,536 bytes of body content: `bodyBytes` counts captured response bytes
 (up to 1 MiB), `bodyBytesReturned` counts the bytes included, `truncated`
 reports that the returned body is incomplete, and `captureTruncated` reports
-that the response exceeded the capture limit. Durable telemetry retains up to
-1 MiB of response body.
+that the response exceeded the capture limit. Durable telemetry retains up to 1
+MiB of response body.
 
 The feature does not add search, browser automation, or research behavior.
 
