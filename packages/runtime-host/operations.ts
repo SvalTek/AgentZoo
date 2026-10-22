@@ -62,6 +62,8 @@ const WriteParams = z.object({
   path: z.string().min(1),
   mode: z.enum(["create", "overwrite", "append"]),
   permission: z.number().int().nonnegative().max(0o7777).optional(),
+  expectedSizeBytes: z.number().int().nonnegative().optional(),
+  expectedMtimeMs: z.number().int().nonnegative().optional(),
 });
 
 const ReadParams = z.object({
@@ -191,6 +193,14 @@ export async function executeOperation(
       input.mode as WriteMode,
       payload,
       input.permission,
+      {
+        ...(input.expectedSizeBytes === undefined
+          ? {}
+          : { sizeBytes: input.expectedSizeBytes }),
+        ...(input.expectedMtimeMs === undefined
+          ? {}
+          : { mtimeMs: input.expectedMtimeMs }),
+      },
     );
   }
 

@@ -139,10 +139,16 @@ Deno.test({
           { path: "/root/log.txt", mode: "append" },
           encoder.encode("B"),
         ),
+        client.requestWithPayload(
+          "fs.write",
+          "alpha",
+          { path: "/root//log.txt", mode: "append" },
+          encoder.encode("C"),
+        ),
       ]);
       const content = await Deno.readTextFile(`${root}/root/log.txt`);
-      assertEquals(content.length, 2);
-      assert(content === "AB" || content === "BA");
+      assertEquals(content.length, 3);
+      assertEquals([...content].sort().join(""), "ABC");
     } finally {
       client.close();
       await server.close();
@@ -191,6 +197,33 @@ Deno.test({
       assertEquals(ping.result.protocol, 1);
     } finally {
       client.close();
+      await server.close();
+      await Deno.remove(base, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "runtime host refuses binary frames before authentication",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { base, server } = await fixture();
+    try {
+      const socket = new WebSocket(`ws://127.0.0.1:${server.port}`);
+      const closed = Promise.withResolvers<number>();
+      socket.onclose = (event) => closed.resolve(event.code);
+      await new Promise<void>((resolve, reject) => {
+        socket.onopen = () => resolve();
+        socket.onerror = () => reject(new Error("socket failed"));
+      });
+      socket.send(new Uint8Array([0, 0, 0, 1, 1]));
+      const code = await Promise.race([
+        closed.promise,
+        new Promise<number>((resolve) => setTimeout(() => resolve(-1), 3_000)),
+      ]);
+      assertEquals(code, 1008);
+    } finally {
       await server.close();
       await Deno.remove(base, { recursive: true });
     }

@@ -470,6 +470,38 @@ Deno.test({
         path: "/root/editable",
         content: "same same",
       });
+      await invoke(alpha, "write_file", {
+        path: "/root/dollar.txt",
+        content: "prefix foo suffix\n",
+      });
+      const dollarEdit = await invoke(alpha, "edit_file", {
+        path: "/root/dollar.txt",
+        oldText: "foo",
+        newText: "$&-bar $1",
+      });
+      assertEquals(dollarEdit.replacements, 1);
+      assertEquals(
+        (await alpha.exec(["/bin/cat", "/root/dollar.txt"])).stdout,
+        "prefix $&-bar $1 suffix\n",
+      );
+
+      await invoke(alpha, "write_file", {
+        path: "/root/mode-file",
+        content: "before",
+      });
+      await alpha.exec(["/bin/chmod", "640", "/root/mode-file"]);
+      await invoke(alpha, "write_file", {
+        path: "/root/mode-file",
+        content: "mode kept",
+        mode: "overwrite",
+        force: true,
+      });
+      assertEquals(
+        (await alpha.exec(["/bin/stat", "-c", "%a", "/root/mode-file"])).stdout
+          .trim(),
+        "640",
+      );
+
       const missingEdit = await assertRejects(
         () =>
           invoke(alpha, "edit_file", {

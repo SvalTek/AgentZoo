@@ -9,7 +9,7 @@
  */
 
 import { HostError, MAX_REQUEST_BYTES } from "./protocol.ts";
-import { openTarget } from "./containment.ts";
+import { type OpenedTarget, openTarget } from "./containment.ts";
 
 export type WriteMode = "create" | "overwrite" | "append";
 
@@ -17,7 +17,13 @@ export interface WriteResult {
   readonly result: Record<string, unknown>;
 }
 
-/** One tail promise per agent path, so concurrent writes cannot interleave. */
+/** Guard against a concurrent edit whose source snapshot is now stale. */
+export interface WriteExpectation {
+  readonly sizeBytes?: number;
+  readonly mtimeMs?: number;
+}
+
+/** One tail promise per target, so concurrent writes cannot interleave. */
 const pathLocks = new Map<string, Promise<unknown>>();
 
 async function withPathLock<T>(
@@ -33,6 +39,24 @@ async function withPathLock<T>(
   } finally {
     if (pathLocks.get(key) === tail) pathLocks.delete(key);
   }
+}
+
+/**
+ * Stable lock identity for one directory entry. The parent's device/inode
+ * covers hard links and symlinked parents; the resolved path is the fallback
+ * on platforms without inode numbers.
+ */
+function lockKey(
+  root: string,
+  directory: OpenedTarget,
+  name: string,
+): string {
+  const { dev, ino } = directory.info;
+  const parent = dev !== null && dev !== undefined && ino !== null &&
+      ino !== undefined
+    ? `${dev}:${ino}`
+    : directory.path;
+  return `${root}\u0000${parent}\u0000${name}`;
 }
 
 function splitAgentPath(
@@ -81,16 +105,31 @@ async function readCurrentFile(
 /**
  * Locate the descriptor that still points at the temp file, so mode and owner
  * changes act on the inode rather than on a directory entry the agent could
- * have swapped for a symlink.
+ * have swapped for a symlink. readlink() reports the canonical dentry path,
+ * not the /proc path we opened, so match by device/inode instead.
  */
-async function descriptorPathFor(tempPath: string): Promise<string> {
+async function descriptorPathFor(
+  tempPath: string,
+  info: Deno.FileInfo,
+): Promise<string> {
   if (Deno.build.os !== "linux") return tempPath;
+  if (
+    info.dev === null || info.dev === undefined || info.ino === null ||
+    info.ino === undefined
+  ) {
+    return tempPath;
+  }
   try {
     for await (const entry of Deno.readDir("/proc/self/fd")) {
       if (!/^\d+$/.test(entry.name)) continue;
       const fdPath = `/proc/self/fd/${entry.name}`;
       try {
-        if (await Deno.readLink(fdPath) === tempPath) return fdPath;
+        const candidate = await Deno.stat(fdPath);
+        if (
+          candidate.dev === info.dev && candidate.ino === info.ino
+        ) {
+          return fdPath;
+        }
       } catch {
         // The descriptor closed while we scanned.
       }
@@ -111,25 +150,30 @@ async function writeAll(
   }
 }
 
+function changedSince(
+  current: Deno.FileInfo | undefined,
+  expected: WriteExpectation,
+): boolean {
+  if (current === undefined) {
+    return expected.sizeBytes !== undefined || expected.mtimeMs !== undefined;
+  }
+  if (
+    expected.sizeBytes !== undefined && current.size !== expected.sizeBytes
+  ) return true;
+  if (
+    expected.mtimeMs !== undefined &&
+    (current.mtime?.getTime() ?? null) !== expected.mtimeMs
+  ) return true;
+  return false;
+}
+
 export async function writeAgentFile(
   root: string,
   path: string,
   mode: WriteMode,
   payload: Uint8Array,
   permission?: number,
-): Promise<WriteResult> {
-  return await withPathLock(
-    `${root}\u0000${path}`,
-    () => writeAgentFileUnlocked(root, path, mode, payload, permission),
-  );
-}
-
-async function writeAgentFileUnlocked(
-  root: string,
-  path: string,
-  mode: WriteMode,
-  payload: Uint8Array,
-  permission?: number,
+  expected?: WriteExpectation,
 ): Promise<WriteResult> {
   if (payload.length > MAX_REQUEST_BYTES) {
     throw new HostError(
@@ -140,132 +184,174 @@ async function writeAgentFileUnlocked(
   const { parent, name } = splitAgentPath(path);
   const directory = await openTarget(root, parent, { requireDirectory: true });
   try {
-    const targetPath = `${directory.listingPath}/${name}`;
-    let existing: Deno.FileInfo | undefined;
-    try {
-      existing = await Deno.lstat(targetPath);
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) {
-        if (error instanceof Deno.errors.PermissionDenied) {
-          throw new HostError("permission_denied", `"${path}" is not writable`);
-        }
-        throw error;
-      }
-    }
-
-    if (existing?.isSymlink) {
-      throw new HostError(
-        "symlink",
-        `"${path}" is a symbolic link; replace the link itself instead`,
-      );
-    }
-    if (existing && !existing.isFile) {
-      throw new HostError("not_a_file", `"${path}" is not a regular file`);
-    }
-    if (mode === "create" && existing) {
-      throw new HostError("conflict", `"${path}" already exists`);
-    }
-
-    const prefix = mode === "append" && existing
-      ? await readCurrentFile(targetPath, existing)
-      : new Uint8Array();
-    const tempPath =
-      `${directory.listingPath}/.agentzoo-write-${crypto.randomUUID()}`;
-    try {
-      let file: Deno.FsFile;
-      try {
-        file = await Deno.open(tempPath, {
-          createNew: true,
-          write: true,
-          mode: 0o666,
-        });
-      } catch (error) {
-        if (error instanceof Deno.errors.PermissionDenied) {
-          throw new HostError(
-            "permission_denied",
-            `"${parent}" is not writable`,
-          );
-        }
-        throw error;
-      }
-      try {
-        if (prefix.length > 0) await writeAll(file, prefix);
-        await writeAll(file, payload);
-        // Persist before the atomic commit; a crash after rename must not
-        // leave the new name pointing at unflushed content.
-        await file.sync();
-
-        const permissionPath = await descriptorPathFor(tempPath);
-        if (permission !== undefined) {
-          await Deno.chmod(permissionPath, permission & 0o7777);
-        } else if (existing?.mode !== null && existing !== undefined) {
-          await Deno.chmod(permissionPath, existing.mode! & 0o7777);
-        }
-        if (
-          Deno.build.os === "linux" && existing?.uid !== null &&
-          existing?.uid !== undefined && existing.gid !== null
-        ) {
-          await Deno.chown(permissionPath, existing.uid, existing.gid).catch(
-            () => undefined,
-          );
-        }
-      } finally {
-        file.close();
-      }
-
-      if (mode === "append") {
-        // The lock serializes service requests; this check catches an agent
-        // process (or another writer) appending after our snapshot.
-        let current: Deno.FileInfo | undefined;
-        try {
-          current = await Deno.lstat(targetPath);
-        } catch (error) {
-          if (!(error instanceof Deno.errors.NotFound)) throw error;
-        }
-        const unchanged = existing === undefined
-          ? current === undefined
-          : current !== undefined &&
-            current.size === existing.size &&
-            (existing.ino === null || current.ino === null ||
-              current.ino === existing.ino) &&
-            (existing.mtime?.getTime() ?? null) ===
-              (current.mtime?.getTime() ?? null);
-        if (!unchanged) {
-          throw new HostError(
-            "conflict",
-            `"${path}" changed while it was being appended`,
-          );
-        }
-      }
-
-      if (mode === "create") {
-        try {
-          await Deno.link(tempPath, targetPath);
-        } catch (error) {
-          if (error instanceof Deno.errors.AlreadyExists) {
-            throw new HostError("conflict", `"${path}" already exists`);
-          }
-          throw error;
-        }
-        await Deno.remove(tempPath);
-      } else {
-        await Deno.rename(tempPath, targetPath);
-      }
-    } finally {
-      await Deno.remove(tempPath).catch(() => undefined);
-    }
-
-    return {
-      result: {
-        path,
-        mode,
-        created: existing === undefined,
-        sizeBytes: prefix.length + payload.length,
-      },
-    };
+    return await withPathLock(
+      lockKey(root, directory, name),
+      () =>
+        writeIntoDirectory(
+          directory,
+          parent,
+          path,
+          name,
+          mode,
+          payload,
+          permission,
+          expected,
+        ),
+    );
   } finally {
     directory.close();
   }
+}
+
+async function writeIntoDirectory(
+  directory: OpenedTarget,
+  parent: string,
+  path: string,
+  name: string,
+  mode: WriteMode,
+  payload: Uint8Array,
+  permission: number | undefined,
+  expected: WriteExpectation | undefined,
+): Promise<WriteResult> {
+  const targetPath = `${directory.listingPath}/${name}`;
+  let existing: Deno.FileInfo | undefined;
+  try {
+    existing = await Deno.lstat(targetPath);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) {
+      if (error instanceof Deno.errors.PermissionDenied) {
+        throw new HostError("permission_denied", `"${path}" is not writable`);
+      }
+      throw error;
+    }
+  }
+
+  if (existing?.isSymlink) {
+    throw new HostError(
+      "symlink",
+      `"${path}" is a symbolic link; replace the link itself instead`,
+    );
+  }
+  if (existing && !existing.isFile) {
+    throw new HostError("not_a_file", `"${path}" is not a regular file`);
+  }
+  if (mode === "create" && existing) {
+    throw new HostError("conflict", `"${path}" already exists`);
+  }
+
+  const prefix = mode === "append" && existing
+    ? await readCurrentFile(targetPath, existing)
+    : new Uint8Array();
+  const tempPath =
+    `${directory.listingPath}/.agentzoo-write-${crypto.randomUUID()}`;
+  try {
+    let file: Deno.FsFile;
+    try {
+      file = await Deno.open(tempPath, {
+        createNew: true,
+        write: true,
+        mode: 0o666,
+      });
+    } catch (error) {
+      if (error instanceof Deno.errors.PermissionDenied) {
+        throw new HostError(
+          "permission_denied",
+          `"${parent}" is not writable`,
+        );
+      }
+      throw error;
+    }
+    try {
+      if (prefix.length > 0) await writeAll(file, prefix);
+      await writeAll(file, payload);
+      // Persist before the atomic commit; a crash after rename must not
+      // leave the new name pointing at unflushed content.
+      await file.sync();
+
+      const info = await file.stat();
+      const permissionPath = await descriptorPathFor(tempPath, info);
+      if (permission !== undefined) {
+        await Deno.chmod(permissionPath, permission & 0o7777);
+      } else if (existing?.mode !== null && existing !== undefined) {
+        await Deno.chmod(permissionPath, existing.mode! & 0o7777);
+      }
+      if (
+        Deno.build.os === "linux" && existing?.uid !== null &&
+        existing?.uid !== undefined && existing.gid !== null
+      ) {
+        await Deno.chown(permissionPath, existing.uid, existing.gid).catch(
+          () => undefined,
+        );
+      }
+    } finally {
+      file.close();
+    }
+
+    if (mode === "append") {
+      // The lock serializes service requests; this check catches an agent
+      // process (or another writer) appending after our snapshot.
+      let current: Deno.FileInfo | undefined;
+      try {
+        current = await Deno.lstat(targetPath);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      const unchanged = existing === undefined
+        ? current === undefined
+        : current !== undefined &&
+          current.size === existing.size &&
+          (existing.ino === null || current.ino === null ||
+            current.ino === existing.ino) &&
+          (current.mtime?.getTime() ?? null) ===
+            (existing.mtime?.getTime() ?? null);
+      if (!unchanged) {
+        throw new HostError(
+          "conflict",
+          `"${path}" changed while it was being appended`,
+        );
+      }
+    } else if (mode === "overwrite" && expected !== undefined) {
+      // edit_file passes the snapshot it read; refuse to replace a file that
+      // changed after that read.
+      let current: Deno.FileInfo | undefined;
+      try {
+        current = await Deno.lstat(targetPath);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (changedSince(current, expected)) {
+        throw new HostError(
+          "conflict",
+          `"${path}" changed after it was read`,
+        );
+      }
+    }
+
+    if (mode === "create") {
+      try {
+        await Deno.link(tempPath, targetPath);
+      } catch (error) {
+        if (error instanceof Deno.errors.AlreadyExists) {
+          throw new HostError("conflict", `"${path}" already exists`);
+        }
+        throw error;
+      }
+      await Deno.remove(tempPath);
+    } else {
+      await Deno.rename(tempPath, targetPath);
+    }
+  } finally {
+    await Deno.remove(tempPath).catch(() => undefined);
+  }
+
+  return {
+    result: {
+      path,
+      mode,
+      created: existing === undefined,
+      sizeBytes: prefix.length + payload.length,
+    },
+  };
 }
 
 export async function removeAgentFile(
@@ -275,29 +361,37 @@ export async function removeAgentFile(
   const { parent, name } = splitAgentPath(path);
   const directory = await openTarget(root, parent, { requireDirectory: true });
   try {
-    const targetPath = `${directory.listingPath}/${name}`;
-    let info: Deno.FileInfo | undefined;
-    try {
-      info = await Deno.lstat(targetPath);
-    } catch (error) {
-      if (error instanceof Deno.errors.NotFound) {
-        return { result: { path, removed: false } };
-      }
-      if (error instanceof Deno.errors.PermissionDenied) {
-        throw new HostError("permission_denied", `"${path}" is not removable`);
-      }
-      throw error;
-    }
-    if (info.isDirectory) {
-      throw new HostError(
-        "not_a_file",
-        `"${path}" is a directory; recursive removal is not supported`,
-      );
-    }
-    // Removing through the parent fd unlinks the entry itself, so a symlink is
-    // removed rather than its referent.
-    await Deno.remove(targetPath);
-    return { result: { path, removed: true } };
+    return await withPathLock(
+      lockKey(root, directory, name),
+      async () => {
+        const targetPath = `${directory.listingPath}/${name}`;
+        let info: Deno.FileInfo | undefined;
+        try {
+          info = await Deno.lstat(targetPath);
+        } catch (error) {
+          if (error instanceof Deno.errors.NotFound) {
+            return { result: { path, removed: false } };
+          }
+          if (error instanceof Deno.errors.PermissionDenied) {
+            throw new HostError(
+              "permission_denied",
+              `"${path}" is not removable`,
+            );
+          }
+          throw error;
+        }
+        if (info.isDirectory) {
+          throw new HostError(
+            "not_a_file",
+            `"${path}" is a directory; recursive removal is not supported`,
+          );
+        }
+        // Removing through the parent fd unlinks the entry itself, so a
+        // symlink is removed rather than its referent.
+        await Deno.remove(targetPath);
+        return { result: { path, removed: true } };
+      },
+    );
   } finally {
     directory.close();
   }

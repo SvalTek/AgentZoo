@@ -44,6 +44,15 @@ interface PendingRequest {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+const MAX_BUFFERED_PAYLOADS = 64;
+
+/** A request exceeded its deadline; the connection itself may still be fine. */
+export class RuntimeHostTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RuntimeHostTimeoutError";
+  }
+}
 
 export class RuntimeHostClient {
   readonly #socket: WebSocket;
@@ -165,7 +174,11 @@ export class RuntimeHostClient {
     >();
     const timer = setTimeout(() => {
       this.#pending.delete(id);
-      reject(new Error(`runtime host request "${op}" timed out`));
+      reject(
+        new RuntimeHostTimeoutError(
+          `runtime host request "${op}" timed out`,
+        ),
+      );
     }, timeoutMs);
     this.#pending.set(id, { resolve, reject, timer });
     try {
@@ -238,8 +251,16 @@ export class RuntimeHostClient {
   #handleMessage(data: unknown): void {
     if (typeof data !== "string") {
       if (data instanceof ArrayBuffer) {
-        const frame = decodeBinaryFrame(new Uint8Array(data));
-        this.#payloads.set(frame.sequence, frame.payload);
+        try {
+          const frame = decodeBinaryFrame(new Uint8Array(data));
+          if (this.#payloads.size >= MAX_BUFFERED_PAYLOADS) {
+            const oldest = this.#payloads.keys().next().value;
+            if (oldest !== undefined) this.#payloads.delete(oldest);
+          }
+          this.#payloads.set(frame.sequence, frame.payload);
+        } catch {
+          // Ignore a malformed frame rather than throwing from onmessage.
+        }
       }
       return;
     }
@@ -277,6 +298,11 @@ export class RuntimeHostClient {
       }
       return;
     }
+    const sequence = typeof message.seq === "number" ? message.seq : undefined;
+    const payload = sequence === undefined
+      ? undefined
+      : this.#payloads.get(sequence);
+    if (sequence !== undefined) this.#payloads.delete(sequence);
     if (typeof message.id !== "string") return;
     const pending = this.#pending.get(message.id);
     if (!pending) return;
@@ -297,11 +323,6 @@ export class RuntimeHostClient {
       );
       return;
     }
-    const sequence = typeof message.seq === "number" ? message.seq : undefined;
-    const payload = sequence === undefined
-      ? undefined
-      : this.#payloads.get(sequence);
-    if (sequence !== undefined) this.#payloads.delete(sequence);
     pending.resolve({
       result: (message.result as Record<string, unknown>) ?? {},
       ...(payload ? { payload } : {}),

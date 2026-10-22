@@ -27,6 +27,8 @@ import { executeOperation, startAgentWatch } from "./operations.ts";
 import type { WatchHandle } from "./watch.ts";
 
 const MAX_SUBSCRIPTIONS = 64;
+/** Bytes of request payload one connection may buffer before authentication. */
+const MAX_BUFFERED_PAYLOAD_BYTES = 16 * 1_048_576;
 
 export interface RuntimeHostServerOptions {
   readonly agentsRoot: string;
@@ -93,6 +95,8 @@ export function createRuntimeHostServer(
     const { socket, response } = Deno.upgradeWebSocket(request);
     const context = { agentsRoot: options.agentsRoot };
     const subscriptions = new Map<string, WatchHandle>();
+    let subscriptionCount = 0;
+    let bufferedPayloadBytes = 0;
     // Request payloads arrive as binary frames before the JSON request that
     // names their sequence. Bound the map so an abandoned payload cannot grow
     // memory without limit.
@@ -105,13 +109,26 @@ export function createRuntimeHostServer(
     const closeSubscriptions = () => {
       for (const handle of subscriptions.values()) handle.close();
       subscriptions.clear();
+      subscriptionCount = 0;
+    };
+
+    const dropPayload = (sequence: number) => {
+      const payload = payloads.get(sequence);
+      if (payload === undefined) return;
+      payloads.delete(sequence);
+      bufferedPayloadBytes -= payload.length;
+    };
+
+    const clearPayloads = () => {
+      payloads.clear();
+      bufferedPayloadBytes = 0;
     };
 
     const handleSubscribe = async (message: unknown): Promise<boolean> => {
       const subscribe = SubscribeSchema.safeParse(message);
       if (!subscribe.success) return false;
       const { sub, agent, params } = subscribe.data;
-      if (subscriptions.size >= MAX_SUBSCRIPTIONS) {
+      if (subscriptionCount >= MAX_SUBSCRIPTIONS) {
         send(failureForSubscription(
           sub,
           new HostError(
@@ -131,6 +148,7 @@ export function createRuntimeHostServer(
         ));
         return true;
       }
+      subscriptionCount++;
       try {
         const handle = await startAgentWatch(
           context,
@@ -153,6 +171,7 @@ export function createRuntimeHostServer(
         if (socket.readyState !== WebSocket.OPEN) {
           // The client disconnected while the watch was being established.
           handle.close();
+          subscriptionCount--;
           return true;
         }
         subscriptions.set(sub, handle);
@@ -168,6 +187,7 @@ export function createRuntimeHostServer(
           },
         });
       } catch (error) {
+        subscriptionCount--;
         send(failureForSubscription(sub, error));
       }
       return true;
@@ -189,6 +209,7 @@ export function createRuntimeHostServer(
       }
       handle.close();
       subscriptions.delete(unsubscribe.data.sub);
+      subscriptionCount = Math.max(0, subscriptionCount - 1);
       send({ ok: true, sub: unsubscribe.data.sub, result: {} });
       return true;
     };
@@ -245,7 +266,7 @@ export function createRuntimeHostServer(
       const payload = payloadSeq === undefined
         ? undefined
         : payloads.get(payloadSeq);
-      if (payloadSeq !== undefined) payloads.delete(payloadSeq);
+      if (payloadSeq !== undefined) dropPayload(payloadSeq);
       if (payloadSeq !== undefined && payload === undefined) {
         send(failure(
           id,
@@ -283,6 +304,10 @@ export function createRuntimeHostServer(
     socket.onmessage = (event) => {
       if (typeof event.data !== "string") {
         if (!(event.data instanceof ArrayBuffer)) return;
+        if (!authorized) {
+          socket.close(1008, "send hello first");
+          return;
+        }
         let frame;
         try {
           frame = decodeBinaryFrame(new Uint8Array(event.data));
@@ -294,20 +319,28 @@ export function createRuntimeHostServer(
           socket.close(1009, "payload too large");
           return;
         }
-        if (payloads.size >= 64) {
-          const oldest = payloads.keys().next().value;
-          if (oldest !== undefined) payloads.delete(oldest);
+        if (
+          bufferedPayloadBytes + frame.payload.length >
+            MAX_BUFFERED_PAYLOAD_BYTES
+        ) {
+          socket.close(1009, "payload buffer is full");
+          return;
         }
+        dropPayload(frame.sequence);
         payloads.set(frame.sequence, frame.payload);
+        bufferedPayloadBytes += frame.payload.length;
         return;
       }
       void handleRequest(event.data);
     };
     socket.onclose = () => {
       closeSubscriptions();
-      payloads.clear();
+      clearPayloads();
     };
-    socket.onerror = closeSubscriptions;
+    socket.onerror = () => {
+      closeSubscriptions();
+      clearPayloads();
+    };
     return response;
   });
 

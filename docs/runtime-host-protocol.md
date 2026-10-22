@@ -145,7 +145,7 @@ only chooses defaults.
 - Line reads are capped by the 1 MiB per-response limit as well as by lines; the
   cut is made at the last complete line and reflected in `truncated`/`nextLine`.
 - Binary content (NUL bytes) is reported as `binary`, never decoded.
-- Per-response cap: 1 MiB. Larger requests are a protocol error.
+- Per-response cap: 1 MiB. Byte windows larger than the cap are clamped to it.
 
 ### `fs.list`
 

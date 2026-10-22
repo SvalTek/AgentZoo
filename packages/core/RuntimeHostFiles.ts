@@ -1,9 +1,9 @@
 /**
  * Read-only filesystem access through the resident runtime host.
  *
- * The adapter keeps one WebSocket per agent environment and reconnects once
- * after a transport failure. Protocol errors keep their code so tools can map
- * them onto their existing model-facing feedback.
+ * The adapter keeps one WebSocket per agent environment. Protocol errors keep
+ * their code so tools can map them onto their existing model-facing feedback;
+ * a socket failure drops the connection for the next call to reconnect.
  */
 
 import {
@@ -20,6 +20,7 @@ import type {
 import {
   RuntimeHostClient,
   type RuntimeHostEndpoint,
+  RuntimeHostTimeoutError,
 } from "./RuntimeHostClient.ts";
 
 export class RuntimeFilesError extends Error {
@@ -167,7 +168,13 @@ export class RuntimeHostFiles implements RuntimeFiles {
     path: string,
     mode: "create" | "overwrite" | "append",
     bytes: Uint8Array,
-    options: { readonly permission?: number } = {},
+    options: {
+      readonly permission?: number;
+      readonly expected?: {
+        readonly sizeBytes?: number;
+        readonly mtimeMs?: number;
+      };
+    } = {},
   ): Promise<{ readonly created: boolean; readonly sizeBytes: number }> {
     const { result } = await this.#request(
       "fs.write",
@@ -177,6 +184,12 @@ export class RuntimeHostFiles implements RuntimeFiles {
         ...(options.permission === undefined
           ? {}
           : { permission: options.permission }),
+        ...(options.expected?.sizeBytes === undefined
+          ? {}
+          : { expectedSizeBytes: options.expected.sizeBytes }),
+        ...(options.expected?.mtimeMs === undefined
+          ? {}
+          : { expectedMtimeMs: options.expected.mtimeMs }),
       },
       bytes,
     );
@@ -217,6 +230,10 @@ export class RuntimeHostFiles implements RuntimeFiles {
     } catch (error) {
       if (error instanceof HostError) {
         throw new RuntimeFilesError(error.code, error.message);
+      }
+      if (error instanceof RuntimeHostTimeoutError) {
+        // The socket is still usable; only this request gave up.
+        throw error;
       }
       // The request may have reached the service before the socket failed.
       // Retrying a non-idempotent write would duplicate it, so drop the

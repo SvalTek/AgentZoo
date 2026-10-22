@@ -246,7 +246,13 @@ export interface RuntimeFiles {
     path: string,
     mode: "create" | "overwrite" | "append",
     bytes: Uint8Array,
-    options?: { readonly permission?: number },
+    options?: {
+      readonly permission?: number;
+      readonly expected?: {
+        readonly sizeBytes?: number;
+        readonly mtimeMs?: number;
+      };
+    },
   ): Promise<{ readonly created: boolean; readonly sizeBytes: number }>;
   stat(path: string): Promise<RuntimeStat>;
   remove(path: string): Promise<{ readonly removed: boolean }>;

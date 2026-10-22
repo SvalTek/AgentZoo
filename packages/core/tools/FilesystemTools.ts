@@ -543,6 +543,14 @@ Use these structured tools for ordinary file and directory work instead of shell
                     target,
                     "overwrite",
                     new TextEncoder().encode(outcome.content),
+                    {
+                      expected: {
+                        sizeBytes: stat.sizeBytes,
+                        ...(stat.mtimeMs === null
+                          ? {}
+                          : { mtimeMs: stat.mtimeMs }),
+                      },
+                    },
                   );
                 } catch (error) {
                   throwHostFailure(error, {
@@ -880,7 +888,7 @@ Use these structured tools for ordinary file and directory work instead of shell
             });
           }
           entries.sort((left, right) => left.name.localeCompare(right.name));
-          const result = { path, entries };
+          const result = { path, entries, truncated: false };
           return observedToolResult(result, { command: raw, result });
         },
       }),
@@ -1149,8 +1157,8 @@ function replaceExact(
   if (!replaceAll && count !== 1) return { failure: 45 };
   return {
     content: replaceAll
-      ? content.replaceAll(oldValue, newValue)
-      : content.replace(oldValue, newValue),
+      ? content.replaceAll(oldValue, () => newValue)
+      : content.replace(oldValue, () => newValue),
     replacements: replaceAll ? count : 1,
   };
 }
@@ -1324,7 +1332,7 @@ export function normalizePatchHunks(patch: string): string {
     for (; cursor < lines.length; cursor++) {
       const line = lines[cursor];
       if (/^(?:@@ |diff |Index: )/.test(line)) break;
-      if (isFileHeader(cursor)) break;
+      if (cursor > index + 1 && isFileHeader(cursor)) break;
       if (line === "") {
         // A blank line can be an empty context line, or the separator before
         // the next file header. Anything else is context.
@@ -2047,8 +2055,8 @@ function parseTextMatches(
       ? {
         path: match[1],
         line: Number(match[2]),
-        snippet: match[3].slice(0, 500),
+        snippet: match[3].trimEnd().slice(0, 500),
       }
-      : { path: "", line: 0, snippet: entry.slice(0, 500) };
+      : { path: "", line: 0, snippet: entry.trimEnd().slice(0, 500) };
   });
 }

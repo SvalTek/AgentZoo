@@ -383,3 +383,32 @@ Deno.test("fs.read returns an empty page for line 1 of an empty file", async () 
     await Deno.remove(base, { recursive: true });
   }
 });
+
+Deno.test("fs.write refuses a stale expected snapshot", async () => {
+  const { base, context } = await fixture({ "note.txt": "current" });
+  try {
+    await assertRejects(
+      () =>
+        executeOperation(
+          context,
+          "fs.write",
+          "alpha",
+          {
+            path: "/note.txt",
+            mode: "overwrite",
+            expectedSizeBytes: 3,
+            expectedMtimeMs: 1,
+          },
+          new TextEncoder().encode("new"),
+        ),
+      HostError,
+      "changed after it was read",
+    );
+    assertEquals(
+      await Deno.readTextFile(`${base}/alpha/merged/note.txt`),
+      "current",
+    );
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+});
