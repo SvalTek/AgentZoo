@@ -16,6 +16,7 @@ import {
 } from "./protocol.ts";
 import { type OpenedTarget, openTarget } from "./containment.ts";
 import { agentRoot } from "./paths.ts";
+import { type LogSink, silentLogger } from "./log.ts";
 import {
   acquirePathLock,
   changedSince,
@@ -91,6 +92,7 @@ export class UploadManager {
 
   constructor(
     private readonly agentsRoot: string,
+    private readonly logger: LogSink = silentLogger,
     private readonly maxSessions = MAX_UPLOADS_PER_CONNECTION,
   ) {}
 
@@ -207,6 +209,13 @@ export class UploadManager {
         timer,
       };
       this.#sessions.set(id, session);
+      this.logger.debug("uploads", "start", {
+        upload: id,
+        agent: agent ?? null,
+        mode: input.mode,
+        path: input.path,
+        sizeBytes: input.sizeBytes ?? null,
+      });
       return { result: { upload: id, chunkSize: UPLOAD_CHUNK_BYTES } };
     } catch (error) {
       release();
@@ -273,6 +282,12 @@ export class UploadManager {
         await file.sync();
         const final = await file.stat();
         session.append.close();
+        this.logger.info("uploads", "commit", {
+          upload: session.id,
+          mode: "append",
+          path: session.path,
+          sizeBytes: final.size,
+        });
         return {
           result: {
             path: session.path,
@@ -344,6 +359,12 @@ export class UploadManager {
         await Deno.remove(tempPath).catch(() => undefined);
       }
 
+      this.logger.info("uploads", "commit", {
+        upload: session.id,
+        mode: session.mode,
+        path: session.path,
+        sizeBytes: session.received,
+      });
       return {
         result: {
           path: session.path,
@@ -367,6 +388,10 @@ export class UploadManager {
     const input = parse(UploadParams, params);
     const session = this.#session(agent, input.upload);
     this.#sessions.delete(session.id);
+    this.logger.info("uploads", "abort", {
+      upload: session.id,
+      path: session.path,
+    });
     void this.#cleanup(session, true);
     return { result: { upload: session.id, aborted: true } };
   }
@@ -390,6 +415,10 @@ export class UploadManager {
       const session = this.#sessions.get(id);
       if (!session) return;
       this.#sessions.delete(id);
+      this.logger.warn("uploads", "expired", {
+        upload: id,
+        path: session.path,
+      });
       void this.#cleanup(session, true);
     }, UPLOAD_IDLE_MS);
   }

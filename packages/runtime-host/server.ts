@@ -25,6 +25,7 @@ import {
 } from "./protocol.ts";
 import { executeOperation, startAgentWatch } from "./operations.ts";
 import { UploadManager } from "./uploads.ts";
+import { type LogSink, silentLogger } from "./log.ts";
 import type { WatchHandle } from "./watch.ts";
 
 const MAX_SUBSCRIPTIONS = 64;
@@ -35,6 +36,7 @@ export interface RuntimeHostServerOptions {
   readonly agentsRoot: string;
   readonly token: string;
   readonly port?: number;
+  readonly logger?: LogSink;
 }
 
 export interface RuntimeHostServer {
@@ -82,20 +84,22 @@ function failure(id: string | undefined, error: unknown): ServerMessage {
 }
 
 function logFailure(
+  logger: LogSink,
   op: string,
   agent: string | undefined,
   error: unknown,
 ): void {
   const code = error instanceof HostError ? error.code : "internal";
   const message = error instanceof Error ? error.message : String(error);
-  console.error(
-    `[${new Date().toISOString()}] ${op} agent=${
-      agent ?? "-"
-    } code=${code}: ${message}`,
-  );
-  if (!(error instanceof HostError) && error instanceof Error && error.stack) {
-    console.error(error.stack);
-  }
+  logger.error("server", `${op} failed`, {
+    op,
+    agent: agent ?? null,
+    code,
+    message,
+    ...(error instanceof HostError || !(error instanceof Error)
+      ? {}
+      : { stack: error.stack }),
+  });
 }
 
 export function createRuntimeHostServer(
@@ -111,8 +115,10 @@ export function createRuntimeHostServer(
       return new Response("expected a WebSocket upgrade", { status: 426 });
     }
     const { socket, response } = Deno.upgradeWebSocket(request);
+    const logger = options.logger ?? silentLogger;
     const context = { agentsRoot: options.agentsRoot };
-    const uploads = new UploadManager(options.agentsRoot);
+    const uploads = new UploadManager(options.agentsRoot, logger);
+    logger.info("server", "client connected");
     const subscriptions = new Map<string, WatchHandle>();
     let subscriptionCount = 0;
     let bufferedPayloadBytes = 0;
@@ -194,6 +200,7 @@ export function createRuntimeHostServer(
           return true;
         }
         subscriptions.set(sub, handle);
+        logger.info("server", "subscription opened", { sub, agent });
         send({
           ok: true,
           sub,
@@ -207,7 +214,7 @@ export function createRuntimeHostServer(
         });
       } catch (error) {
         subscriptionCount--;
-        logFailure("subscribe", agent, error);
+        logFailure(logger, "subscribe", agent, error);
         send(failureForSubscription(sub, error));
       }
       return true;
@@ -229,6 +236,9 @@ export function createRuntimeHostServer(
       }
       handle.close();
       subscriptions.delete(unsubscribe.data.sub);
+      logger.info("server", "subscription closed", {
+        sub: unsubscribe.data.sub,
+      });
       subscriptionCount = Math.max(0, subscriptionCount - 1);
       send({ ok: true, sub: unsubscribe.data.sub, result: {} });
       return true;
@@ -259,7 +269,7 @@ export function createRuntimeHostServer(
           return;
         }
         if (hello.data.token !== options.token) {
-          console.error(`[${new Date().toISOString()}] hello rejected: token`);
+          logger.warn("server", "hello rejected", { reason: "token" });
           send(unauthorized("token rejected"));
           socket.close(1008, "unauthorized");
           return;
@@ -326,7 +336,7 @@ export function createRuntimeHostServer(
           result: result.result,
         });
       } catch (error) {
-        logFailure(op, agent, error);
+        logFailure(logger, op, agent, error);
         send(failure(id, error));
       }
     };
@@ -364,6 +374,7 @@ export function createRuntimeHostServer(
       void handleRequest(event.data);
     };
     socket.onclose = () => {
+      logger.info("server", "client disconnected");
       closeSubscriptions();
       clearPayloads();
       void uploads.close();

@@ -312,8 +312,9 @@ Helper errors are transport-level; tools translate them into their existing
   before every image build, so tests and `docker:build` stay in sync.
 - The Containerfile copies the binary to `/usr/local/bin` **after** the rootfs
   template is created, so no agent chroot contains it.
-- The runtime log is bind-mounted from `<project>/.agent-zoo-logs/` and
-  truncated when the container's main process starts.
+- The service writes a JSONL application log to `<project>/.agent-zoo-logs/`
+  (bind-mounted at `/var/log/agentzoo`) and truncates it on startup. Container
+  stdout/stderr remains separate for infrastructure diagnostics.
 - The entrypoint creates a per-container token at
   `/var/lib/runtime/runtime-host.token` (mode 0600, in the data volume, so it
   survives restarts), exports it, and starts the service in a restart loop for

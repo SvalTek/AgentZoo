@@ -7,6 +7,7 @@
 
 import { createRuntimeHostServer } from "./server.ts";
 import { DEFAULT_PORT } from "./protocol.ts";
+import { Logger, type LogLevel } from "./log.ts";
 
 const token = Deno.env.get("AGENTZOO_RUNTIME_TOKEN");
 if (!token) {
@@ -22,7 +23,19 @@ if (!Number.isInteger(port) || port <= 0) {
   Deno.exit(1);
 }
 
-const server = createRuntimeHostServer({ agentsRoot, token, port });
-console.log(
-  `runtime host listening on port ${server.port} (agents root: ${agentsRoot})`,
-);
+const logger = new Logger({
+  path: "/var/log/agentzoo/runtime-host.log",
+  level: (Deno.env.get("AGENTZOO_LOG_LEVEL") as LogLevel) ?? "info",
+});
+const server = createRuntimeHostServer({ agentsRoot, token, port, logger });
+logger.info("main", "listening", { port: server.port, agentsRoot });
+// Infrastructure channel only: the application record is the JSONL file.
+console.error(`runtime-host listening on port ${server.port}`);
+
+const shutdown = () => {
+  logger.info("main", "shutting down");
+  logger.close();
+  Deno.exit(0);
+};
+Deno.addSignalListener("SIGTERM", shutdown);
+Deno.addSignalListener("SIGINT", shutdown);

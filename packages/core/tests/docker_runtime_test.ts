@@ -1809,7 +1809,11 @@ Deno.test({
         if (log.includes("listening")) break;
         await delay(50);
       }
-      assert(log.includes("listening"), `empty runtime host log: ${logFile}`);
+      assert(
+        log.includes('"source":"main"') &&
+          log.includes('"message":"listening"'),
+        `missing startup record: ${logFile}: ${log}`,
+      );
 
       await alpha.exec([
         "/bin/bash",
