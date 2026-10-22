@@ -1,6 +1,13 @@
 /** Copyright (C) 2026 Theros <https://github.com/therosin> GPL-3.0-or-later */
 
-import { dirname, fromFileUrl, join, resolve } from "@std/path";
+import {
+  dirname,
+  fromFileUrl,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "@std/path";
 import type {
   CommandOptions,
   CommandResult,
@@ -97,7 +104,14 @@ export class DockerRuntimeManager implements RuntimeManager {
     const projectDir = /\.(?:ya?ml|jsonc?)$/i.test(this.project)
       ? dirname(this.project)
       : this.project;
-    this.#runtimeLogDir = join(projectDir, ".agent-zoo-logs");
+    // Never place the log inside the workspace mounted at /shared: agents can
+    // read and write that tree.
+    const insideWorkspace = (() => {
+      const rel = relative(resolve(this.workspace), resolve(projectDir));
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    })();
+    const logBase = insideWorkspace ? dirname(this.workspace) : projectDir;
+    this.#runtimeLogDir = join(logBase, ".agent-zoo-logs", this.runId);
     this.#runtimeLogFile = join(this.#runtimeLogDir, "runtime-host.log");
   }
 

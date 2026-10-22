@@ -26,6 +26,7 @@ if (!Number.isInteger(port) || port <= 0) {
 const logger = new Logger({
   path: "/var/log/agentzoo/runtime-host.log",
   level: (Deno.env.get("AGENTZOO_LOG_LEVEL") as LogLevel) ?? "info",
+  fresh: Deno.env.get("AGENTZOO_LOG_FRESH") !== "0",
 });
 const server = createRuntimeHostServer({ agentsRoot, token, port, logger });
 logger.info("main", "listening", { port: server.port, agentsRoot });

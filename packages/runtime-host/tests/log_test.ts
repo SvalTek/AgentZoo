@@ -22,6 +22,14 @@ Deno.test("logger writes JSONL and truncates on each start", async () => {
     assertEquals(records[2].error.name, "Error");
     assertEquals(records[2].error.message, "boom");
 
+    const appending = new Logger({ path, level: "info", fresh: false });
+    appending.info("delta", "after restart");
+    appending.close();
+    const appended = (await Deno.readTextFile(path)).trim().split("\n")
+      .map((line) => JSON.parse(line));
+    assertEquals(appended.length, 4);
+    assertEquals(appended[3].message, "after restart");
+
     const fresh = new Logger({ path, level: "warn" });
     fresh.info("alpha", "ignored");
     fresh.close();

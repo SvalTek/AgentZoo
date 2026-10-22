@@ -124,10 +124,19 @@ modes.
 
 ## Runtime host logs
 
-The resident runtime host writes to `<project>/.agent-zoo-logs/runtime-host.log`
-on the host (bind-mounted at `/var/log/agentzoo`). The file is truncated when
-the runtime container's main process starts, so it reflects the current run. It
-records startup, handshake rejections, and operation failures with the
-operation, agent, error code, and message. If the bind mount is unavailable, the
-entrypoint falls back to `/var/lib/runtime/runtime-host.log` inside the data
-volume.
+The resident runtime host writes an application log to
+`<project>/.agent-zoo-logs/<runId>/runtime-host.log` on the host, bind-mounted
+at `/var/log/agentzoo`. `DockerRuntimeManager.runtimeLogFile()` is
+authoritative; the directory moves beside the workspace if the project path
+would otherwise sit inside the agent-visible `/shared` mount.
+
+The log is JSONL with `ts`, `level`, `source`, `message`, and optional
+`details`/`error`. It records startup, connections, handshake rejections,
+subscriptions, upload lifecycle, and operation failures with agent, operation,
+and error code. Set `AGENTZOO_LOG_LEVEL=debug` for per-request detail.
+
+The file is truncated on the first service start of a container run; supervisor
+restarts append, so crash history survives. If the log path cannot be opened,
+the service reports that on stderr and continues without application logging.
+Container stdout/stderr remains separate for infrastructure diagnostics and is
+not copied into the application log.

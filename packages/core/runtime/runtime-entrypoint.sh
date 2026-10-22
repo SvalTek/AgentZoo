@@ -15,9 +15,12 @@ fi
 # every agent root and is restarted if it exits.
 if [[ "${1:-}" == "sleep" && -x /usr/local/bin/agentzoo-runtime-host && -s "${token_file}" ]]; then
   (
+    fresh=1
     while true; do
       AGENTZOO_RUNTIME_TOKEN="$(cat "${token_file}")" \
+        AGENTZOO_LOG_FRESH="${fresh}" \
         /usr/local/bin/agentzoo-runtime-host || true
+      fresh=0
       sleep 1
     done
   ) &

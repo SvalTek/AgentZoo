@@ -19,6 +19,8 @@ const LEVELS: Record<LogLevel, number> = {
 export interface LoggerOptions {
   readonly path: string;
   readonly level?: LogLevel;
+  /** Truncate first; supervisor restarts pass false so crash history remains. */
+  readonly fresh?: boolean;
 }
 
 /** The surface server/uploads use; tests can pass a silent implementation. */
@@ -48,11 +50,17 @@ export class Logger {
     this.#threshold = LEVELS[options.level ?? "info"] ?? LEVELS.info;
     try {
       // Fresh application log per service start.
-      this.#file = Deno.openSync(this.#path, {
-        write: true,
-        create: true,
-        truncate: true,
-      });
+      this.#file = options.fresh === false
+        ? Deno.openSync(this.#path, {
+          write: true,
+          create: true,
+          append: true,
+        })
+        : Deno.openSync(this.#path, {
+          write: true,
+          create: true,
+          truncate: true,
+        });
     } catch (error) {
       this.#failed = true;
       // Application logging is unavailable; say so on the infrastructure

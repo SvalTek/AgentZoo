@@ -257,11 +257,10 @@ export function createRuntimeHostServer(
       const hello = HelloSchema.safeParse(message);
       if (hello.success) {
         if (hello.data.protocol !== PROTOCOL_VERSION) {
-          console.error(
-            `[${
-              new Date().toISOString()
-            }] hello rejected: protocol ${hello.data.protocol}`,
-          );
+          logger.warn("server", "hello rejected", {
+            reason: "protocol",
+            protocol: hello.data.protocol,
+          });
           send(unauthorized(
             `protocol ${hello.data.protocol} is not supported (expected ${PROTOCOL_VERSION})`,
           ));
